@@ -1,0 +1,17 @@
+# WardenIPS - Python Bağımlılıkları
+# ===================================
+
+# Yapılandırma
+pyyaml>=6.0.1
+
+# Asenkron Dosya I/O
+aiofiles>=23.2.1
+
+# MaxMind GeoLite2 ASN Veritabanı (Faz 2)
+geoip2>=4.8.0
+
+# Asenkron SQLite (Faz 2)
+aiosqlite>=0.19.0
+
+# Asenkron HTTP İstemci (AbuseIPDB - Faz 3)
+aiohttp>=3.9.0
