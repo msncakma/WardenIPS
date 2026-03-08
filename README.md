@@ -23,7 +23,7 @@ A detailed installation guide is available in [INSTALL.md](INSTALL.md).
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-venv ipset iptables git
-git clone <YOUR_REPO_URL> wardenips
+git clone https://github.com/msncakma/WardenIPS wardenips
 cd wardenips
 python3 -m venv venv
 source venv/bin/activate
@@ -65,7 +65,7 @@ WardenIPS is an actively evolving project. Here are some of our planned features
 - [ ] Implement Redis backend support as an alternative to SQLite for enterprise clusters.
 - [ ] Add Web Dashboard (UI) for monitoring blocked IPs and risk scores.
 - [ ] Add Telegram and Discord integration for notifications.
-- 
+- [ ] Auto setup script.
 ---
 
 <p align="center">Made with ❤️ for server administrators by msncakma and AIs :D.</p>
