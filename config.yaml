@@ -27,6 +27,7 @@ database:
   sqlite:
     path: "/var/lib/wardenips/warden.db" 
   ip_hashing:
+    enabled: true
     # IMPORTANT: Change this salt to a secure random string for GDPR compliance!
     salt: "YOUR-RANDOM-SECURE-SALT-STRING-HERE"
     algorithm: "sha256"

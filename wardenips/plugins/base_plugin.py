@@ -148,6 +148,8 @@ class BasePlugin(abc.ABC):
         Override ederek ozel baslangic islemi yapilabilir.
         """
         self._logger.info("Plugin started: %s", self.name)
+        self._logger.info("If you encounter any issues, please open an Issue on GitHub!")
+        self._logger.info("Support the project: https://ko-fi.com/msncakma")
 
     async def on_stop(self) -> None:
         """
@@ -155,9 +157,10 @@ class BasePlugin(abc.ABC):
         Override ederek ozel temizlik islemi yapilabilir.
         """
         self._logger.info(
-            "Plugin stopped: %s — Processed: %d satir, %d events",
-            self.name, self._lines_processed, self._events_generated,
+            "Plugin stopped: %s — Processed: %d events",
+            self.name, self._events_generated,
         )
+        self._logger.info("If you enjoyed WardenIPS, buy me a coffee! https://ko-fi.com/msncakma")
 
     async def on_event(self, event: ConnectionEvent) -> None:
         """

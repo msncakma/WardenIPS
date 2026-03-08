@@ -83,6 +83,9 @@ class IPHasher:
         Returns:
             Hex formatinda hash string (orn: "a3f2b8..." 64 karakter).
         """
+        if not self._enabled:
+            return ip_str.strip()
+            
         ip_bytes = ip_str.strip().encode("utf-8")
         digest = hmac.new(self._salt, ip_bytes, self._algorithm).hexdigest()
         return digest
@@ -100,6 +103,9 @@ class IPHasher:
         Returns:
             True ise hash'ler eslesir.
         """
+        if not self._enabled:
+            return ip_str.strip() == expected_hash.strip()
+            
         computed = self.hash_ip(ip_str)
         return hmac.compare_digest(computed, expected_hash)
 
@@ -119,7 +125,8 @@ class IPHasher:
         hashing = db_section.get("ip_hashing", {})
         salt = hashing.get("salt", "")
         algorithm = hashing.get("algorithm", "sha256")
-        return cls(salt=salt, algorithm=algorithm)
+        enabled = hashing.get("enabled", True)
+        return cls(salt=salt, algorithm=algorithm, enabled=enabled)
 
     def __repr__(self) -> str:
         return f"<IPHasher algorithm={self._algorithm}>"

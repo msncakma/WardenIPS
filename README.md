@@ -59,13 +59,18 @@ Our repository releases follow these tags:
 
 ## 🛠️ TODO / Future Road map
 WardenIPS is an actively evolving project. Here are some of our planned features:
-- [ ] Support for IPv6 blocking.
-- [ ] Implement Docker support for easier deployment.
-- [ ] Add Nginx / Apache plugin for Layer 7 web threat detection.
-- [ ] Implement Redis backend support as an alternative to SQLite for enterprise clusters.
-- [ ] Add Web Dashboard (UI) for monitoring blocked IPs and risk scores.
-- [ ] Add Telegram and Discord integration for notifications.
-- [ ] Auto setup script.
+- [ ] `Add systemd service template (wardenips.service) for daemonizing.`
+- [ ] `Support for IPv6 blocking.`
+- [ ] `Implement Docker support for easier deployment.`
+- [ ] `Add Nginx / Apache plugin for Layer 7 web threat detection.`
+- [ ] `Implement Redis backend support as an alternative to SQLite for enterprise clusters.`
+- [ ] `Add Web Dashboard (UI) for monitoring blocked IPs and risk scores.`
+- [ ] `Add Telegram and Discord integration for notifications.`
+- [ ] `Auto setup script.`
+- [ ] `Decentralized Threat Intelligence:` A feature that can be toggled on/off to sync banned IPs between all WardenIPS instances globally automatically!
+
 ---
+
+**Disclaimer:** WardenIPS is provided "as is". Please ensure you whitelist your own IPs before deploying to avoid locking yourself out of your server.
 
 <p align="center">Made with ❤️ for server administrators by msncakma and AIs :D.</p>
