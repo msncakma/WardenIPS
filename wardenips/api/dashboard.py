@@ -58,11 +58,13 @@ class DashboardAPI:
         db,
         firewall,
         start_time: float,
+        threat_intel=None,
     ) -> None:
         self._config = config
         self._db = db
         self._firewall = firewall
         self._start_time = start_time
+        self._threat_intel = threat_intel
         self._enabled: bool = False
         self._host: str = "127.0.0.1"
         self._port: int = 7680
@@ -107,6 +109,7 @@ class DashboardAPI:
         self._app.router.add_get("/api/country-stats", self._handle_country_stats)
         self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
         self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
+        self._app.router.add_get("/api/threat-intel", self._handle_threat_intel)
 
         self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
@@ -311,6 +314,21 @@ class DashboardAPI:
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 
+    async def _handle_threat_intel(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if not self._threat_intel:
+            return web.json_response({
+                "enabled": False,
+                "mode": "disabled",
+                "description": "Threat intelligence sync is not configured.",
+                "peers": [],
+            })
+        try:
+            return web.json_response(await self._threat_intel.get_status())
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
     # ── Dashboard SPA ──
 
     async def _handle_dashboard(self, request: web.Request) -> web.Response:
@@ -420,6 +438,29 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 .pt{display:inline-block;padding:.1rem .45rem;border-radius:4px;font-size:.65rem;font-weight:600;background:var(--cyan-d);color:var(--cyan)}
 .em{padding:2rem;text-align:center;color:var(--dim2);font-size:.85rem}
 .em svg{width:40px;height:40px;margin-bottom:.75rem;opacity:.3}
+.mesh-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}
+.mesh-stat{padding:.9rem;border:1px solid var(--bdr);border-radius:10px;background:#0f172a}
+.mesh-stat .k{font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.35rem}
+.mesh-stat .v{font-size:1.1rem;font-weight:700}
+.mesh-topology{display:grid;place-items:center;min-height:220px;margin:1rem 0 1.2rem;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at center,#13233d 0%,#0f172a 42%,#0b1220 100%);overflow:hidden;position:relative}
+.mesh-topology::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at center,#3b82f61c 0%,transparent 52%);pointer-events:none}
+.mesh-canvas{position:relative;width:min(100%,520px);height:200px}
+.mesh-node{position:absolute;display:flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid var(--bdr);font-size:.72rem;font-weight:700;letter-spacing:.01em;box-shadow:0 10px 28px #00000035}
+.mesh-node.local{left:50%;top:50%;transform:translate(-50%,-50%);width:112px;height:112px;background:linear-gradient(135deg,#2563eb,#0f766e);color:#eff6ff;border-color:#60a5fa}
+.mesh-node.peer{width:78px;height:78px;background:#111827;color:var(--txt)}
+.mesh-node.peer.ok{border-color:#34d399;background:linear-gradient(135deg,#0f172a,#0b2b22)}
+.mesh-node.peer.bad{border-color:#f87171;background:linear-gradient(135deg,#0f172a,#311313)}
+.mesh-line{position:absolute;height:2px;transform-origin:left center;background:linear-gradient(90deg,#60a5fa55,#22d3ee20)}
+.mesh-node small{display:block;font-size:.62rem;color:#cbd5e1;font-weight:600;opacity:.85}
+.peer-list{display:grid;gap:.65rem}
+.peer-card{padding:.85rem 1rem;border:1px solid var(--bdr);border-radius:10px;background:#0f172a}
+.peer-head{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-bottom:.45rem}
+.peer-url{font-size:.8rem;font-weight:700;color:var(--txt);word-break:break-all}
+.peer-meta{font-size:.72rem;color:var(--dim);display:flex;gap:.85rem;flex-wrap:wrap}
+.st{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700}
+.st.ok{background:var(--grn-d);color:var(--grn)}
+.st.bad{background:var(--red-d);color:var(--red)}
+.desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
 footer{text-align:center;padding:2rem 0 1rem;color:var(--dim2);font-size:.75rem}
 footer a{color:var(--accent);text-decoration:none}
 footer a:hover{text-decoration:underline}
@@ -432,7 +473,8 @@ footer a:hover{text-decoration:underline}
 @keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .ai{animation:fi .4s cubic-bezier(.4,0,.2,1) both}
 .d1{animation-delay:.05s}.d2{animation-delay:.1s}.d3{animation-delay:.15s}.d4{animation-delay:.2s}.d5{animation-delay:.25s}.d6{animation-delay:.3s}
-@media(max-width:640px){.sg{grid-template-columns:repeat(2,1fr)}.sc .vl{font-size:1.5rem}.logo h1{font-size:1.2rem}.sh{padding:1rem}.kofi-fab{right:12px;bottom:12px;padding:.5rem .75rem}.kofi-fab .sub{display:none}}
+@media(max-width:900px){.mesh-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:640px){.sg{grid-template-columns:repeat(2,1fr)}.sc .vl{font-size:1.5rem}.logo h1{font-size:1.2rem}.sh{padding:1rem}.kofi-fab{right:12px;bottom:12px;padding:.5rem .75rem}.kofi-fab .sub{display:none}.mesh-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -482,6 +524,20 @@ footer a:hover{text-decoration:underline}
 
   <div class="pn">
     <div class="pl fw ai d2">
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 7 7 17"/><path d="M7 7h10v10"/><path d="M5 5h4"/><path d="M15 19h4"/></svg>Threat Mesh</h2><span class="pill" id="tic">0</span></div>
+      <div class="pb">
+        <div class="desc" id="tid">Threat intelligence is disabled.</div>
+        <div class="mesh-grid">
+          <div class="mesh-stat"><div class="k">Mode</div><div class="v" id="tim">Disabled</div></div>
+          <div class="mesh-stat"><div class="k">Peers</div><div class="v" id="tip">0</div></div>
+          <div class="mesh-stat"><div class="k">Hashes Shared</div><div class="v" id="tis">0</div></div>
+          <div class="mesh-stat"><div class="k">Hashes Received</div><div class="v" id="tir">0</div></div>
+        </div>
+        <div class="mesh-topology"><div class="mesh-canvas" id="tmc"></div></div>
+        <div class="peer-list" id="til"></div>
+      </div>
+    </div>
+    <div class="pl fw ai d2">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>Active Bans</h2><span class="pill" id="bc">0</span></div>
       <div class="pb" style="max-height:350px">
         <table class="t" id="bnt"><thead><tr><th>IP Hash</th><th>Risk</th><th>Reason</th><th>Duration</th><th>Banned At</th><th>Expires</th></tr></thead><tbody id="bnb"></tbody></table>
@@ -523,6 +579,7 @@ function D(s){
   if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';
   return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
 }
+function TG(iso){return iso?T(iso):'-'}
 function RC(r){return r>=70?'rh':r>=40?'rm':'rl'}
 function CF(c){
   if(!c||c.length!==2)return'';
@@ -544,6 +601,52 @@ function bars(id,items,lk,vk,ci){
   }).join('');
 }
 
+function renderThreatIntel(ti){
+  $('#tic').textContent = ti&&ti.peers ? ti.peers.length : 0;
+  $('#tim').textContent = ti&&ti.enabled ? (ti.mode||'Enabled') : 'Disabled';
+  $('#tip').textContent = N(ti&&ti.peers ? ti.peers.length : 0);
+  $('#tis').textContent = N(ti&&ti.shared_total ? ti.shared_total : 0);
+  $('#tir').textContent = N(ti&&ti.received_total ? ti.received_total : 0);
+  $('#tid').textContent = ti&&ti.description ? ti.description : 'Threat intelligence is disabled.';
+  var list = $('#til');
+  var canvas = $('#tmc');
+  if(!ti||!ti.enabled||!ti.peers||!ti.peers.length){
+    list.innerHTML = '<div class="em" style="padding:1rem 0"><div>No peers configured</div></div>';
+    canvas.innerHTML = '<div class="mesh-node local">This Node<small>No peers</small></div>';
+    return;
+  }
+  var peers = ti.peers.slice(0, 6);
+  var centerX = 260;
+  var centerY = 100;
+  var radius = peers.length > 1 ? 78 : 0;
+  var html = '<div class="mesh-node local" style="left:'+centerX+'px;top:'+centerY+'px">This Node<small>'+E(ti.mode||'mesh')+'</small></div>';
+  peers.forEach(function(peer, idx){
+    var angle = peers.length === 1 ? 0 : ((Math.PI * 2) / peers.length) * idx - Math.PI / 2;
+    var x = centerX + Math.cos(angle) * radius;
+    var y = centerY + Math.sin(angle) * radius;
+    var dx = x - centerX;
+    var dy = y - centerY;
+    var len = Math.sqrt((dx * dx) + (dy * dy));
+    var deg = Math.atan2(dy, dx) * (180 / Math.PI);
+    var cls = peer.reachable ? 'ok' : 'bad';
+    html += '<div class="mesh-line" style="left:'+centerX+'px;top:'+centerY+'px;width:'+len+'px;transform:rotate('+deg+'deg)"></div>';
+    html += '<div class="mesh-node peer '+cls+'" style="left:'+x+'px;top:'+y+'px;transform:translate(-50%,-50%)" title="'+E(peer.peer||'peer')+'">Peer '+(idx+1)+'<small>'+(peer.reachable?'online':'offline')+'</small></div>';
+  });
+  canvas.innerHTML = html;
+  list.innerHTML = ti.peers.map(function(peer){
+    var ok = !!peer.reachable;
+    return '<div class="peer-card">'
+      + '<div class="peer-head"><div class="peer-url">'+E(peer.peer||'unknown')+'</div><span class="st '+(ok?'ok':'bad')+'">'+(ok?'Reachable':'Offline')+'</span></div>'
+      + '<div class="peer-meta">'
+      + '<span>Last success: '+TG(peer.last_success_at)+'</span>'
+      + '<span>Last attempt: '+TG(peer.last_attempt_at)+'</span>'
+      + '<span>New hashes: '+N(peer.last_received_count||0)+'</span>'
+      + '<span>Total received: '+N(peer.total_received||0)+'</span>'
+      + (peer.last_error?'<span>Error: '+E(peer.last_error)+'</span>':'')
+      + '</div></div>';
+  }).join('');
+}
+
 async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
@@ -554,6 +657,7 @@ async function refresh(){
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var at=await A('/api/top-attackers?limit=10');
+  var ti=await A('/api/threat-intel');
 
   // Health
   if(h){$('#su').textContent=h.uptime||'--:--:--';$('#ut').textContent='Uptime: '+(h.uptime||'--:--:--')}
@@ -631,6 +735,8 @@ async function refresh(){
     var ait=at.attackers.map(function(a){return{label:(a.ip_hash||'').substring(0,16)+'…',count:a.ban_count}});
     bars('atc',ait,'label','count',1)}
   else{ap.textContent='0';bars('atc',[],'label','count',1)}
+
+  renderThreatIntel(ti);
 }
 
 refresh();

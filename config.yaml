@@ -89,8 +89,8 @@ threat_intel:
   enabled: false
   sync_interval: 300          # Pull from peers every N seconds
   share_bans: true            # Share our ban hashes with peers
-  auto_ban_received: false    # Auto-ban IPs from peers (hashed IPs = correlation only)
-  received_ban_duration: 1800 # Duration for auto-bans from peers (seconds)
+  auto_ban_received: false    # Current feed mode is hash-only, so this is informational/correlation-focused
+  received_ban_duration: 1800 # Reserved for future direct-ban compatible peer feed modes
   peers: []                   # List of peer URLs, e.g. ["http://10.0.0.2:7681"]
   server:
     enabled: true

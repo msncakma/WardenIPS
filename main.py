@@ -145,20 +145,24 @@ class WardenIPS:
         self._running = True
         self._start_time = time.monotonic()
 
-        # ── 7. Dashboard API (optional) ──
-        self._dashboard = DashboardAPI(
-            self._config, self._db, self._firewall, self._start_time,
-        )
-        if self._dashboard.enabled:
-            await self._dashboard.start()
-
-        # ── 8. Threat Intelligence Sync (optional) ──
+        # ── 7. Threat Intelligence Sync (optional) ──
         self._threat_intel = await ThreatIntelSync.create(
             self._config, self._db, self._firewall,
         )
         if self._threat_intel.enabled:
             await self._threat_intel.start()
             self._logger.info("Threat Intel: %s", self._threat_intel)
+
+        # ── 8. Dashboard API (optional) ──
+        self._dashboard = DashboardAPI(
+            self._config,
+            self._db,
+            self._firewall,
+            self._start_time,
+            threat_intel=self._threat_intel,
+        )
+        if self._dashboard.enabled:
+            await self._dashboard.start()
 
         self._logger.info("")
         self._logger.info("=" * 60)

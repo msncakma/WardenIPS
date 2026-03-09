@@ -8,7 +8,7 @@ over HTTP, creating a decentralized threat intelligence network.
 How it works:
   - Each instance runs a lightweight HTTP sync server
   - Periodically pulls new ban hashes from configured peer nodes
-  - Received hashes are verified and optionally auto-banned locally
+    - Received hashes are stored as shared threat indicators for correlation
   - Only HMAC-hashed IPs are shared — no plaintext IPs leave the node
 
 Architecture:
@@ -26,8 +26,8 @@ Config:
     enabled: false
     sync_interval: 300          # Pull from peers every N seconds
     share_bans: true            # Share our bans with peers
-    auto_ban_received: false    # Auto-ban IPs received from peers
-    received_ban_duration: 1800 # Duration for auto-bans from peers
+    auto_ban_received: false    # Currently informational only with hashed feeds
+    received_ban_duration: 1800 # Reserved for future plaintext-compatible feeds
     peers:                      # List of peer node URLs
       - "http://10.0.0.2:7681"
       - "http://10.0.0.3:7681"
@@ -41,8 +41,8 @@ Config:
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import Optional, Set
+from datetime import datetime, timezone
+from typing import Any, Optional, Set
 
 from wardenips.core.logger import get_logger
 
@@ -81,6 +81,9 @@ class ThreatIntelSync:
         self._firewall = None
         self._local_ban_hashes: Set[str] = set()
         self._received_hashes: Set[str] = set()
+        self._peer_status: dict[str, dict[str, Any]] = {}
+        self._last_sync_started_at: Optional[str] = None
+        self._last_sync_completed_at: Optional[str] = None
 
         # Server
         self._app: Optional[web.Application] = None
@@ -111,7 +114,19 @@ class ThreatIntelSync:
         self._auto_ban = section.get("auto_ban_received", False)
         self._received_ban_duration = section.get("received_ban_duration", 1800)
         self._sync_interval = section.get("sync_interval", 300)
-        self._peers = section.get("peers", [])
+        self._peers = [peer.rstrip("/") for peer in section.get("peers", []) if peer]
+        self._peer_status = {
+            peer: {
+                "peer": peer,
+                "reachable": False,
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "last_received_count": 0,
+                "total_received": 0,
+            }
+            for peer in self._peers
+        }
 
         server = section.get("server", {})
         self._server_enabled = server.get("enabled", True)
@@ -137,6 +152,7 @@ class ThreatIntelSync:
             self._app = web.Application()
             self._app.router.add_get("/api/threat-intel/bans", self._handle_get_bans)
             self._app.router.add_get("/api/threat-intel/health", self._handle_health)
+            self._app.router.add_get("/api/threat-intel/status", self._handle_status)
 
             self._runner = web.AppRunner(self._app, access_log=None)
             await self._runner.setup()
@@ -153,6 +169,12 @@ class ThreatIntelSync:
             logger.info(
                 "Threat Intel sync enabled — %d peer(s), interval %ds",
                 len(self._peers), self._sync_interval,
+            )
+
+        if self._auto_ban:
+            logger.warning(
+                "Threat Intel auto_ban_received is enabled, but peers share only hashed IPs. "
+                "This currently works as correlation intel, not direct firewall blocking."
             )
 
     async def stop(self) -> None:
@@ -181,12 +203,52 @@ class ThreatIntelSync:
     # ── Server Handlers ──
 
     async def _handle_health(self, request: web.Request) -> web.Response:
+        status = await self.get_status(include_peers=False)
         return web.json_response({
             "status": "ok",
-            "shared": self._total_shared,
-            "received": self._total_received,
-            "local_bans": len(self._local_ban_hashes),
+            "enabled": status["enabled"],
+            "mode": status["mode"],
+            "sharing_enabled": status["sharing_enabled"],
+            "auto_ban_effective": status["auto_ban_effective"],
+            "sync_interval": status["sync_interval"],
+            "peer_count": len(self._peers),
+            "shared": status["shared_total"],
+            "received": status["received_total"],
+            "local_bans": status["local_hash_count"],
+            "last_sync_started_at": status["last_sync_started_at"],
+            "last_sync_completed_at": status["last_sync_completed_at"],
         })
+
+    async def _handle_status(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(await self.get_status())
+
+    async def get_status(self, include_peers: bool = True) -> dict[str, Any]:
+        local_hashes = await self._get_local_ban_hashes() if self._share_bans else set()
+        status = {
+            "enabled": self.enabled,
+            "mode": "correlation-only",
+            "description": (
+                "Peers exchange hashed active-ban indicators. This improves visibility "
+                "and correlation across nodes, but does not directly firewall-block remote "
+                "hashes because plaintext IPs are never shared."
+            ),
+            "sharing_enabled": self._share_bans,
+            "auto_ban_requested": self._auto_ban,
+            "auto_ban_effective": False,
+            "sync_interval": self._sync_interval,
+            "received_ban_duration": self._received_ban_duration,
+            "local_hash_count": len(local_hashes),
+            "received_hash_count": len(self._received_hashes),
+            "shared_total": self._total_shared,
+            "received_total": self._total_received,
+            "last_sync_started_at": self._last_sync_started_at,
+            "last_sync_completed_at": self._last_sync_completed_at,
+        }
+        if include_peers:
+            status["peers"] = list(self._peer_status.values())
+        return status
 
     async def _handle_get_bans(self, request: web.Request) -> web.Response:
         """Return locally banned IP hashes for peers to consume."""
@@ -216,7 +278,9 @@ class ThreatIntelSync:
                     """
                 ) as cursor:
                     rows = await cursor.fetchall()
-                    return {row[0] for row in rows}
+                    hashes = {row[0] for row in rows}
+                    self._local_ban_hashes = hashes
+                    return hashes
         except Exception as exc:
             logger.debug("Failed to get local ban hashes: %s", exc)
             return set()
@@ -226,9 +290,14 @@ class ThreatIntelSync:
     async def _sync_loop(self) -> None:
         """Periodically pull ban hashes from peers."""
         while True:
-            await asyncio.sleep(self._sync_interval)
+            self._last_sync_started_at = self._now_iso()
             for peer_url in self._peers:
                 await self._pull_from_peer(peer_url)
+            self._last_sync_completed_at = self._now_iso()
+            await asyncio.sleep(self._sync_interval)
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     async def _pull_from_peer(self, peer_url: str) -> None:
         """Pull ban hashes from a single peer."""
@@ -237,9 +306,25 @@ class ThreatIntelSync:
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
+        status = self._peer_status.setdefault(
+            peer_url,
+            {
+                "peer": peer_url,
+                "reachable": False,
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "last_received_count": 0,
+                "total_received": 0,
+            },
+        )
+        status["last_attempt_at"] = self._now_iso()
+
         try:
             async with self._session.get(url, headers=headers) as resp:
                 if resp.status != 200:
+                    status["reachable"] = False
+                    status["last_error"] = f"HTTP {resp.status}"
                     logger.debug(
                         "Peer %s returned %d", peer_url, resp.status
                     )
@@ -248,6 +333,11 @@ class ThreatIntelSync:
                 data = await resp.json()
                 peer_hashes = set(data.get("hashes", []))
                 new_hashes = peer_hashes - self._received_hashes
+                status["reachable"] = True
+                status["last_success_at"] = self._now_iso()
+                status["last_error"] = None
+                status["last_received_count"] = len(new_hashes)
+                status["total_received"] += len(new_hashes)
 
                 if new_hashes:
                     self._received_hashes.update(new_hashes)
@@ -270,8 +360,12 @@ class ThreatIntelSync:
                         )
 
         except asyncio.TimeoutError:
+            status["reachable"] = False
+            status["last_error"] = "timeout"
             logger.debug("Timeout pulling from peer %s", peer_url)
         except Exception as exc:
+            status["reachable"] = False
+            status["last_error"] = str(exc)
             logger.debug("Error pulling from peer %s: %s", peer_url, exc)
 
     def __repr__(self) -> str:
