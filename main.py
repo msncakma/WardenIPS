@@ -16,6 +16,8 @@ import argparse
 import asyncio
 import signal
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 
 from wardenips.core.config import ConfigManager
@@ -58,6 +60,17 @@ class WardenIPS:
         self._plugin_manager: PluginManager = None
         self._tailers: list[LogTailer] = []
         self._running = False
+        # In-memory burst tracker: ip -> list of timestamps (monotonic).
+        # When an IP generates more events than _burst_threshold within
+        # _burst_window seconds it is immediately banned without waiting
+        # for the normal risk-score escalation.
+        self._burst_tracker: dict[str, list[float]] = defaultdict(list)
+        self._burst_window: int = 10    # seconds
+        self._burst_threshold: int = 15  # events in window
+        # Runtime counters for periodic summary
+        self._stats_total_events: int = 0
+        self._stats_total_bans: int = 0
+        self._start_time: float = 0.0
 
     async def start(self) -> None:
         """Starts WardenIPS and loads all components."""
@@ -114,6 +127,7 @@ class WardenIPS:
         self._start_tailers()
 
         self._running = True
+        self._start_time = time.monotonic()
         self._logger.info("")
         self._logger.info("=" * 60)
         self._logger.info(
@@ -163,9 +177,52 @@ class WardenIPS:
             if event is None:
                 return
 
+            self._stats_total_events += 1
+
             # 2. Whitelist check
             if await self._whitelist.is_whitelisted(event.source_ip):
                 return
+
+            # ── 2.5 Burst / flood detection ──
+            # If the same IP fires more than _burst_threshold events in
+            # _burst_window seconds, ban immediately without waiting for
+            # the normal risk-score ramp-up.  This catches high-speed
+            # brute-force / botnet floods that would slip through the
+            # per-event scoring before enough events accumulate.
+            now_mono = time.monotonic()
+            ts_list = self._burst_tracker[event.source_ip]
+            ts_list.append(now_mono)
+            # Prune old timestamps outside the window
+            cutoff = now_mono - self._burst_window
+            self._burst_tracker[event.source_ip] = ts_list = [
+                t for t in ts_list if t > cutoff
+            ]
+            if len(ts_list) >= self._burst_threshold:
+                ip_hash = self._hasher.hash_ip(event.source_ip)
+                ban_duration = self._config.get(
+                    "firewall.ipset.default_ban_duration", 3600
+                )
+                reason = (
+                    f"[{plugin.name}] BURST FLOOD — "
+                    f"{len(ts_list)} events in {self._burst_window}s"
+                )
+                banned = await self._firewall.ban_ip(
+                    event.source_ip, duration=ban_duration, reason=reason,
+                )
+                if banned:
+                    self._stats_total_bans += 1
+                    await self._db.log_ban(
+                        ip_hash, reason, 100, ban_duration
+                    )
+                    self._logger.warning(
+                        "BURST DETECTED: IP=%s Events=%d/%ds — AUTO-BANNED "
+                        "Plugin=%s",
+                        event.source_ip, len(ts_list),
+                        self._burst_window, plugin.name,
+                    )
+                    # Clear tracker for this IP so we don't keep re-banning
+                    self._burst_tracker.pop(event.source_ip, None)
+                return  # Skip normal scoring — already handled
 
             # 3. Hash IP
             ip_hash = self._hasher.hash_ip(event.source_ip)
@@ -240,6 +297,7 @@ class WardenIPS:
                     reason=reason,
                 )
                 if banned:
+                    self._stats_total_bans += 1
                     await self._db.log_ban(
                         ip_hash, reason, risk_score, ban_duration
                     )
@@ -282,11 +340,36 @@ class WardenIPS:
                 # Signal handling might not be supported on Windows
                 pass
 
+        # Periodic stats summary (every 5 minutes by default)
+        async def _stats_loop():
+            interval = self._config.get("general.stats_interval", 300)
+            while self._running:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    break
+                uptime = int(time.monotonic() - self._start_time)
+                m, s = divmod(uptime, 60)
+                h, m = divmod(m, 60)
+                db_stats = await self._db.get_stats()
+                self._logger.info(
+                    "── STATS ── Uptime: %02d:%02d:%02d | "
+                    "Session events: %d | Session bans: %d | "
+                    "DB total events: %d | DB active bans: %d",
+                    h, m, s,
+                    self._stats_total_events,
+                    self._stats_total_bans,
+                    db_stats.get("total_events", 0),
+                    db_stats.get("active_bans", 0),
+                )
+
+        stats_task = asyncio.create_task(_stats_loop())
+
         try:
             await stop_event.wait()
         except KeyboardInterrupt:
             pass
         finally:
+            stats_task.cancel()
             await self.shutdown()
 
     def _log_system_info(self) -> None:
@@ -341,14 +424,24 @@ class WardenIPS:
         """Verifies if required system programs are installed."""
         import shutil
         import sys
+        import os
+
+        # Debian/Ubuntu install ipset/iptables under /usr/sbin which may not be
+        # in the PATH of a non-root user.  Search the common sbin directories
+        # too so we don't emit a false-positive "missing tools" warning.
+        def _which_sbin(tool: str):
+            base = os.environ.get("PATH", "")
+            extra = ["/sbin", "/usr/sbin", "/usr/local/sbin"]
+            search_path = os.pathsep.join([base, *extra])
+            return shutil.which(tool, path=search_path)
 
         # Basic tools check
         required_tools = []
         if sys.platform != "win32":
             required_tools.extend(["ipset", "iptables"])
-            
+
             # Optional but recommended
-            if not shutil.which("rsyslogd") and not shutil.which("journalctl"):
+            if not _which_sbin("rsyslogd") and not _which_sbin("journalctl"):
                 self._logger.warning(
                     "System check: Neither 'rsyslog' nor 'journalctl' was found. "
                     "Log tailing might not work correctly if logs are not written."
@@ -356,9 +449,9 @@ class WardenIPS:
 
         missing = []
         for tool in required_tools:
-            if not shutil.which(tool):
+            if not _which_sbin(tool):
                 missing.append(tool)
-        
+
         if missing:
             self._logger.warning(
                 "System check: Missing required tools: %s. "
@@ -412,12 +505,39 @@ def parse_args() -> argparse.Namespace:
         action="version",
         version=f"WardenIPS v{__version__}",
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print a summary of WardenIPS database stats and exit.",
+    )
     return parser.parse_args()
+
+
+async def print_status(config_path: str) -> None:
+    """Connect to the DB read-only, print stats, then exit."""
+    config = await ConfigManager.load(Path(config_path))
+    db = await DatabaseManager.create(config)
+    stats = await db.get_stats()
+    await db.close()
+
+    print("="*50)
+    print(f"  WardenIPS v{__version__} — Status Report")
+    print("="*50)
+    print(f"  Database       : {stats.get('db_path', 'N/A')}")
+    print(f"  Total events   : {stats.get('total_events', 0)}")
+    print(f"  Total bans     : {stats.get('total_bans', 0)}")
+    print(f"  Active bans    : {stats.get('active_bans', 0)}")
+    print(f"  Top attackers  : (run 'sqlite3 <db> \"SELECT ip_hash, COUNT(*) c FROM ban_history GROUP BY ip_hash ORDER BY c DESC LIMIT 5;\"')")
+    print("="*50)
 
 
 async def main() -> None:
     """Main entry point."""
     args = parse_args()
+
+    if args.status:
+        await print_status(args.config)
+        return
 
     warden = WardenIPS(config_path=args.config)
     await warden.start()

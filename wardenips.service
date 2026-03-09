@@ -1,21 +1,45 @@
 [Unit]
 Description=WardenIPS - Autonomous Intrusion Prevention System
+Documentation=https://github.com/msncakma/WardenIPS
 After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
 User=root
+
 # Change the path below to match your actual installation path
 WorkingDirectory=/opt/wardenips
 ExecStart=/opt/wardenips/venv/bin/python /opt/wardenips/main.py --config /opt/wardenips/config.yaml
 
 # Restart policies
-Restart=always
+Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Security hardening — defense in depth even though we run as root.
+# These restrict the process to only what WardenIPS actually needs.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+# Allow write access to the database and log directories
+ReadWritePaths=/var/lib/wardenips /var/log/wardenips
+
+# Required for ipset/iptables
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
 # Logging handling (StandardOutput goes to journalctl)
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=wardenips
 
 [Install]
 WantedBy=multi-user.target
