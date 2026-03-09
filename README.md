@@ -135,6 +135,8 @@ wardenips logs
 wardenips shell
 ```
 
+These wrapper commands use `sudo` automatically when protected files, service control, or the install directory require elevated access.
+
 ## Quick Start
 
 ### Automated Install

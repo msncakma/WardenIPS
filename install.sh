@@ -372,6 +372,33 @@ PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
 MAIN_FILE="$INSTALL_DIR/main.py"
 SERVICE_NAME="wardenips"
 
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        exec "$@"
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo "$@"
+    fi
+
+    printf "This command requires root or sudo.\n" >&2
+    exit 1
+}
+
+run_privileged_shell() {
+    if [ "$(id -u)" -eq 0 ]; then
+        cd "$INSTALL_DIR"
+        exec "${SHELL:-/bin/sh}"
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo sh -c "cd '$INSTALL_DIR' && exec /bin/sh"
+    fi
+
+    printf "This command requires root or sudo.\n" >&2
+    exit 1
+}
+
 usage() {
     printf "WardenIPS command wrapper\n"
     printf "Usage: wardenips <command> [args]\n\n"
@@ -395,25 +422,25 @@ case "${1:-help}" in
         usage
         ;;
     version)
-        exec "$PYTHON_BIN" "$MAIN_FILE" --version
+        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --version
         ;;
     status)
-        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
         ;;
     start)
-        exec systemctl start "$SERVICE_NAME"
+        run_privileged systemctl start "$SERVICE_NAME"
         ;;
     stop)
-        exec systemctl stop "$SERVICE_NAME"
+        run_privileged systemctl stop "$SERVICE_NAME"
         ;;
     restart)
-        exec systemctl restart "$SERVICE_NAME"
+        run_privileged systemctl restart "$SERVICE_NAME"
         ;;
     service-status)
-        exec systemctl status "$SERVICE_NAME"
+        run_privileged systemctl status "$SERVICE_NAME"
         ;;
     logs)
-        exec journalctl -u "$SERVICE_NAME" -f
+        run_privileged journalctl -u "$SERVICE_NAME" -f
         ;;
     config)
         printf "%s\n" "$CONFIG_FILE"
@@ -422,18 +449,17 @@ case "${1:-help}" in
         printf "%s\n" "$INSTALL_DIR"
         ;;
     ls)
-        exec ls -la "$INSTALL_DIR"
+        run_privileged ls -la "$INSTALL_DIR"
         ;;
     shell)
-        cd "$INSTALL_DIR"
-        exec "${SHELL:-/bin/sh}"
+        run_privileged_shell
         ;;
     run)
         shift
-        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
         ;;
     *)
-        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
         ;;
 esac
 EOF
@@ -471,6 +497,8 @@ PY
         log "Starting WardenIPS service..."
         systemctl restart wardenips
     else
+
+These wrapper commands use `sudo` automatically when protected files, service control, or the install directory require elevated access.
         warn "Autostart is disabled by default for safety. Set WARDENIPS_AUTOSTART=1 to start immediately."
     fi
 }
