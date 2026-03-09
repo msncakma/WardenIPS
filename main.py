@@ -158,6 +158,7 @@ class WardenIPS:
             self._db,
             self._firewall,
             self._start_time,
+            notifier=self._notifier,
             threat_intel=self._threat_intel,
         )
         if self._dashboard.enabled:

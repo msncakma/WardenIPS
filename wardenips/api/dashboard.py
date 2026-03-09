@@ -36,7 +36,7 @@ import json
 import secrets
 import time
 from typing import TYPE_CHECKING, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from aiohttp import web
 
@@ -58,12 +58,14 @@ class DashboardAPI:
     db,
     firewall,
     start_time: float,
+    notifier=None,
     threat_intel=None,
   ) -> None:
     self._config = config
     self._db = db
     self._firewall = firewall
     self._start_time = start_time
+    self._notifier = notifier
     self._threat_intel = threat_intel
     self._enabled: bool = False
     self._host: str = "127.0.0.1"
@@ -273,6 +275,7 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
     self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
+    self._app.router.add_post("/api/admin/test-notification", self._handle_admin_test_notification)
 
     self._runner = web.AppRunner(self._app, access_log=None)
     await self._runner.setup()
@@ -653,6 +656,29 @@ class DashboardAPI:
     deleted = await self._db.clear_ban_history()
     return web.json_response({"ok": True, "deleted": deleted})
 
+  async def _handle_admin_test_notification(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    if not self._notifier:
+      return web.json_response(
+        {"error": "notifications_unavailable", "message": "Notification manager is not available."},
+        status=503,
+      )
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    channel = str(payload.get("channel", "all")).strip().lower() or "all"
+    try:
+      result = await self._notifier.send_test_notification(channel)
+    except ValueError as exc:
+      return web.json_response({"error": "invalid_channel", "message": str(exc)}, status=400)
+    except RuntimeError as exc:
+      return web.json_response({"error": "notification_unavailable", "message": str(exc)}, status=503)
+    summary = ", ".join(f"{name}: {status}" for name, status in result["results"].items())
+    return web.json_response({"ok": True, "message": f"Test notification dispatched ({summary}).", **result})
+
   async def _handle_dashboard(self, request: web.Request) -> web.Response:
     if not self._public_dashboard_enabled:
       auth_redirect = self._require_dashboard_auth(request)
@@ -661,7 +687,7 @@ class DashboardAPI:
     is_authenticated = self._is_session_authenticated(request)
     if is_authenticated:
       self._touch_session(request)
-    admin_href = "/admin" if is_authenticated else "/login?next=/admin"
+    admin_href = "/admin" if is_authenticated else f"/login?{urlencode({'next': '/admin'})}"
     admin_label = "Open Admin" if is_authenticated else "Admin Login"
     html = DASHBOARD_HTML.replace("__ADMIN_HREF__", admin_href)
     html = html.replace("__ADMIN_LABEL__", admin_label)
@@ -1287,25 +1313,25 @@ setInterval(refresh,R);
 
 
 DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WardenIPS Admin Console</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#08111f;--panel:#111c30;--panel2:#0f1a2c;--b:#22304a;--txt:#e7edf7;--muted:#8da0bd;--blue:#4f8cff;--cyan:#19c2d8;--green:#13c38b;--yellow:#f4b740;--red:#f15b6c}
-body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at top,#12203a 0%,#08111f 45%,#070d18 100%);color:var(--txt);min-height:100vh}
-.app{max-width:1600px;margin:0 auto;padding:24px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}.brand h1{font-size:1.9rem;font-weight:800;letter-spacing:-.03em}.brand p{font-size:.9rem;color:var(--muted);margin-top:4px}
-.utility-strip{display:grid;grid-template-columns:1.4fr .9fr;gap:16px;margin-bottom:16px}.utility-card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:14px 16px}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.8rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.utility-metrics div{padding:10px;border-radius:12px;background:#0b1527;border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
-.actions,.toolbar,.action-grid{display:flex;gap:10px;flex-wrap:wrap}.ctrl,.btn{background:var(--panel);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:10px 12px;font-size:.88rem}.btn{cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,var(--blue),#375ff5);border-color:#4f8cff}.btn.warn{background:linear-gradient(135deg,#c2410c,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#991b1b,#dc2626);border-color:#f87171}.btn.ghost{background:#0b1527}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}
-.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.6rem;font-weight:800}
-.layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:#0f1d32}
-.mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
-.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:#175343;background:#0d2e26}.status.err{border-color:#6a2432;background:#32131a}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:#9fc5ff;text-decoration:none}
+:root{--bg:#110f18;--bg2:#1d1730;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--yellow:#ffbe5c;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
+:root[data-theme="light"]{--bg:#f4eee4;--bg2:#e9ddcf;--panel:#fffdf8;--panel2:#f7f1e8;--surface:#f3eadf;--surface2:#f9f4eb;--b:#dac8b2;--txt:#221d17;--muted:#74685b;--blue:#2f6fe4;--cyan:#0f8f92;--green:#1f8b57;--yellow:#c98410;--red:#c84e58;--accent:#c95c2b;--shadow:0 22px 48px rgba(73,49,19,.12)}
+body{font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);min-height:100vh;transition:background .25s ease,color .25s ease}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 85% 12%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 16%,transparent) 0%,transparent 28%);pointer-events:none}
+.app{max-width:1600px;margin:0 auto;padding:26px;position:relative;z-index:1}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;margin-bottom:22px}.brand h1{font-size:2rem;font-weight:800;letter-spacing:-.04em}.brand p{font-size:.95rem;color:var(--muted);margin-top:6px;max-width:62ch}.utility-strip{display:grid;grid-template-columns:1.2fr .9fr .9fr;gap:16px;margin-bottom:16px}.utility-card,.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:20px;padding:16px;box-shadow:var(--shadow)}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.82rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.utility-metrics div{padding:10px;border-radius:14px;background:var(--surface);border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.actions,.toolbar,.action-grid,.notification-grid{display:flex;gap:10px;flex-wrap:wrap}.ctrl,.btn{background:var(--surface2);border:1px solid var(--b);color:var(--txt);border-radius:14px;padding:10px 13px;font-size:.88rem;transition:transform .18s ease,background .18s ease,border-color .18s ease}.btn{cursor:pointer;font-weight:700}.btn:hover{transform:translateY(-1px)}.btn.primary{background:linear-gradient(135deg,var(--accent),#ff6f61);border-color:color-mix(in srgb,var(--accent) 60%,white)}.btn.warn{background:linear-gradient(135deg,#b45309,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#9f1239,#e11d48);border-color:#fb7185}.btn.ghost{background:var(--surface)}.btn.cyan{background:linear-gradient(135deg,var(--cyan),#0f9ea6);border-color:color-mix(in srgb,var(--cyan) 70%,white)}.btn.theme{background:linear-gradient(135deg,var(--blue),#6d78ff);border-color:color-mix(in srgb,var(--blue) 65%,white)}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}
+.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
+.layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--b);font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}
+.mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:color-mix(in srgb,var(--red) 20%,transparent);color:#ffd3d7}.t-green{background:color-mix(in srgb,var(--green) 18%,transparent);color:#b8ffe0}.t-yellow{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:#ffe1a7}.t-blue{background:color-mix(in srgb,var(--blue) 18%,transparent);color:#c9deff}
+.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:13px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:color-mix(in srgb,var(--green) 14%,var(--surface))}.status.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:color-mix(in srgb,var(--red) 14%,var(--surface))}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.linkbar a{color:var(--blue);text-decoration:none;font-size:.82rem}.linkbar a:hover{text-decoration:underline}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:var(--blue);text-decoration:none}.notification-grid{margin-top:12px}.action-caption{margin-top:10px;color:var(--muted);font-size:.8rem}.theme-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);font-size:.76rem;color:var(--muted)}
 @media(max-width:1100px){.utility-strip,.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions,.toolbar,.action-grid{width:100%}.ctrl,.btn{width:100%}}
+@media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions,.toolbar,.action-grid,.notification-grid{width:100%}.ctrl,.btn{width:100%}}
 </style>
 </head>
 <body>
@@ -1328,6 +1354,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
         <option value="3000">Refresh 3s</option>
         <option value="5000">Refresh 5s</option>
       </select>
+      <button id="themeToggle" class="btn theme">Light Mode</button>
       <button id="logoutBtn" class="btn">Log Out</button>
       <button id="refreshNow" class="btn primary">Refresh Now</button>
     </div>
@@ -1344,6 +1371,11 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
         <div><span>Session</span>Idle expires</div>
         <div><span>Route</span>/admin</div>
       </div>
+    </div>
+    <div class="utility-card">
+      <strong>Delivery checks</strong>
+      <p>Run Telegram and Discord test messages from the panel to validate credentials, routing, and webhook behavior without waiting for a real ban event.</p>
+      <div class="theme-chip" id="themeChip">Theme: Dark</div>
     </div>
   </div>
 
@@ -1381,6 +1413,12 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
           <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
           <button id="clearBanHistoryBtn" class="btn danger">Clear Ban History</button>
         </div>
+        <div class="notification-grid">
+          <button id="testAllNotificationsBtn" class="btn primary">Send All Test Messages</button>
+          <button id="testTelegramBtn" class="btn cyan">Test Telegram</button>
+          <button id="testDiscordBtn" class="btn ghost">Test Discord</button>
+        </div>
+        <div class="action-caption">Use these buttons to verify notification delivery from the admin panel.</div>
         <div id="actionStatus" class="panel-box status"><strong>Action status</strong><div class="sub">Interactive admin actions will report results here.</div></div>
       </div>
 
@@ -1441,7 +1479,7 @@ var inputTimers = {};
 var activityPingTimer = null;
 var idleTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null};
+var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark'};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -1451,6 +1489,8 @@ function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t
 function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[key] = setTimeout(fn, wait); }
 function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
 function setStatus(kind, title, message){ var box=$('#actionStatus'); box.className='panel-box status '+(kind||''); box.innerHTML='<strong>'+E(title)+'</strong><div class="sub">'+E(message)+'</div>'; }
+function applyTheme(theme){ state.theme = theme==='light' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', state.theme); try{ localStorage.setItem('wardenips_admin_theme', state.theme); }catch(error){} $('#themeToggle').textContent = state.theme==='light' ? 'Dark Mode' : 'Light Mode'; $('#themeChip').textContent = 'Theme: ' + (state.theme==='light' ? 'Light' : 'Dark'); }
+function initTheme(){ var saved='dark'; try{ saved = localStorage.getItem('wardenips_admin_theme') || 'dark'; }catch(error){} applyTheme(saved); }
 async function api(path, options){
   try{
     var response = await fetch(path, options || {});
@@ -1533,6 +1573,7 @@ async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); a
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
   ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#refreshNow').addEventListener('click', function(){ handleUserActivity(); refresh(); });
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
@@ -1541,11 +1582,14 @@ function bind(){
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
   $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });
+  $('#testAllNotificationsBtn').addEventListener('click', async function(){ handleUserActivity(); await performAction('/api/admin/test-notification', {channel:'all'}, 'Notification test sent', function(payload){ return payload.message || 'All configured notification channels were tested.'; }); });
+  $('#testTelegramBtn').addEventListener('click', async function(){ handleUserActivity(); await performAction('/api/admin/test-notification', {channel:'telegram'}, 'Telegram test sent', function(payload){ return payload.message || 'Telegram test message was dispatched.'; }); });
+  $('#testDiscordBtn').addEventListener('click', async function(){ handleUserActivity(); await performAction('/api/admin/test-notification', {channel:'discord'}, 'Discord test sent', function(payload){ return payload.message || 'Discord test message was dispatched.'; }); });
   $('#banRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.ban-action'); if(!button){ return; } var hash = button.getAttribute('data-hash'); if(!hash || !confirm('Deactivate this database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-ban', {ip_hash:hash}, 'Ban record updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' matching records.'; }); });
   $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
 }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
-bind(); bindActivity(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+initTheme(); bind(); bindActivity(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 })();
 </script>
 </body>

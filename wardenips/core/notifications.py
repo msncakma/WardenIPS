@@ -178,9 +178,46 @@ class NotificationManager:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def send_test_notification(self, channel: str = "all") -> dict[str, object]:
+        """Send an operator-triggered test notification to one or more channels."""
+        requested = str(channel or "all").strip().lower()
+        if requested not in {"all", "telegram", "discord"}:
+            raise ValueError("Unsupported notification channel.")
+
+        if not _AIOHTTP_AVAILABLE or not self._session:
+            raise RuntimeError("Notification transport is unavailable.")
+
+        title = f"🧪 WardenIPS v{__version__} — Test Notification"
+        body = (
+            "**Trigger:** Admin dashboard manual test\n"
+            "**Purpose:** Validate notification delivery and channel credentials\n"
+            f"**Version:** v{__version__} ({__author__})"
+        )
+
+        results: dict[str, str] = {}
+        targets: list[tuple[str, object, bool]] = []
+        if requested in {"all", "telegram"}:
+            targets.append(("telegram", self._send_telegram, self._telegram_enabled))
+        if requested in {"all", "discord"}:
+            targets.append(("discord", self._send_discord, self._discord_enabled))
+
+        any_enabled = False
+        for name, sender, enabled in targets:
+            if not enabled:
+                results[name] = "disabled"
+                continue
+            any_enabled = True
+            sent = await sender(title, body)
+            results[name] = "sent" if sent else "failed"
+
+        if not any_enabled:
+            raise RuntimeError("No matching notification channels are enabled.")
+
+        return {"requested": requested, "results": results}
+
     # ── Telegram ──
 
-    async def _send_telegram(self, title: str, body: str) -> None:
+    async def _send_telegram(self, title: str, body: str) -> bool:
         """Send a message via Telegram Bot API."""
         # Telegram uses HTML or Markdown — we'll use MarkdownV2 with fallback
         # to plain text if escaping is an issue.  For simplicity, use HTML.
@@ -199,6 +236,7 @@ class NotificationManager:
                     self._send_times.append(time.monotonic())
                     if resp.status == 200:
                         self._total_sent += 1
+                        return True
                     else:
                         self._total_failed += 1
                         body_text = await resp.text()
@@ -206,13 +244,15 @@ class NotificationManager:
                             "Telegram API error %d: %s",
                             resp.status, body_text[:200],
                         )
+                        return False
             except Exception as exc:
                 self._total_failed += 1
                 logger.debug("Telegram send failed: %s", exc)
+                return False
 
     # ── Discord ──
 
-    async def _send_discord(self, title: str, body: str) -> None:
+    async def _send_discord(self, title: str, body: str) -> bool:
         """Send a message via Discord Webhook."""
         # Discord Webhook accepts embeds or content
         embed = {
@@ -231,6 +271,7 @@ class NotificationManager:
                     self._send_times.append(time.monotonic())
                     if resp.status in (200, 204):
                         self._total_sent += 1
+                        return True
                     else:
                         self._total_failed += 1
                         body_text = await resp.text()
@@ -238,9 +279,11 @@ class NotificationManager:
                             "Discord webhook error %d: %s",
                             resp.status, body_text[:200],
                         )
+                        return False
             except Exception as exc:
                 self._total_failed += 1
                 logger.debug("Discord send failed: %s", exc)
+                return False
 
     async def close(self) -> None:
         """Close the HTTP session."""

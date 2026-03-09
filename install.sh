@@ -16,6 +16,8 @@ VERBOSE="${WARDENIPS_VERBOSE:-0}"
 DEBUG_MODE="${WARDENIPS_DEBUG:-0}"
 SERVICE_USER="${WARDENIPS_USER:-wardenips}"
 SERVICE_GROUP="${WARDENIPS_GROUP:-wardenips}"
+APP_VERSION="unknown"
+APP_AUTHOR="unknown"
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -134,6 +136,30 @@ deploy_files() {
         --exclude='data' \
         --exclude='*.pyc' \
         "$SOURCE_DIR/" "$INSTALL_DIR/"
+}
+
+load_app_metadata() {
+    if [ ! -f "$INSTALL_DIR/wardenips/__init__.py" ]; then
+        return
+    fi
+
+    APP_METADATA="$(python3 - "$INSTALL_DIR/wardenips/__init__.py" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+version_match = re.search(r'''^__version__\s*=\s*["']([^"']+)["']''', text, re.MULTILINE)
+author_match = re.search(r'''^__author__\s*=\s*["']([^"']+)["']''', text, re.MULTILINE)
+version = version_match.group(1) if version_match else "unknown"
+author = author_match.group(1) if author_match else "unknown"
+print(f"{version}\n{author}")
+PY
+)"
+
+    APP_VERSION="$(printf '%s\n' "$APP_METADATA" | sed -n '1p')"
+    APP_AUTHOR="$(printf '%s\n' "$APP_METADATA" | sed -n '2p')"
 }
 
 ensure_venv() {
@@ -346,6 +372,7 @@ PY
 
     if [ -d "$(dirname "$SSH_LOG_PATH")" ] && command -v setfacl >/dev/null 2>&1; then
         setfacl -m "u:${SERVICE_USER}:rx" "$(dirname "$SSH_LOG_PATH")" || true
+        setfacl -d -m "u:${SERVICE_USER}:rx" "$(dirname "$SSH_LOG_PATH")" || true
     fi
 
     if [ -f "$SSH_LOG_PATH" ]; then
@@ -356,7 +383,7 @@ PY
             warn "setfacl is not available, relying on group-based access for $SSH_LOG_PATH."
         fi
     else
-        warn "$SSH_LOG_PATH was not found during install. Group-based access has still been prepared for future log creation."
+        warn "$SSH_LOG_PATH was not found during install. Default ACLs were prepared on $(dirname "$SSH_LOG_PATH") for future log creation."
     fi
 }
 
@@ -392,7 +419,7 @@ run_privileged_shell() {
     fi
 
     if command -v sudo >/dev/null 2>&1; then
-        exec sudo sh -c "cd '$INSTALL_DIR' && exec /bin/sh"
+        exec sudo env INSTALL_DIR="$INSTALL_DIR" WRAPPER_SHELL="${SHELL:-/bin/sh}" sh -c 'cd "$INSTALL_DIR" && exec "$WRAPPER_SHELL"'
     fi
 
     printf "This command requires root or sudo.\n" >&2
@@ -463,7 +490,17 @@ case "${1:-help}" in
         ;;
 esac
 EOF
-    sed -i "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$CLI_WRAPPER"
+    python3 - "$CLI_WRAPPER" "$INSTALL_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+
+wrapper_path = Path(sys.argv[1])
+install_dir = sys.argv[2]
+text = wrapper_path.read_text(encoding="utf-8")
+text = text.replace("__INSTALL_DIR__", install_dir)
+wrapper_path.write_text(text, encoding="utf-8")
+PY
     chmod +x "$CLI_WRAPPER"
 }
 
@@ -504,6 +541,7 @@ PY
 install_dependencies
 detect_source_dir
 deploy_files "$SOURCE_DIR"
+load_app_metadata
 ensure_service_user
 ensure_venv
 merge_config_template
@@ -518,6 +556,8 @@ printf "%b\n" "${GREEN}============================================${NC}"
 printf "%b\n" "${GREEN}   WardenIPS installed successfully!${NC}"
 printf "%b\n" "${GREEN}============================================${NC}"
 printf "\n"
+printf "%b\n" "  Version      : ${CYAN}v$APP_VERSION${NC}"
+printf "%b\n" "  Maintainer   : ${CYAN}$APP_AUTHOR${NC}"
 printf "%b\n" "  Install dir  : ${CYAN}$INSTALL_DIR${NC}"
 printf "%b\n" "  Database     : ${CYAN}$DATA_DIR/warden.db${NC}"
 printf "%b\n" "  Logs         : ${CYAN}$LOG_DIR/warden.log${NC}"
