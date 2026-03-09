@@ -60,14 +60,14 @@ Our repository releases follow these tags:
 ## 🛠️ TODO / Future Road map
 WardenIPS is an actively evolving project. Here are some of our planned features:
 - [x] `Add systemd service template (wardenips.service) for daemonizing.`
-- [ ] `Support for IPv6 blocking.`
-- [ ] `Implement Docker support for easier deployment.`
-- [ ] `Add Nginx / Apache plugin for Layer 7 web threat detection.`
-- [ ] `Implement Redis backend support as an alternative to SQLite for enterprise clusters.`
-- [ ] `Add Web Dashboard (UI) for monitoring blocked IPs and risk scores.`
-- [ ] `Add Telegram and Discord integration for notifications.`
-- [ ] `Auto setup script.`
-- [ ] `Decentralized Threat Intelligence:` A feature that can be toggled on/off to sync banned IPs between all WardenIPS instances globally automatically!
+- [x] `Support for IPv6 blocking.`
+- [x] `Implement Docker support for easier deployment.`
+- [x] `Add Nginx / Apache plugin for Layer 7 web threat detection.`
+- [x] `Implement Redis backend support as an alternative to SQLite for enterprise clusters.`
+- [x] `Add Web Dashboard (UI) for monitoring blocked IPs and risk scores.`
+- [x] `Add Telegram and Discord integration for notifications.`
+- [x] `Auto setup script.`
+- [x] `Decentralized Threat Intelligence:` A feature that can be toggled on/off to sync banned IPs between all WardenIPS instances globally automatically!
 - [x] `Burst/Flood auto-detection:` Automatically bans IPs that send a flood of events within a short time window.
 - [x] `CLI status command:` `python3 main.py --status` for quick database summary without starting the daemon.
 - [x] `Periodic runtime statistics logging:` Automatic uptime/event/ban summaries every 5 minutes.

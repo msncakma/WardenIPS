@@ -10,12 +10,12 @@ whitelist:
   ips:
     - "127.0.0.1"
     - "::1"
-    - "192.168.1.100"         # MUST CHANGE: Your server or home IP
+    # - "192.168.1.100"         # MUST CHANGE: Your server or home IP
   # CIDR ranges that will NEVER be blocked
   cidr_ranges:
     - "10.0.0.0/8"
     - "172.16.0.0/12"
-    - "192.168.0.0/16"
+    # - "192.168.0.0/16"
 
 geofencing:
   enabled: false              # If true, IPs not matching criteria get an immediate high risk score
@@ -24,12 +24,17 @@ geofencing:
     - "TR"                    # ISO 3166-1 alpha-2 country codes
 
 database:
+  backend: "sqlite"           # "sqlite" (default) or "redis" (enterprise/cluster)
   sqlite:
     path: "/var/lib/wardenips/warden.db" 
+  redis:
+    url: "redis://localhost:6379/0"
+    prefix: "warden:"
+    event_ttl: 86400          # Event retention in Redis (seconds, default 24h)
   ip_hashing:
     enabled: true
     # IMPORTANT: Change this salt to a secure random string for GDPR compliance!
-    salt: "YOUR-RANDOM-SECURE-SALT-STRING-HERE"
+    salt: "YOUR-RANaDOM-SECURE-SALT-STRING-HERE"
     algorithm: "sha256"
 
 maxmind:
@@ -64,6 +69,35 @@ abuseipdb:
   api_key: ""
   rate_limit_per_minute: 10
 
+notifications:
+  rate_limit_per_minute: 20   # Max notifications across all channels
+  telegram:
+    enabled: false
+    bot_token: ""             # Get from @BotFather on Telegram
+    chat_id: ""               # Your chat or group ID
+  discord:
+    enabled: false
+    webhook_url: ""           # Discord channel webhook URL
+
+dashboard:
+  enabled: false
+  host: "127.0.0.1"          # Bind address (use 0.0.0.0 for external access)
+  port: 7680
+  api_key: ""                # Optional Bearer token for API auth (leave empty to disable)
+
+threat_intel:
+  enabled: false
+  sync_interval: 300          # Pull from peers every N seconds
+  share_bans: true            # Share our ban hashes with peers
+  auto_ban_received: false    # Auto-ban IPs from peers (hashed IPs = correlation only)
+  received_ban_duration: 1800 # Duration for auto-bans from peers (seconds)
+  peers: []                   # List of peer URLs, e.g. ["http://10.0.0.2:7681"]
+  server:
+    enabled: true
+    host: "0.0.0.0"
+    port: 7681
+    api_key: ""               # Shared secret between all nodes
+
 plugins:
   ssh:
     enabled: true
@@ -74,3 +108,7 @@ plugins:
     enabled: false
     log_path: "/opt/minecraft/logs/latest.log"
     rapid_connection_threshold: 10  # Connections within analysis_interval signaling a botnet
+    
+  nginx:
+    enabled: false
+    log_path: "/var/log/nginx/access.log"

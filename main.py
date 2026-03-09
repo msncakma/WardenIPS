@@ -28,12 +28,16 @@ from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.database import DatabaseManager
 from wardenips.core.firewall import FirewallManager
 from wardenips.core.abuseipdb import AbuseIPDBReporter
+from wardenips.core.notifications import NotificationManager
+from wardenips.core.threat_intel import ThreatIntelSync
 from wardenips.core.log_tailer import LogTailer
 from wardenips.core.models import ConnectionEvent, ThreatLevel
 from wardenips.core.updater import UpdateChecker
+from wardenips.api.dashboard import DashboardAPI
 from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
+from wardenips.plugins.nginx_plugin import NginxPlugin
 
 # Version
 __version__ = "0.1.0"
@@ -57,6 +61,9 @@ class WardenIPS:
         self._db: DatabaseManager = None
         self._firewall: FirewallManager = None
         self._abuse_reporter: AbuseIPDBReporter = None
+        self._notifier: NotificationManager = None
+        self._dashboard: DashboardAPI = None
+        self._threat_intel: ThreatIntelSync = None
         self._plugin_manager: PluginManager = None
         self._tailers: list[LogTailer] = []
         self._running = False
@@ -107,7 +114,13 @@ class WardenIPS:
 
         self._hasher = IPHasher.from_config(self._config)
 
-        self._db = await DatabaseManager.create(self._config)
+        # Select database backend (sqlite or redis)
+        db_backend = self._config.get("database.backend", "sqlite")
+        if db_backend == "redis":
+            from wardenips.core.redis_backend import RedisDatabaseManager
+            self._db = await RedisDatabaseManager.create(self._config)
+        else:
+            self._db = await DatabaseManager.create(self._config)
         self._logger.info("Database: %s", self._db)
 
         self._firewall = await FirewallManager.create(
@@ -117,6 +130,9 @@ class WardenIPS:
 
         self._abuse_reporter = await AbuseIPDBReporter.create(self._config)
         self._logger.info("AbuseIPDB: %s", self._abuse_reporter)
+
+        self._notifier = await NotificationManager.create(self._config)
+        self._logger.info("Notifications: %s", self._notifier)
 
         # ── 5. Load Plugins ──
         self._plugin_manager = PluginManager(self._config)
@@ -128,6 +144,22 @@ class WardenIPS:
 
         self._running = True
         self._start_time = time.monotonic()
+
+        # ── 7. Dashboard API (optional) ──
+        self._dashboard = DashboardAPI(
+            self._config, self._db, self._firewall, self._start_time,
+        )
+        if self._dashboard.enabled:
+            await self._dashboard.start()
+
+        # ── 8. Threat Intelligence Sync (optional) ──
+        self._threat_intel = await ThreatIntelSync.create(
+            self._config, self._db, self._firewall,
+        )
+        if self._threat_intel.enabled:
+            await self._threat_intel.start()
+            self._logger.info("Threat Intel: %s", self._threat_intel)
+
         self._logger.info("")
         self._logger.info("=" * 60)
         self._logger.info(
@@ -148,6 +180,11 @@ class WardenIPS:
         if self._config.get("plugins.minecraft.enabled", True):
             mc_plugin = MinecraftPlugin(self._config)
             self._plugin_manager.register(mc_plugin)
+
+        # Nginx Plugin
+        if self._config.get("plugins.nginx.enabled", False):
+            nginx_plugin = NginxPlugin(self._config)
+            self._plugin_manager.register(nginx_plugin)
 
     def _start_tailers(self) -> None:
         """Creates and starts a LogTailer for each active plugin."""
@@ -219,6 +256,12 @@ class WardenIPS:
                         "Plugin=%s",
                         event.source_ip, len(ts_list),
                         self._burst_window, plugin.name,
+                    )
+                    await self._notifier.notify_burst(
+                        ip=event.source_ip,
+                        event_count=len(ts_list),
+                        window=self._burst_window,
+                        plugin=plugin.name,
                     )
                     # Clear tracker for this IP so we don't keep re-banning
                     self._burst_tracker.pop(event.source_ip, None)
@@ -307,6 +350,14 @@ class WardenIPS:
                         ip=event.source_ip,
                         categories=categories,
                         comment=reason,
+                    )
+                    # Send notification
+                    await self._notifier.notify_ban(
+                        ip=event.source_ip,
+                        reason=reason,
+                        risk=risk_score,
+                        duration=ban_duration,
+                        plugin=plugin.name,
                     )
 
                 self._logger.warning(
@@ -478,6 +529,12 @@ class WardenIPS:
         # Close services
         if self._abuse_reporter:
             await self._abuse_reporter.close()
+        if self._notifier:
+            await self._notifier.close()
+        if self._dashboard:
+            await self._dashboard.stop()
+        if self._threat_intel:
+            await self._threat_intel.stop()
         if self._firewall:
             await self._firewall.shutdown()
         if self._db:

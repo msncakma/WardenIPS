@@ -18,6 +18,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import platform
 import shutil
 from typing import Optional
@@ -50,15 +51,18 @@ class FirewallManager:
 
     def __init__(self) -> None:
         self._set_name: str = "warden_blacklist"
+        self._set_name_v6: str = "warden_blacklist_v6"
         self._default_ban_duration: int = 3600
         self._simulation_mode: bool = False
         self._whitelist = None
         self._initialized: bool = False
-        # Resolved absolute paths for ipset/iptables so they work regardless
-        # of whether /usr/sbin is in the current user's PATH (common on Debian
-        # when running without sudo).
+        # Resolved absolute paths for ipset/iptables/ip6tables so they work
+        # regardless of whether /usr/sbin is in the current user's PATH
+        # (common on Debian when running without sudo).
         self._ipset_cmd: str = "ipset"
         self._iptables_cmd: str = "iptables"
+        self._ip6tables_cmd: str = "ip6tables"
+        self._ipv6_supported: bool = False
         # When True, all firewall commands are prefixed with 'sudo -n'.
         # Activated automatically when the process is not root but the user has
         # configured passwordless sudo for ipset/iptables (NOPASSWD in sudoers).
@@ -112,10 +116,14 @@ class FirewallManager:
             search_path = os.pathsep.join([os.environ.get("PATH", ""), *extra])
             ipset_path = shutil.which("ipset", path=search_path)
             iptables_path = shutil.which("iptables", path=search_path)
+            ip6tables_path = shutil.which("ip6tables", path=search_path)
             if ipset_path:
                 self._ipset_cmd = ipset_path
             if iptables_path:
                 self._iptables_cmd = iptables_path
+            if ip6tables_path:
+                self._ip6tables_cmd = ip6tables_path
+                self._ipv6_supported = True
             has_ipset = ipset_path is not None
             has_iptables = iptables_path is not None
         else:
@@ -163,12 +171,21 @@ class FirewallManager:
                         self._ipset_cmd, self._iptables_cmd,
                     )
 
-        # ipset setini olustur
+        # ipset setini olustur (IPv4)
         await self._exec_command(
             self._ipset_cmd, "create", self._set_name,
             "hash:ip", "timeout", str(self._default_ban_duration),
             "-exist",
         )
+
+        # ipset setini olustur (IPv6) — only if ip6tables is available
+        if self._ipv6_supported:
+            await self._exec_command(
+                self._ipset_cmd, "create", self._set_name_v6,
+                "hash:ip", "family", "inet6",
+                "timeout", str(self._default_ban_duration),
+                "-exist",
+            )
 
         # iptables DROP kuralini ekle — once kontrol et, duplike olmasini onle.
         # Her restart'ta -I cagrilirsa INPUT chain'e yeni kural eklenir ve
@@ -186,17 +203,49 @@ class FirewallManager:
                 "-j", "DROP",
             )
 
+        # ip6tables DROP rule for IPv6 set
+        if self._ipv6_supported:
+            rule6_exists = await self._exec_command(
+                self._ip6tables_cmd, "-C", "INPUT",
+                "-m", "set", "--match-set", self._set_name_v6, "src",
+                "-j", "DROP",
+                ignore_errors=True,
+            )
+            if not rule6_exists:
+                await self._exec_command(
+                    self._ip6tables_cmd, "-I", "INPUT",
+                    "-m", "set", "--match-set", self._set_name_v6, "src",
+                    "-j", "DROP",
+                )
+
         # Populate in-memory ban set from existing ipset entries so that
         # a restart does not lose track of already-banned IPs.
         if not self._simulation_mode:
             await self._load_existing_bans()
 
         self._initialized = True
+        ipv6_str = "enabled" if self._ipv6_supported else "disabled"
         logger.info(
-            "Firewall started. Set: '%s', "
+            "Firewall started. Set: '%s', IPv6: %s, "
             "Default ban duration: %ds, Simulation: %s",
-            self._set_name, self._default_ban_duration, self._simulation_mode,
+            self._set_name, ipv6_str,
+            self._default_ban_duration, self._simulation_mode,
         )
+
+    # ── Helpers ──
+
+    def _is_ipv6(self, ip_str: str) -> bool:
+        """Returns True if the given IP string is an IPv6 address."""
+        try:
+            return isinstance(ipaddress.ip_address(ip_str), ipaddress.IPv6Address)
+        except ValueError:
+            return False
+
+    def _get_set_for_ip(self, ip_str: str) -> str:
+        """Returns the ipset name appropriate for the IP address family."""
+        if self._is_ipv6(ip_str) and self._ipv6_supported:
+            return self._set_name_v6
+        return self._set_name
 
     # ── Ana API ──
 
@@ -237,17 +286,18 @@ class FirewallManager:
             return True
 
         ban_duration = duration if duration is not None else self._default_ban_duration
+        target_set = self._get_set_for_ip(ip_str)
 
         if ban_duration > 0:
             success = await self._exec_command(
-                self._ipset_cmd, "add", self._set_name, ip_str,
+                self._ipset_cmd, "add", target_set, ip_str,
                 "timeout", str(ban_duration),
                 "-exist",
             )
         else:
             # Kalici ban (timeout 0)
             success = await self._exec_command(
-                self._ipset_cmd, "add", self._set_name, ip_str,
+                self._ipset_cmd, "add", target_set, ip_str,
                 "-exist",
             )
 
@@ -271,7 +321,7 @@ class FirewallManager:
             True if unban was successful.
         """
         success = await self._exec_command(
-            self._ipset_cmd, "del", self._set_name, ip_str,
+            self._ipset_cmd, "del", self._get_set_for_ip(ip_str), ip_str,
             "-exist",
         )
         if success:
@@ -292,7 +342,7 @@ class FirewallManager:
         if ip_str in self._banned_ips:
             return True
         success = await self._exec_command(
-            self._ipset_cmd, "test", self._set_name, ip_str,
+            self._ipset_cmd, "test", self._get_set_for_ip(ip_str), ip_str,
             ignore_errors=True,
         )
         return success
@@ -309,9 +359,14 @@ class FirewallManager:
         success = await self._exec_command(
             self._ipset_cmd, "flush", self._set_name
         )
+        if self._ipv6_supported:
+            await self._exec_command(
+                self._ipset_cmd, "flush", self._set_name_v6
+            )
         if success:
             self._banned_ips.clear()
-            logger.warning("ALL BANS REMOVED! Set '%s' flushed.", self._set_name)
+            logger.warning("ALL BANS REMOVED! Sets '%s'/'%s' flushed.",
+                           self._set_name, self._set_name_v6)
         return success
 
     async def get_banned_count(self) -> int:
@@ -324,26 +379,30 @@ class FirewallManager:
         if self._simulation_mode:
             return 0
 
-        try:
-            cmd = []
-            if self._use_sudo:
-                cmd = [self._sudo_cmd, "-n"]
-            cmd += [self._ipset_cmd, "list", self._set_name, "-t"]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            output = stdout.decode("utf-8", errors="replace")
+        total = 0
+        for set_name in (self._set_name, self._set_name_v6):
+            if set_name == self._set_name_v6 and not self._ipv6_supported:
+                continue
+            try:
+                cmd = []
+                if self._use_sudo:
+                    cmd = [self._sudo_cmd, "-n"]
+                cmd += [self._ipset_cmd, "list", set_name, "-t"]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                output = stdout.decode("utf-8", errors="replace")
 
-            for line in output.splitlines():
-                if line.strip().startswith("Number of entries:"):
-                    return int(line.split(":")[-1].strip())
-        except Exception as exc:
-            logger.debug("Failed to get ban count: %s", exc)
+                for line in output.splitlines():
+                    if line.strip().startswith("Number of entries:"):
+                        total += int(line.split(":")[-1].strip())
+            except Exception as exc:
+                logger.debug("Failed to get ban count for %s: %s", set_name, exc)
 
-        return 0
+        return total
 
     # ── Sudo probe ──
 
@@ -369,35 +428,39 @@ class FirewallManager:
 
     async def _load_existing_bans(self) -> None:
         """Populate _banned_ips from ipset entries that survived a previous run."""
-        try:
-            cmd = []
-            if self._use_sudo:
-                cmd = [self._sudo_cmd, "-n"]
-            cmd += [self._ipset_cmd, "list", self._set_name]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode != 0:
-                return
-            in_members = False
-            for line in stdout.decode(errors="replace").splitlines():
-                stripped = line.strip()
-                if stripped == "Members:":
-                    in_members = True
-                    continue
-                if in_members and stripped:
-                    # Each member line is: "<ip> timeout <secs>" or just "<ip>"
-                    self._banned_ips.add(stripped.split()[0])
-            if self._banned_ips:
-                logger.info(
-                    "Loaded %d existing ban(s) from ipset '%s'.",
-                    len(self._banned_ips), self._set_name,
+        sets_to_load = [self._set_name]
+        if self._ipv6_supported:
+            sets_to_load.append(self._set_name_v6)
+        for set_name in sets_to_load:
+            try:
+                cmd = []
+                if self._use_sudo:
+                    cmd = [self._sudo_cmd, "-n"]
+                cmd += [self._ipset_cmd, "list", set_name]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-        except Exception as exc:
-            logger.debug("Could not load existing bans from ipset: %s", exc)
+                stdout, _ = await proc.communicate()
+                if proc.returncode != 0:
+                    continue
+                in_members = False
+                for line in stdout.decode(errors="replace").splitlines():
+                    stripped = line.strip()
+                    if stripped == "Members:":
+                        in_members = True
+                        continue
+                    if in_members and stripped:
+                        # Each member line is: "<ip> timeout <secs>" or just "<ip>"
+                        self._banned_ips.add(stripped.split()[0])
+            except Exception as exc:
+                logger.debug("Could not load existing bans from ipset %s: %s", set_name, exc)
+        if self._banned_ips:
+            logger.info(
+                "Loaded %d existing ban(s) from ipset.",
+                len(self._banned_ips),
+            )
 
     # ── Shutdown ──
 

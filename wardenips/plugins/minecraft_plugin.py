@@ -23,12 +23,15 @@ from wardenips.plugins.base_plugin import BasePlugin
 
 
 # ══════════════════════════════════════════════════════════
-#  Minecraft Log Regex Kaliplari
+#  Minecraft Log Regex Kaliplari (IPv4 + IPv6)
 # ══════════════════════════════════════════════════════════
+
+# Generic IP pattern: matches IPv4 dotted-quad or IPv6 (colon-hex)
+_IP = r'(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]{3,39})'
 
 # [14:30:22] [Server thread/INFO]: PlayerName[/203.0.113.50:12345] logged in
 _RE_LOGIN = re.compile(
-    r"\[.*?INFO\].*?:\s+(\S+)\[/(\d+\.\d+\.\d+\.\d+):\d+\]\s+logged in"
+    r"\[.*?INFO\].*?:\s+(\S+)\[/" + _IP + r":\d+\]\s+logged in"
 )
 
 # [14:30:22] [Server thread/INFO]: PlayerName lost connection: Disconnected
@@ -38,17 +41,17 @@ _RE_DISCONNECT = re.compile(
 
 # [14:30:22] [Server thread/INFO]: /203.0.113.50:12345 lost connection: ...
 _RE_IP_DISCONNECT = re.compile(
-    r"\[.*?INFO\].*?:\s+/(\d+\.\d+\.\d+\.\d+):\d+\s+lost connection:\s+(.*)"
+    r"\[.*?INFO\].*?:\s+/" + _IP + r":\d+\s+lost connection:\s+(.*)"
 )
 
 # [14:30:22] [Server thread/WARN]: Failed to handle packet for /203.0.113.50:12345
 _RE_FAILED_PACKET = re.compile(
-    r"\[.*?WARN\].*?Failed to handle packet for /(\d+\.\d+\.\d+\.\d+)"
+    r"\[.*?WARN\].*?Failed to handle packet for /" + _IP
 )
 
 # [14:30:22] [Server thread/INFO]: com.mojang.authlib.GameProfile ... (/203.0.113.50) ...
 _RE_GAMEPROFILE_LOGIN = re.compile(
-    r"GameProfile\{.*?name='?(\S+?)'?}\s*\(/(\d+\.\d+\.\d+\.\d+)\)"
+    r"GameProfile\{.*?name='?(\S+?)'?}\s*\(/" + _IP + r"\)"
 )
 
 # Minecraft log tarih formati: [14:30:22]

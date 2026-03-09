@@ -2,9 +2,6 @@
 WardenIPS - Async Database Manager
 ============================================
 
-GDPR-compliant asynchronous SQLite database. IP addresses are not stored as plain text
-— all IP addresses are hashed for anonymity.
-
 Record fields:
   - Timestamp
   - Hash'ed IP

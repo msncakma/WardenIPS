@@ -1,0 +1,28 @@
+services:
+  wardenips:
+    build: .
+    container_name: wardenips
+    restart: unless-stopped
+    # NET_ADMIN is required for ipset/iptables
+    # NET_RAW is required for raw socket operations
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Host network is required so iptables rules apply to the host
+    network_mode: host
+    volumes:
+      # Persistent data & logs
+      - wardenips-data:/var/lib/wardenips
+      - wardenips-logs:/var/log/wardenips
+      # Custom config (optional — override the default)
+      - ./config.yaml:/opt/wardenips/config.yaml:ro
+      # Host log files the plugins need to monitor
+      - /var/log/auth.log:/var/log/auth.log:ro
+      # Uncomment for Nginx monitoring:
+      # - /var/log/nginx:/var/log/nginx:ro
+      # Uncomment for Minecraft monitoring:
+      # - /opt/minecraft/logs:/opt/minecraft/logs:ro
+
+volumes:
+  wardenips-data:
+  wardenips-logs:

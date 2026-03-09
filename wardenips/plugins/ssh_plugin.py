@@ -22,32 +22,35 @@ from wardenips.plugins.base_plugin import BasePlugin
 
 
 # ══════════════════════════════════════════════════════════
-#  auth.log Regex Kaliplari
+#  auth.log Regex Kaliplari (IPv4 + IPv6)
 # ══════════════════════════════════════════════════════════
+
+# Generic IP pattern: matches IPv4 dotted-quad or IPv6 (colon-hex)
+_IP = r'(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]{3,39})'
 
 # Failed password for root from 203.0.113.50 port 22 ssh2
 _RE_FAILED_PASSWORD = re.compile(
-    r"Failed password for (?:invalid user )?(\S+) from (\d+\.\d+\.\d+\.\d+)"
+    r"Failed password for (?:invalid user )?(\S+) from " + _IP
 )
 
 # Invalid user admin from 203.0.113.50 port 22
 _RE_INVALID_USER = re.compile(
-    r"Invalid user (\S+) from (\d+\.\d+\.\d+\.\d+)"
+    r"Invalid user (\S+) from " + _IP
 )
 
 # Accepted password for root from 192.168.1.1 port 54321 ssh2
 _RE_ACCEPTED_PASSWORD = re.compile(
-    r"Accepted (?:password|publickey) for (\S+) from (\d+\.\d+\.\d+\.\d+)"
+    r"Accepted (?:password|publickey) for (\S+) from " + _IP
 )
 
 # Connection closed by authenticating user root 203.0.113.50 port 22
 _RE_CONNECTION_CLOSED = re.compile(
-    r"Connection (?:closed|reset) by (?:authenticating user )?(\S+)?\s*(\d+\.\d+\.\d+\.\d+)"
+    r"Connection (?:closed|reset) by (?:authenticating user )?(\S+)?\s*" + _IP
 )
 
 # pam_unix(sshd:auth): authentication failure; ... rhost=203.0.113.50 user=root
 _RE_PAM_FAILURE = re.compile(
-    r"pam_unix\(sshd:auth\): authentication failure;.*rhost=(\d+\.\d+\.\d+\.\d+)(?:\s+user=(\S+))?"
+    r"pam_unix\(sshd:auth\): authentication failure;.*rhost=" + _IP + r"(?:\s+user=(\S+))?"
 )
 
 # sshd auth.log tarih formati: Mar  8 14:30:22
