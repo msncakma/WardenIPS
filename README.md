@@ -85,8 +85,10 @@ What the installer does:
 - Fetches or updates the project files.
 - Creates and repairs the Python virtual environment if needed.
 - Installs Python dependencies.
+- Creates a dedicated `wardenips` service user by default and prepares runtime ownership automatically.
 - Generates a secure hashing salt automatically.
 - Preserves the previous `config.yaml`, then merges any newly added template keys from `config_backup.yaml` into the active config.
+- Grants the service account read access to the SSH log path and adds it to `adm` on Debian/Ubuntu-style systems.
 - Enables the dashboard by default on `127.0.0.1:7680`.
 - Installs and enables the systemd service.
 - Installs a `wardenips` command wrapper so common checks do not require changing into the install directory.
@@ -113,6 +115,15 @@ Bootstrap installer flags:
 - `WARDENIPS_AUTOSTART=1` starts the service automatically after install.
 - `WARDENIPS_ENABLE_DASHBOARD=0` keeps the dashboard disabled during bootstrap.
 - `WARDENIPS_REPO_BRANCH=branch-name` installs from a different branch.
+- `WARDENIPS_USER=username` overrides the default service user.
+- `WARDENIPS_GROUP=groupname` overrides the default service group.
+
+Verbose and debug install commands:
+
+```sh
+sudo env WARDENIPS_VERBOSE=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
+sudo env WARDENIPS_DEBUG=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
+```
 
 Direct terminal commands after install:
 

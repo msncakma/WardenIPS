@@ -14,9 +14,12 @@ ENABLE_DASHBOARD="${WARDENIPS_ENABLE_DASHBOARD:-1}"
 CLI_WRAPPER="/usr/local/bin/wardenips"
 VERBOSE="${WARDENIPS_VERBOSE:-0}"
 DEBUG_MODE="${WARDENIPS_DEBUG:-0}"
+SERVICE_USER="${WARDENIPS_USER:-wardenips}"
+SERVICE_GROUP="${WARDENIPS_GROUP:-wardenips}"
 
 TMP_DIR=""
 SOURCE_DIR=""
+HAS_ADM_GROUP="0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,11 +71,11 @@ install_dependencies() {
         if is_verbose; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog
+                acl ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog
         else
             apt-get update -qq
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog \
+                acl ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog \
                 >/dev/null
         fi
         return
@@ -158,6 +161,29 @@ ensure_venv() {
     else
         "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
         "$INSTALL_DIR/venv/bin/python" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt"
+    fi
+}
+
+ensure_service_user() {
+    log "Ensuring service account..."
+
+    if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+        groupadd --system "$SERVICE_GROUP"
+    fi
+
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        useradd \
+            --system \
+            --gid "$SERVICE_GROUP" \
+            --home-dir "$INSTALL_DIR" \
+            --shell /usr/sbin/nologin \
+            --comment "WardenIPS service account" \
+            "$SERVICE_USER"
+    fi
+
+    if getent group adm >/dev/null 2>&1; then
+        HAS_ADM_GROUP="1"
+        usermod -a -G adm "$SERVICE_USER"
     fi
 }
 
@@ -285,6 +311,55 @@ PY
     fi
 }
 
+configure_permissions() {
+    log "Configuring ownership and permissions..."
+
+    mkdir -p "$DATA_DIR" "$LOG_DIR"
+    touch "$LOG_DIR/warden.log"
+
+    chown -R root:"$SERVICE_GROUP" "$INSTALL_DIR"
+    chmod -R g=rX,o= "$INSTALL_DIR"
+    find "$INSTALL_DIR" -type d -exec chmod 750 {} +
+
+    chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
+    find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +
+    find "$DATA_DIR" "$LOG_DIR" -type f -exec chmod 640 {} +
+}
+
+grant_plugin_log_access() {
+    SSH_LOG_PATH="$($INSTALL_DIR/venv/bin/python - "$INSTALL_DIR/config.yaml" <<'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+
+config_path = Path(sys.argv[1])
+config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+print(config.get("plugins", {}).get("ssh", {}).get("log_path", "/var/log/auth.log"))
+PY
+)"
+
+    if [ -z "$SSH_LOG_PATH" ]; then
+        SSH_LOG_PATH="/var/log/auth.log"
+    fi
+
+    if [ -d "$(dirname "$SSH_LOG_PATH")" ] && command -v setfacl >/dev/null 2>&1; then
+        setfacl -m "u:${SERVICE_USER}:rx" "$(dirname "$SSH_LOG_PATH")" || true
+    fi
+
+    if [ -f "$SSH_LOG_PATH" ]; then
+        if command -v setfacl >/dev/null 2>&1; then
+            setfacl -m "u:${SERVICE_USER}:r" "$SSH_LOG_PATH"
+            log "Granted $SERVICE_USER read access to $SSH_LOG_PATH."
+        else
+            warn "setfacl is not available, relying on group-based access for $SSH_LOG_PATH."
+        fi
+    else
+        warn "$SSH_LOG_PATH was not found during install. Group-based access has still been prepared for future log creation."
+    fi
+}
+
 install_cli_wrapper() {
     log "Installing CLI wrapper..."
     cat > "$CLI_WRAPPER" <<'EOF'
@@ -369,6 +444,26 @@ EOF
 install_service() {
     log "Installing systemd service..."
     cp "$INSTALL_DIR/wardenips.service" "$SERVICE_FILE"
+    python3 - "$SERVICE_FILE" "$INSTALL_DIR" "$SERVICE_USER" "$SERVICE_GROUP" "$HAS_ADM_GROUP" <<'PY'
+from pathlib import Path
+import sys
+
+
+service_path = Path(sys.argv[1])
+install_dir = sys.argv[2]
+service_user = sys.argv[3]
+service_group = sys.argv[4]
+has_adm_group = sys.argv[5] == "1"
+text = service_path.read_text(encoding="utf-8")
+text = text.replace("__SERVICE_USER__", service_user)
+text = text.replace("__SERVICE_GROUP__", service_group)
+text = text.replace("__INSTALL_DIR__", install_dir)
+text = text.replace(
+    "__SUPPLEMENTARY_GROUPS__",
+    "SupplementaryGroups=adm" if has_adm_group else "",
+)
+service_path.write_text(text, encoding="utf-8")
+PY
     systemctl daemon-reload
     run_quiet systemctl enable wardenips
 
@@ -383,9 +478,12 @@ install_service() {
 install_dependencies
 detect_source_dir
 deploy_files "$SOURCE_DIR"
+ensure_service_user
 ensure_venv
 merge_config_template
 configure_defaults
+configure_permissions
+grant_plugin_log_access
 install_cli_wrapper
 install_service
 
@@ -399,6 +497,7 @@ printf "%b\n" "  Database     : ${CYAN}$DATA_DIR/warden.db${NC}"
 printf "%b\n" "  Logs         : ${CYAN}$LOG_DIR/warden.log${NC}"
 printf "%b\n" "  Dashboard    : ${CYAN}http://127.0.0.1:7680/${NC}"
 printf "%b\n" "  Service      : ${CYAN}wardenips.service${NC}"
+printf "%b\n" "  Service user : ${CYAN}$SERVICE_USER${NC}"
 printf "\n"
 printf "%b\n" "  ${YELLOW}Before production use:${NC}"
 printf "%b\n" "    1. Review ${CYAN}$INSTALL_DIR/config.yaml${NC}"

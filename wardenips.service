@@ -6,11 +6,13 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=root
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+__SUPPLEMENTARY_GROUPS__
 
 # Change the path below to match your actual installation path
-WorkingDirectory=/opt/wardenips
-ExecStart=/opt/wardenips/venv/bin/python /opt/wardenips/main.py --config /opt/wardenips/config.yaml
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/main.py --config __INSTALL_DIR__/config.yaml
 
 # Restart policies
 Restart=on-failure
