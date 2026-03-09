@@ -75,6 +75,9 @@ class WardenIPS:
         self._logger.info("  Starting WardenIPS v%s...", __version__)
         self._logger.info("=" * 60)
 
+        # ── 2.5 System Dependency Checks ──
+        await self._check_dependencies()
+
         # ── 3. Check for Updates ──
         updater = UpdateChecker(current_version=__version__)
         await updater.check_for_updates()
@@ -282,6 +285,37 @@ class WardenIPS:
             pass
         finally:
             await self.shutdown()
+
+    async def _check_dependencies(self) -> None:
+        """Verifies if required system programs are installed."""
+        import shutil
+        import sys
+
+        # Basic tools check
+        required_tools = []
+        if sys.platform != "win32":
+            required_tools.extend(["ipset", "iptables"])
+            
+            # Optional but recommended
+            if not shutil.which("rsyslogd") and not shutil.which("journalctl"):
+                self._logger.warning(
+                    "System check: Neither 'rsyslog' nor 'journalctl' was found. "
+                    "Log tailing might not work correctly if logs are not written."
+                )
+
+        missing = []
+        for tool in required_tools:
+            if not shutil.which(tool):
+                missing.append(tool)
+        
+        if missing:
+            self._logger.warning(
+                "System check: Missing required tools: %s. "
+                "WardenIPS might not function correctly or will run in simulation mode.",
+                ", ".join(missing)
+            )
+        else:
+            self._logger.debug("System check: All required dependencies are installed.")
 
     async def shutdown(self) -> None:
         """Safely shutdown all components."""
