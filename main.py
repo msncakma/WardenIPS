@@ -75,6 +75,9 @@ class WardenIPS:
         self._logger.info("  Starting WardenIPS v%s...", __version__)
         self._logger.info("=" * 60)
 
+        # ── 2.1 System Info Logging ──
+        self._log_system_info()
+
         # ── 2.5 System Dependency Checks ──
         await self._check_dependencies()
 
@@ -285,6 +288,54 @@ class WardenIPS:
             pass
         finally:
             await self.shutdown()
+
+    def _log_system_info(self) -> None:
+        """Logs basic system information for easier debugging."""
+        import platform
+        import sys
+        import os
+
+        os_info = f"{platform.system()} {platform.release()} ({platform.version()})"
+        arch_info = f"{platform.machine()} ({platform.architecture()[0]})"
+        py_version = sys.version.split()[0]
+        
+        # Try to get RAM info using standard libs
+        mem_info = "Unknown"
+        try:
+            if sys.platform == "linux":
+                # Using sysconf on linux
+                pages = os.sysconf("SC_PHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                total_ram_gb = (pages * page_size) / (1024 ** 3)
+                mem_info = f"{total_ram_gb:.1f} GB"
+            elif sys.platform == "win32":
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                total_ram_gb = stat.ullTotalPhys / (1024 ** 3)
+                mem_info = f"{total_ram_gb:.1f} GB"
+        except Exception:
+            pass
+
+        self._logger.info("--- System Information ---")
+        self._logger.info("OS      : %s", os_info)
+        self._logger.info("Arch    : %s", arch_info)
+        self._logger.info("Python  : %s", py_version)
+        self._logger.info("RAM     : %s", mem_info)
+        self._logger.info("--------------------------")
 
     async def _check_dependencies(self) -> None:
         """Verifies if required system programs are installed."""
