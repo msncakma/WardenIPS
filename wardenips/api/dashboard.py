@@ -37,499 +37,595 @@ import time
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote
 
+from aiohttp import web
+
+from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-try:
-    from aiohttp import web
-    _AIOHTTP_WEB_AVAILABLE = True
-except ImportError:
-    _AIOHTTP_WEB_AVAILABLE = False
+_AIOHTTP_WEB_AVAILABLE = True
 
 
 class DashboardAPI:
-    """
-    Async REST API server for WardenIPS monitoring.
+  """Async REST API server for WardenIPS monitoring."""
 
-    Usage:
-        api = DashboardAPI(config, db, firewall, start_time)
-        await api.start()
-        ...
-        await api.stop()
-    """
+  def __init__(
+    self,
+    config,
+    db,
+    firewall,
+    start_time: float,
+    threat_intel=None,
+  ) -> None:
+    self._config = config
+    self._db = db
+    self._firewall = firewall
+    self._start_time = start_time
+    self._threat_intel = threat_intel
+    self._enabled: bool = False
+    self._host: str = "127.0.0.1"
+    self._port: int = 7680
+    self._app: Optional[web.Application] = None
+    self._runner: Optional[web.AppRunner] = None
+    self._api_key: str = ""
+    self._dashboard_username: str = "admin"
+    self._dashboard_password: str = ""
+    self._session_ttl: int = 600
+    self._login_rate_limit_per_minute: int = 10
+    self._session_cookie_name: str = "wardenips_dashboard_session"
+    self._sessions: dict[str, float] = {}
+    self._login_attempts: dict[str, list[float]] = {}
+    self._activity_touches: dict[str, list[float]] = {}
+    self._activity_touch_interval_seconds: int = 15
+    self._ip_hasher = IPHasher.from_config(config)
+    self._initialize_config()
 
-    def __init__(
-        self,
-        config,
-        db,
-        firewall,
-        start_time: float,
-        threat_intel=None,
-    ) -> None:
-        self._config = config
-        self._db = db
-        self._firewall = firewall
-        self._start_time = start_time
-        self._threat_intel = threat_intel
-        self._enabled: bool = False
-        self._host: str = "127.0.0.1"
-        self._port: int = 7680
-        self._app: Optional[web.Application] = None
-        self._runner: Optional[web.AppRunner] = None
-        self._api_key: str = ""
-        self._dashboard_username: str = "admin"
-        self._dashboard_password: str = ""
-        self._session_ttl: int = 43200
-        self._login_rate_limit_per_minute: int = 10
-        self._session_cookie_name: str = "wardenips_dashboard_session"
-        self._sessions: dict[str, float] = {}
-        self._login_attempts: dict[str, list[float]] = {}
-        self._initialize_config()
+  def _initialize_config(self) -> None:
+    dash = self._config.get_section("dashboard") if self._config.get("dashboard", None) else {}
+    if not dash:
+      return
+    self._enabled = dash.get("enabled", False)
+    self._host = dash.get("host", "127.0.0.1")
+    self._port = dash.get("port", 7680)
+    self._api_key = dash.get("api_key", "")
+    self._dashboard_username = dash.get("username", "admin")
+    self._dashboard_password = dash.get("password", "")
+    self._session_ttl = max(int(dash.get("session_ttl", 600)), 60)
+    self._login_rate_limit_per_minute = max(
+      int(dash.get("login_rate_limit_per_minute", 10)),
+      1,
+    )
 
-    def _initialize_config(self) -> None:
-        dash = self._config.get_section("dashboard") if self._config.get("dashboard", None) else {}
-        if not dash:
-            return
-        self._enabled = dash.get("enabled", False)
-        self._host = dash.get("host", "127.0.0.1")
-        self._port = dash.get("port", 7680)
-        self._api_key = dash.get("api_key", "")
-        self._dashboard_username = dash.get("username", "admin")
-        self._dashboard_password = dash.get("password", "")
-        self._session_ttl = max(int(dash.get("session_ttl", 43200)), 300)
-        self._login_rate_limit_per_minute = max(
-          int(dash.get("login_rate_limit_per_minute", 10)), 1
-        )
+  @property
+  def enabled(self) -> bool:
+    return self._enabled and _AIOHTTP_WEB_AVAILABLE
 
-    @property
-    def enabled(self) -> bool:
-        return self._enabled and _AIOHTTP_WEB_AVAILABLE
+  def _get_dashboard_secrets(self) -> set[str]:
+    return {value for value in (self._dashboard_password, self._api_key) if value}
 
-    def _get_dashboard_secrets(self) -> set[str]:
-        return {
-            value
-            for value in (self._dashboard_password, self._api_key)
-            if value
+  def _dashboard_auth_configured(self) -> bool:
+    return bool(self._get_dashboard_secrets())
+
+  def _get_session_token(self, request: web.Request) -> str:
+    return request.cookies.get(self._session_cookie_name, "")
+
+  def _cleanup_expired_sessions(self) -> None:
+    now = time.time()
+    expired = [token for token, expires_at in self._sessions.items() if expires_at <= now]
+    for token in expired:
+      self._sessions.pop(token, None)
+
+  def _client_ip(self, request: web.Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    return forwarded_for or request.remote or "unknown"
+
+  def _consume_rate_limit(
+    self,
+    bucket: dict[str, list[float]],
+    key: str,
+    limit: int,
+    window_seconds: int,
+  ) -> bool:
+    now = time.monotonic()
+    entries = [value for value in bucket.get(key, []) if now - value < window_seconds]
+    if len(entries) >= limit:
+      bucket[key] = entries
+      return True
+    entries.append(now)
+    bucket[key] = entries
+    return False
+
+  def _is_session_authenticated(self, request: web.Request) -> bool:
+    self._cleanup_expired_sessions()
+    token = self._get_session_token(request)
+    if not token:
+      return False
+    expires_at = self._sessions.get(token)
+    if not expires_at or expires_at <= time.time():
+      self._sessions.pop(token, None)
+      return False
+    return True
+
+  def _touch_session(self, request: web.Request) -> bool:
+    if not self._dashboard_auth_configured():
+      return False
+    token = self._get_session_token(request)
+    if not token:
+      return False
+    expires_at = self._sessions.get(token)
+    if not expires_at or expires_at <= time.time():
+      self._sessions.pop(token, None)
+      return False
+    self._sessions[token] = time.time() + self._session_ttl
+    return True
+
+  def _password_matches(self, candidate: str) -> bool:
+    return any(
+      hmac.compare_digest(candidate, secret)
+      for secret in self._get_dashboard_secrets()
+    )
+
+  def _check_auth(self, request: web.Request) -> bool:
+    if self._is_session_authenticated(request):
+      return True
+    if not self._dashboard_auth_configured():
+      return False
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+      return False
+    token = auth[7:]
+    return token in self._get_dashboard_secrets()
+
+  def _json_auth_error(self) -> web.Response:
+    if not self._dashboard_auth_configured():
+      return web.json_response(
+        {
+          "error": "auth_not_configured",
+          "message": "Configure dashboard.password or dashboard.api_key before using the dashboard.",
+        },
+        status=503,
+      )
+    return web.json_response({"error": "unauthorized"}, status=401)
+
+  def _require_dashboard_auth(self, request: web.Request) -> Optional[web.Response]:
+    if self._is_session_authenticated(request):
+      return None
+    next_path = quote(request.path_qs or "/admin", safe="/%?=&")
+    raise web.HTTPFound(f"/login?next={next_path}")
+
+  def _issue_session(self, response: web.StreamResponse, request: web.Request) -> None:
+    token = secrets.token_urlsafe(32)
+    self._sessions[token] = time.time() + self._session_ttl
+    response.set_cookie(
+      self._session_cookie_name,
+      token,
+      max_age=self._session_ttl,
+      httponly=True,
+      secure=request.secure,
+      samesite="Lax",
+      path="/",
+    )
+
+  def _clear_session(self, request: web.Request, response: web.StreamResponse) -> None:
+    token = self._get_session_token(request)
+    if token:
+      self._sessions.pop(token, None)
+    response.del_cookie(self._session_cookie_name, path="/")
+
+  async def start(self) -> None:
+    if not self.enabled:
+      return
+
+    self._app = web.Application()
+    self._app.router.add_get("/", self._handle_dashboard)
+    self._app.router.add_get("/admin", self._handle_dashboard_v2)
+    self._app.router.add_get("/v2", self._handle_dashboard_v2)
+    self._app.router.add_get("/login", self._handle_login_page)
+    self._app.router.add_post("/api/login", self._handle_login)
+    self._app.router.add_post("/api/logout", self._handle_logout)
+    self._app.router.add_post("/api/session/activity", self._handle_session_activity)
+    self._app.router.add_get("/logout", self._handle_logout)
+    self._app.router.add_get("/api/health", self._handle_health)
+    self._app.router.add_get("/api/stats", self._handle_stats)
+    self._app.router.add_get("/api/bans", self._handle_bans)
+    self._app.router.add_get("/api/firewall-bans", self._handle_firewall_bans)
+    self._app.router.add_get("/api/events", self._handle_events)
+    self._app.router.add_get("/api/firewall", self._handle_firewall)
+    self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
+    self._app.router.add_get("/api/events-timeline", self._handle_events_timeline)
+    self._app.router.add_get("/api/country-stats", self._handle_country_stats)
+    self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
+    self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
+    self._app.router.add_get("/api/threat-intel", self._handle_threat_intel)
+    self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
+    self._app.router.add_post("/api/admin/deactivate-ban", self._handle_admin_deactivate_ban)
+    self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
+    self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
+    self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
+    self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
+
+    self._runner = web.AppRunner(self._app, access_log=None)
+    await self._runner.setup()
+    site = web.TCPSite(self._runner, self._host, self._port)
+    await site.start()
+    logger.info("Dashboard API started on http://%s:%d", self._host, self._port)
+
+  async def stop(self) -> None:
+    if self._runner:
+      await self._runner.cleanup()
+      logger.info("Dashboard API stopped.")
+
+  async def _handle_health(self, request: web.Request) -> web.Response:
+    uptime = int(time.monotonic() - self._start_time)
+    minutes, seconds = divmod(uptime, 60)
+    hours, minutes = divmod(minutes, 60)
+    return web.json_response(
+      {
+        "status": "ok",
+        "uptime": f"{hours:02d}:{minutes:02d}:{seconds:02d}",
+        "uptime_seconds": uptime,
+      }
+    )
+
+  async def _handle_stats(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    stats = await self._db.get_stats()
+    stats["firewall_active_bans"] = await self._firewall.get_banned_count()
+    stats["simulation_mode"] = self._firewall.simulation_mode
+    return web.json_response(stats)
+
+  async def _handle_bans(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT ip_hash, reason, risk_score, ban_duration,
+               banned_at, expires_at, is_active
+          FROM ban_history
+          WHERE is_active = 1
+          ORDER BY banned_at DESC
+          LIMIT 100
+          """
+        ) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          bans = [dict(zip(columns, row)) for row in rows]
+      return web.json_response({"bans": bans, "count": len(bans)})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_events(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    limit = min(int(request.query.get("limit", "50")), 200)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT id, timestamp, ip_hash, player_name,
+               connection_type, asn_number, asn_org,
+               country_code, is_datacenter, risk_score,
+               threat_level, details
+          FROM connection_events
+          ORDER BY id DESC
+          LIMIT ?
+          """,
+          (limit,),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          events = [dict(zip(columns, row)) for row in rows]
+      return web.json_response({"events": events, "count": len(events)})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_firewall(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    count = await self._firewall.get_banned_count()
+    return web.json_response(
+      {
+        "simulation_mode": self._firewall.simulation_mode,
+        "active_bans": count,
+        "firewall": repr(self._firewall),
+      }
+    )
+
+  async def _handle_firewall_bans(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    limit = min(int(request.query.get("limit", "500")), 2000)
+    try:
+      items = await self._firewall.list_banned_ips(limit=limit)
+      return web.json_response({"items": items, "count": len(items)})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_top_attackers(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    limit = min(int(request.query.get("limit", "10")), 50)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT ip_hash,
+               COUNT(*) as ban_count,
+               MAX(risk_score) as max_risk,
+               MAX(banned_at) as last_ban
+          FROM ban_history
+          GROUP BY ip_hash
+          ORDER BY ban_count DESC
+          LIMIT ?
+          """,
+          (limit,),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          attackers = [dict(zip(columns, row)) for row in rows]
+      return web.json_response({"attackers": attackers})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_events_timeline(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    hours = min(int(request.query.get("hours", "24")), 168)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
+               COUNT(*) as count
+          FROM connection_events
+          WHERE timestamp >= datetime('now', ? || ' hours')
+          GROUP BY hour
+          ORDER BY hour ASC
+          """,
+          (f"-{hours}",),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          timeline = [{"hour": r[0], "count": r[1]} for r in rows]
+      return web.json_response({"timeline": timeline})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_country_stats(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT COALESCE(country_code, 'Unknown') as country,
+               COUNT(*) as count
+          FROM connection_events
+          WHERE country_code IS NOT NULL
+          GROUP BY country_code
+          ORDER BY count DESC
+          LIMIT 20
+          """
+        ) as cursor:
+          rows = await cursor.fetchall()
+          countries = [{"country": r[0], "count": r[1]} for r in rows]
+      return web.json_response({"countries": countries})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_threat_distribution(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT threat_level, COUNT(*) as count
+          FROM connection_events
+          GROUP BY threat_level
+          ORDER BY count DESC
+          """
+        ) as cursor:
+          rows = await cursor.fetchall()
+          distribution = [{"level": r[0], "count": r[1]} for r in rows]
+      return web.json_response({"distribution": distribution})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_plugin_stats(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT connection_type, COUNT(*) as count
+          FROM connection_events
+          GROUP BY connection_type
+          ORDER BY count DESC
+          """
+        ) as cursor:
+          rows = await cursor.fetchall()
+          plugins = [{"plugin": r[0], "count": r[1]} for r in rows]
+      return web.json_response({"plugins": plugins})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_threat_intel(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    if not self._threat_intel:
+      return web.json_response(
+        {
+          "enabled": False,
+          "mode": "disabled",
+          "description": "Threat intelligence sync is not configured.",
+          "peers": [],
         }
+      )
+    try:
+      return web.json_response(await self._threat_intel.get_status())
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
 
-    def _dashboard_auth_enabled(self) -> bool:
-        return bool(self._get_dashboard_secrets())
+  async def _handle_login_page(self, request: web.Request) -> web.Response:
+    if self._is_session_authenticated(request):
+      raise web.HTTPFound("/admin")
+    next_path = request.query.get("next", "/admin")
+    if not next_path.startswith("/"):
+      next_path = "/admin"
+    html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
+    html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
+    html = html.replace("__AUTH_READY__", "true" if self._dashboard_auth_configured() else "false")
+    html = html.replace(
+      "__SETUP_MESSAGE__",
+      json.dumps(
+        "Configure dashboard.password or dashboard.api_key in config.yaml and restart WardenIPS before using /admin."
+      ),
+    )
+    return web.Response(text=html, content_type="text/html")
 
-    def _cleanup_expired_sessions(self) -> None:
-        now = time.time()
-        expired = [token for token, expires_at in self._sessions.items() if expires_at <= now]
-        for token in expired:
-            self._sessions.pop(token, None)
+  async def _handle_login(self, request: web.Request) -> web.Response:
+    client_ip = self._client_ip(request)
+    if self._consume_rate_limit(
+      self._login_attempts,
+      client_ip,
+      self._login_rate_limit_per_minute,
+      60,
+    ):
+      return web.json_response(
+        {"error": "too_many_attempts", "message": "Too many login attempts."},
+        status=429,
+      )
+    try:
+      payload = await request.json()
+    except Exception:
+      form_data = await request.post()
+      payload = dict(form_data)
 
-    def _client_ip(self, request: web.Request) -> str:
-        forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-        return forwarded_for or request.remote or "unknown"
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    next_path = str(payload.get("next", "/admin")).strip() or "/admin"
+    if not next_path.startswith("/"):
+      next_path = "/admin"
+    if not self._dashboard_auth_configured():
+      return self._json_auth_error()
+    if username != self._dashboard_username or not self._password_matches(password):
+      return web.json_response(
+        {"error": "invalid_credentials", "message": "Invalid username or password."},
+        status=401,
+      )
 
-    def _consume_rate_limit(
-        self,
-        bucket: dict[str, list[float]],
-        key: str,
-        limit: int,
-        window_seconds: int,
-    ) -> bool:
-        now = time.monotonic()
-        entries = [value for value in bucket.get(key, []) if now - value < window_seconds]
-        if len(entries) >= limit:
-            bucket[key] = entries
-            return True
-        entries.append(now)
-        bucket[key] = entries
-        return False
+    response = web.json_response({"ok": True, "redirect_to": next_path})
+    self._issue_session(response, request)
+    return response
 
-    def _is_session_authenticated(self, request: web.Request) -> bool:
-        if not self._dashboard_auth_enabled():
-            return True
+  async def _handle_logout(self, request: web.Request) -> web.Response:
+    if request.method == "GET":
+      response = web.HTTPFound("/login")
+    else:
+      response = web.json_response({"ok": True, "redirect_to": "/login"})
+    self._clear_session(request, response)
+    return response
 
-        self._cleanup_expired_sessions()
-        token = request.cookies.get(self._session_cookie_name, "")
-        if not token:
-            return False
+  async def _handle_session_activity(self, request: web.Request) -> web.Response:
+    if not self._is_session_authenticated(request):
+      return self._json_auth_error()
+    token = self._get_session_token(request)
+    if self._consume_rate_limit(
+      self._activity_touches,
+      token,
+      limit=1,
+      window_seconds=self._activity_touch_interval_seconds,
+    ):
+      return web.json_response(
+        {"ok": True, "ttl_seconds": max(int(self._sessions.get(token, 0) - time.time()), 0)}
+      )
+    self._touch_session(request)
+    return web.json_response(
+      {"ok": True, "ttl_seconds": max(int(self._sessions.get(token, 0) - time.time()), 0)}
+    )
 
-        expires_at = self._sessions.get(token)
-        if not expires_at or expires_at <= time.time():
-            self._sessions.pop(token, None)
-            return False
+  async def _handle_admin_unban_ip(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    payload = await request.json()
+    ip_value = str(payload.get("ip", "")).strip()
+    if not ip_value:
+      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
+    firewall_result = await self._firewall.unban_ip(ip_value)
+    deactivated = await self._db.deactivate_ban_by_hash(self._ip_hasher.hash_ip(ip_value))
+    return web.json_response(
+      {
+        "ok": firewall_result,
+        "message": f"Removed {ip_value} from firewall bans.",
+        "deactivated_records": deactivated,
+      }
+    )
 
-        self._sessions[token] = time.time() + self._session_ttl
-        return True
+  async def _handle_admin_deactivate_ban(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    payload = await request.json()
+    ip_hash = str(payload.get("ip_hash", "")).strip()
+    if not ip_hash:
+      return web.json_response(
+        {"error": "invalid_hash", "message": "Ban hash is required."},
+        status=400,
+      )
+    updated = await self._db.deactivate_ban_by_hash(ip_hash)
+    return web.json_response({"ok": True, "updated": updated})
 
-    def _password_matches(self, candidate: str) -> bool:
-        return any(
-            hmac.compare_digest(candidate, secret)
-            for secret in self._get_dashboard_secrets()
-        )
+  async def _handle_admin_deactivate_all_bans(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    updated = await self._db.deactivate_all_bans()
+    return web.json_response({"ok": True, "updated": updated})
 
-    def _check_auth(self, request: web.Request) -> bool:
-        """Verify API key if configured."""
-        if not self._dashboard_auth_enabled():
-            return True
-        if self._is_session_authenticated(request):
-            return True
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return False
-        token = auth[7:]
-        return token in self._get_dashboard_secrets()
+  async def _handle_admin_flush_firewall(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    flushed = await self._firewall.flush()
+    updated = await self._db.deactivate_all_bans()
+    return web.json_response({"ok": flushed, "deactivated_records": updated})
 
-    def _require_dashboard_auth(self, request: web.Request) -> Optional[web.Response]:
-        if self._is_session_authenticated(request):
-            return None
-        if not self._dashboard_auth_enabled():
-            return None
-        next_path = quote(request.path_qs or "/admin", safe="/%?=&")
-        raise web.HTTPFound(f"/login?next={next_path}")
+  async def _handle_admin_clear_events(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    deleted = await self._db.clear_events()
+    return web.json_response({"ok": True, "deleted": deleted})
 
-    def _issue_session(self, response: web.StreamResponse, request: web.Request) -> None:
-        token = secrets.token_urlsafe(32)
-        self._sessions[token] = time.time() + self._session_ttl
-        response.set_cookie(
-            self._session_cookie_name,
-            token,
-            max_age=self._session_ttl,
-            httponly=True,
-            secure=request.secure,
-            samesite="Lax",
-            path="/",
-        )
+  async def _handle_admin_clear_ban_history(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    deleted = await self._db.clear_ban_history()
+    return web.json_response({"ok": True, "deleted": deleted})
 
-    def _clear_session(self, request: web.Request, response: web.StreamResponse) -> None:
-        token = request.cookies.get(self._session_cookie_name, "")
-        if token:
-            self._sessions.pop(token, None)
-        response.del_cookie(self._session_cookie_name, path="/")
+  async def _handle_dashboard(self, request: web.Request) -> web.Response:
+    auth_redirect = self._require_dashboard_auth(request)
+    if auth_redirect is not None:
+      return auth_redirect
+    self._touch_session(request)
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
-    async def start(self) -> None:
-        if not self.enabled:
-            return
-
-        self._app = web.Application()
-        self._app.router.add_get("/", self._handle_dashboard)
-        self._app.router.add_get("/admin", self._handle_dashboard_v2)
-        self._app.router.add_get("/v2", self._handle_dashboard_v2)
-        self._app.router.add_get("/login", self._handle_login_page)
-        self._app.router.add_post("/api/login", self._handle_login)
-        self._app.router.add_post("/api/logout", self._handle_logout)
-        self._app.router.add_get("/logout", self._handle_logout)
-        self._app.router.add_get("/api/health", self._handle_health)
-        self._app.router.add_get("/api/stats", self._handle_stats)
-        self._app.router.add_get("/api/bans", self._handle_bans)
-        self._app.router.add_get("/api/firewall-bans", self._handle_firewall_bans)
-        self._app.router.add_get("/api/events", self._handle_events)
-        self._app.router.add_get("/api/firewall", self._handle_firewall)
-        self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
-        self._app.router.add_get("/api/events-timeline", self._handle_events_timeline)
-        self._app.router.add_get("/api/country-stats", self._handle_country_stats)
-        self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
-        self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
-        self._app.router.add_get("/api/threat-intel", self._handle_threat_intel)
-
-        self._runner = web.AppRunner(self._app, access_log=None)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self._host, self._port)
-        await site.start()
-        logger.info(
-            "Dashboard API started on http://%s:%d",
-            self._host, self._port,
-        )
-
-    async def stop(self) -> None:
-        if self._runner:
-            await self._runner.cleanup()
-            logger.info("Dashboard API stopped.")
-
-    # ── Core Handlers ──
-
-    async def _handle_health(self, request: web.Request) -> web.Response:
-        uptime = int(time.monotonic() - self._start_time)
-        m, s = divmod(uptime, 60)
-        h, m = divmod(m, 60)
-        return web.json_response({
-            "status": "ok",
-            "uptime": f"{h:02d}:{m:02d}:{s:02d}",
-            "uptime_seconds": uptime,
-        })
-
-    async def _handle_stats(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        stats = await self._db.get_stats()
-        banned_count = await self._firewall.get_banned_count()
-        stats["firewall_active_bans"] = banned_count
-        stats["simulation_mode"] = self._firewall.simulation_mode
-        return web.json_response(stats)
-
-    async def _handle_bans(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT ip_hash, reason, risk_score, ban_duration,
-                           banned_at, expires_at, is_active
-                    FROM ban_history
-                    WHERE is_active = 1
-                    ORDER BY banned_at DESC
-                    LIMIT 100
-                    """
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    columns = [d[0] for d in cursor.description]
-                    bans = [dict(zip(columns, row)) for row in rows]
-            return web.json_response({"bans": bans, "count": len(bans)})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_events(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        limit = min(int(request.query.get("limit", "50")), 200)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT id, timestamp, ip_hash, player_name,
-                           connection_type, asn_number, asn_org,
-                           country_code, is_datacenter, risk_score,
-                           threat_level, details
-                    FROM connection_events
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    columns = [d[0] for d in cursor.description]
-                    events = [dict(zip(columns, row)) for row in rows]
-            return web.json_response({"events": events, "count": len(events)})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_firewall(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        count = await self._firewall.get_banned_count()
-        return web.json_response({
-            "simulation_mode": self._firewall.simulation_mode,
-            "active_bans": count,
-            "firewall": repr(self._firewall),
-        })
-
-    async def _handle_firewall_bans(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        limit = min(int(request.query.get("limit", "500")), 2000)
-        try:
-            items = await self._firewall.list_banned_ips(limit=limit)
-            return web.json_response({"items": items, "count": len(items)})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    # ── Analytics Handlers ──
-
-    async def _handle_top_attackers(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        limit = min(int(request.query.get("limit", "10")), 50)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT ip_hash,
-                           COUNT(*) as ban_count,
-                           MAX(risk_score) as max_risk,
-                           MAX(banned_at) as last_ban
-                    FROM ban_history
-                    GROUP BY ip_hash
-                    ORDER BY ban_count DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    columns = [d[0] for d in cursor.description]
-                    attackers = [dict(zip(columns, row)) for row in rows]
-            return web.json_response({"attackers": attackers})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_events_timeline(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        hours = min(int(request.query.get("hours", "24")), 168)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
-                           COUNT(*) as count
-                    FROM connection_events
-                    WHERE timestamp >= datetime('now', ? || ' hours')
-                    GROUP BY hour
-                    ORDER BY hour ASC
-                    """,
-                    (f"-{hours}",),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    timeline = [{"hour": r[0], "count": r[1]} for r in rows]
-            return web.json_response({"timeline": timeline})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_country_stats(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT COALESCE(country_code, 'Unknown') as country,
-                           COUNT(*) as count
-                    FROM connection_events
-                    WHERE country_code IS NOT NULL
-                    GROUP BY country_code
-                    ORDER BY count DESC
-                    LIMIT 20
-                    """
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    countries = [{"country": r[0], "count": r[1]} for r in rows]
-            return web.json_response({"countries": countries})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_threat_distribution(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT threat_level, COUNT(*) as count
-                    FROM connection_events
-                    GROUP BY threat_level
-                    ORDER BY count DESC
-                    """
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    distribution = [{"level": r[0], "count": r[1]} for r in rows]
-            return web.json_response({"distribution": distribution})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_plugin_stats(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        try:
-            async with self._db._lock:
-                async with self._db._db.execute(
-                    """
-                    SELECT connection_type, COUNT(*) as count
-                    FROM connection_events
-                    GROUP BY connection_type
-                    ORDER BY count DESC
-                    """
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    plugins = [{"plugin": r[0], "count": r[1]} for r in rows]
-            return web.json_response({"plugins": plugins})
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    async def _handle_threat_intel(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        if not self._threat_intel:
-            return web.json_response({
-                "enabled": False,
-                "mode": "disabled",
-                "description": "Threat intelligence sync is not configured.",
-                "peers": [],
-            })
-        try:
-            return web.json_response(await self._threat_intel.get_status())
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-    # ── Dashboard SPA ──
-
-    async def _handle_login_page(self, request: web.Request) -> web.Response:
-        if not self._dashboard_auth_enabled() or self._is_session_authenticated(request):
-            raise web.HTTPFound("/admin")
-
-        next_path = request.query.get("next", "/admin")
-        if not next_path.startswith("/"):
-            next_path = "/admin"
-        html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
-        html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
-        return web.Response(text=html, content_type="text/html")
-
-    async def _handle_login(self, request: web.Request) -> web.Response:
-        client_ip = self._client_ip(request)
-        if self._consume_rate_limit(
-            self._login_attempts,
-            client_ip,
-            self._login_rate_limit_per_minute,
-            60,
-        ):
-            return web.json_response(
-                {"error": "too_many_attempts", "message": "Too many login attempts."},
-                status=429,
-            )
-
-        payload: dict[str, str]
-        try:
-            payload = await request.json()
-        except Exception:
-            form_data = await request.post()
-            payload = dict(form_data)
-
-        username = str(payload.get("username", "")).strip()
-        password = str(payload.get("password", ""))
-        next_path = str(payload.get("next", "/admin")).strip() or "/admin"
-        if not next_path.startswith("/"):
-            next_path = "/admin"
-
-        if not self._dashboard_auth_enabled():
-            return web.json_response({"ok": True, "redirect_to": next_path})
-
-        if username != self._dashboard_username or not self._password_matches(password):
-            return web.json_response(
-                {"error": "invalid_credentials", "message": "Invalid username or password."},
-                status=401,
-            )
-
-        response = web.json_response({"ok": True, "redirect_to": next_path})
-        self._issue_session(response, request)
-        return response
-
-    async def _handle_logout(self, request: web.Request) -> web.Response:
-      if request.method == "GET":
-        response = web.HTTPFound("/login")
-      else:
-        response = web.json_response({"ok": True, "redirect_to": "/login"})
-        self._clear_session(request, response)
-        return response
-
-    async def _handle_dashboard(self, request: web.Request) -> web.Response:
-        auth_redirect = self._require_dashboard_auth(request)
-        if auth_redirect is not None:
-            return auth_redirect
-        return web.Response(text=DASHBOARD_HTML, content_type="text/html")
-
-    async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
-        auth_redirect = self._require_dashboard_auth(request)
-        if auth_redirect is not None:
-            return auth_redirect
-        if request.path == "/v2":
-            raise web.HTTPFound("/admin")
-        return web.Response(text=DASHBOARD_V2_HTML, content_type="text/html")
+  async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
+    auth_redirect = self._require_dashboard_auth(request)
+    if auth_redirect is not None:
+      return auth_redirect
+    if request.path == "/v2":
+      raise web.HTTPFound("/admin")
+    self._touch_session(request)
+    html = DASHBOARD_V2_HTML.replace("__SESSION_TIMEOUT_MS__", str(self._session_ttl * 1000))
+    return web.Response(text=html, content_type="text/html")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -570,7 +666,7 @@ button[disabled]{opacity:.65;cursor:wait}
   <div class="card">
     <div class="eyebrow">Admin Access</div>
     <h1>Sign in to WardenIPS</h1>
-    <p>The admin console now uses a browser session. If dashboard auth is enabled, log in with the configured dashboard username and password. If no dashboard password is set, the existing API key works as the password for compatibility.</p>
+    <p id="intro">The admin console now uses a browser session. If dashboard auth is enabled, log in with the configured dashboard username and password. If no dashboard password is set, the existing API key works as the password for compatibility.</p>
     <form id="loginForm">
       <div class="field">
         <label for="username">Username</label>
@@ -594,6 +690,8 @@ button[disabled]{opacity:.65;cursor:wait}
 'use strict';
 var nextPath = __NEXT_PATH__;
 var defaultUser = __USERNAME__;
+var authReady = __AUTH_READY__;
+var setupMessage = __SETUP_MESSAGE__;
 var typingTimer = null;
 var submitLocked = false;
 function $(s){return document.querySelector(s)}
@@ -603,6 +701,19 @@ function rateLimitedInput(handler, wait){ return function(ev){ clearTimeout(typi
 
 $('#defaultUser').textContent = defaultUser || 'admin';
 $('#username').value = defaultUser || 'admin';
+var flashMessage = sessionStorage.getItem('wardenips_logout_message');
+if(flashMessage){
+  showMessage('ok', flashMessage);
+  sessionStorage.removeItem('wardenips_logout_message');
+}
+if(!authReady){
+  $('#submitBtn').disabled = true;
+  $('#password').disabled = true;
+  $('#username').disabled = true;
+  $('#hint').textContent = 'Dashboard login is not configured yet.';
+  $('#intro').textContent = setupMessage;
+  showMessage('err', setupMessage);
+}
 ['username','password'].forEach(function(id){
   $('#'+id).addEventListener('input', rateLimitedInput(function(){
     $('#hint').textContent = 'Ready to submit';
@@ -612,6 +723,7 @@ $('#username').value = defaultUser || 'admin';
 
 $('#loginForm').addEventListener('submit', async function(ev){
   ev.preventDefault();
+  if(!authReady){ return; }
   if(submitLocked){ return; }
   submitLocked = true;
   $('#submitBtn').disabled = true;
@@ -864,7 +976,7 @@ footer a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <footer>WardenIPS &mdash; Autonomous Intrusion Prevention &middot; <a href="https://github.com" target="_blank" rel="noopener">GitHub</a></footer>
+  <footer>WardenIPS &mdash; Autonomous Intrusion Prevention &middot; <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></footer>
 </div>
 
 <a class="kofi-fab" href="https://ko-fi.com/msncakma" target="_blank" rel="noopener" title="Support WardenIPS on Ko-fi">
@@ -1066,50 +1178,17 @@ DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
 <title>WardenIPS Admin Console</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#08111f;--bg2:#0d1728;--panel:#111c30;--panel2:#0f1a2c;--b:#22304a;
-  --txt:#e7edf7;--muted:#8da0bd;--blue:#4f8cff;--cyan:#19c2d8;--green:#13c38b;--yellow:#f4b740;--red:#f15b6c;
-}
+:root{--bg:#08111f;--panel:#111c30;--panel2:#0f1a2c;--b:#22304a;--txt:#e7edf7;--muted:#8da0bd;--blue:#4f8cff;--cyan:#19c2d8;--green:#13c38b;--yellow:#f4b740;--red:#f15b6c}
 body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at top,#12203a 0%,#08111f 45%,#070d18 100%);color:var(--txt);min-height:100vh}
-.app{max-width:1560px;margin:0 auto;padding:24px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.brand h1{font-size:1.8rem;font-weight:800;letter-spacing:-.03em}
-.brand p{font-size:.88rem;color:var(--muted);margin-top:4px}
-.actions{display:flex;gap:10px;flex-wrap:wrap}
-.ctrl,.btn{background:var(--panel);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:10px 12px;font-size:.88rem}
-.btn{cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,var(--blue),#375ff5);border-color:#4f8cff}
-.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}
-.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}
-.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}
-.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}
-.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}
-.metric .v{font-size:1.6rem;font-weight:800}
-.layout{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
-.stack{display:grid;gap:16px}
-.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
-.search{flex:1;min-width:220px}
-.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}
-th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
-tr:hover td{background:#0f1d32}
-.mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}
-.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}
-.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
-.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.list{display:grid;gap:10px}
-.list-item{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}
-.list-item strong{display:block;margin-bottom:6px}
-.sub{font-size:.78rem;color:var(--muted);line-height:1.5}
-.advice{display:grid;gap:10px}
-.advice-item{padding:12px;border-radius:12px;border:1px solid var(--b);background:#0b1527}
-.advice-item strong{display:block;margin-bottom:6px}
-.empty{padding:24px;text-align:center;color:var(--muted)}
-.small{font-size:.76rem;color:var(--muted)}
-.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}
+.app{max-width:1600px;margin:0 auto;padding:24px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}.brand h1{font-size:1.9rem;font-weight:800;letter-spacing:-.03em}.brand p{font-size:.9rem;color:var(--muted);margin-top:4px}
+.actions,.toolbar,.action-grid{display:flex;gap:10px;flex-wrap:wrap}.ctrl,.btn{background:var(--panel);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:10px 12px;font-size:.88rem}.btn{cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,var(--blue),#375ff5);border-color:#4f8cff}.btn.warn{background:linear-gradient(135deg,#c2410c,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#991b1b,#dc2626);border-color:#f87171}.btn.ghost{background:#0b1527}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}
+.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.6rem;font-weight:800}
+.layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:#0f1d32}
+.mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
+.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:#175343;background:#0d2e26}.status.err{border-color:#6a2432;background:#32131a}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}.empty{padding:24px;text-align:center;color:var(--muted)}
 @media(max-width:1100px){.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions{width:100%}.ctrl,.btn{width:100%}}
+@media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions,.toolbar,.action-grid{width:100%}.ctrl,.btn{width:100%}}
 </style>
 </head>
 <body>
@@ -1121,6 +1200,7 @@ tr:hover td{background:#0f1d32}
       <div class="linkbar">
         <a href="/">Open Dashboard v1</a>
         <a href="/admin">Canonical admin route</a>
+        <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">Repository</a>
         <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
       </div>
     </div>
@@ -1150,8 +1230,8 @@ tr:hover td{background:#0f1d32}
       <h2>Runtime</h2>
       <div class="list">
         <div class="list-item"><strong id="runtimeMode">Mode: --</strong><span class="sub" id="runtimeUptime">Uptime: --</span></div>
-        <div class="list-item"><strong id="lastUpdated">Last updated: --</strong><span class="sub">Admin UI input handlers are throttled so search and filters do not spam rerenders.</span></div>
-        <div class="list-item"><strong>Privacy Model</strong><span class="sub">Database events and ban history store hashed IP identifiers. Raw IPs are shown only for currently active firewall entries.</span></div>
+        <div class="list-item"><strong id="lastUpdated">Last updated: --</strong><span class="sub">The admin session logs out after 10 minutes of no real user activity.</span></div>
+        <div class="list-item"><strong id="idleStatus">Idle timeout: 10m</strong><span class="sub" id="idleCountdown">Monitoring operator activity.</span></div>
       </div>
     </div>
   </div>
@@ -1159,23 +1239,26 @@ tr:hover td{background:#0f1d32}
   <div class="layout">
     <div class="stack">
       <div class="card">
+        <h2>Action Center</h2>
+        <div class="toolbar">
+          <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
+          <button id="unbanManualBtn" class="btn primary">Unban IP</button>
+        </div>
+        <div class="action-grid">
+          <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
+          <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
+          <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
+          <button id="clearBanHistoryBtn" class="btn danger">Clear Ban History</button>
+        </div>
+        <div id="actionStatus" class="panel-box status"><strong>Action status</strong><div class="sub">Interactive admin actions will report results here.</div></div>
+      </div>
+
+      <div class="card">
         <h2>Recent Security Events</h2>
         <div class="toolbar">
-          <select id="eventPluginFilter" class="ctrl">
-            <option value="">All Plugins</option>
-          </select>
-          <select id="eventThreatFilter" class="ctrl">
-            <option value="">All Threats</option>
-            <option value="CRITICAL">Critical</option>
-            <option value="HIGH">High</option>
-            <option value="MEDIUM">Medium</option>
-            <option value="LOW">Low</option>
-            <option value="NONE">None</option>
-          </select>
-          <select id="eventSort" class="ctrl">
-            <option value="time">Sort: Newest</option>
-            <option value="risk">Sort: Highest Risk</option>
-          </select>
+          <select id="eventPluginFilter" class="ctrl"><option value="">All Plugins</option></select>
+          <select id="eventThreatFilter" class="ctrl"><option value="">All Threats</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="NONE">None</option></select>
+          <select id="eventSort" class="ctrl"><option value="time">Sort: Newest</option><option value="risk">Sort: Highest Risk</option></select>
         </div>
         <div class="table-wrap">
           <table>
@@ -1188,31 +1271,20 @@ tr:hover td{background:#0f1d32}
       <div class="split">
         <div class="card">
           <h2>Active Database Bans</h2>
-          <div class="toolbar">
-            <select id="banSort" class="ctrl">
-              <option value="recent">Sort: Recent</option>
-              <option value="risk">Sort: Highest Risk</option>
-            </select>
-          </div>
+          <div class="toolbar"><select id="banSort" class="ctrl"><option value="recent">Sort: Recent</option><option value="risk">Sort: Highest Risk</option></select></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Hash</th><th>Risk</th><th>Reason</th><th>Expires</th></tr></thead>
+              <thead><tr><th>Hash</th><th>Risk</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead>
               <tbody id="banRows"></tbody>
             </table>
           </div>
         </div>
         <div class="card">
           <h2>Active Firewall IPs</h2>
-          <div class="toolbar">
-            <select id="ipFamilyFilter" class="ctrl">
-              <option value="">All Families</option>
-              <option value="ipv4">IPv4</option>
-              <option value="ipv6">IPv6</option>
-            </select>
-          </div>
+          <div class="toolbar"><select id="ipFamilyFilter" class="ctrl"><option value="">All Families</option><option value="ipv4">IPv4</option><option value="ipv6">IPv6</option></select></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>IP Address</th><th>Family</th></tr></thead>
+              <thead><tr><th>IP Address</th><th>Family</th><th>Action</th></tr></thead>
               <tbody id="firewallRows"></tbody>
             </table>
           </div>
@@ -1221,18 +1293,9 @@ tr:hover td{background:#0f1d32}
     </div>
 
     <div class="stack">
-      <div class="card">
-        <h2>Operator Advice</h2>
-        <div class="advice" id="adviceList"></div>
-      </div>
-      <div class="card">
-        <h2>Threat Mesh</h2>
-        <div class="list" id="meshList"></div>
-      </div>
-      <div class="card">
-        <h2>Top Attackers</h2>
-        <div class="list" id="attackerList"></div>
-      </div>
+      <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
+      <div class="card"><h2>Threat Mesh</h2><div class="list" id="meshList"></div></div>
+      <div class="card"><h2>Top Attackers</h2><div class="list" id="attackerList"></div></div>
     </div>
   </div>
 </div>
@@ -1242,6 +1305,9 @@ tr:hover td{background:#0f1d32}
 'use strict';
 var timer = null;
 var inputTimers = {};
+var activityPingTimer = null;
+var idleTimer = null;
+var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
 var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
@@ -1249,10 +1315,42 @@ function E(s){var d=document.createElement('div'); d.textContent=s||''; return d
 function ago(iso){ if(!iso) return '-'; var d=new Date(iso+'Z'), n=new Date(), df=Math.floor((n-d)/1000); if(df<60)return df+'s'; if(df<3600)return Math.floor(df/60)+'m'; if(df<86400)return Math.floor(df/3600)+'h'; return Math.floor(df/86400)+'d'; }
 function tagRisk(r){ return r>=70?'t-red':r>=40?'t-yellow':'t-green'; }
 function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'?'t-green':'t-blue'; }
-async function api(p){ try{ var r=await fetch(p); if(!r.ok)return null; return await r.json(); }catch(e){ return null; } }
-function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
 function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[key] = setTimeout(fn, wait); }
-
+function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
+function setStatus(kind, title, message){ var box=$('#actionStatus'); box.className='panel-box status '+(kind||''); box.innerHTML='<strong>'+E(title)+'</strong><div class="sub">'+E(message)+'</div>'; }
+async function api(path, options){
+  try{
+    var response = await fetch(path, options || {});
+    var payload = await response.json().catch(function(){ return {}; });
+    if(response.status===401 || response.status===503){
+      setStatus('err','Session issue', payload.message || 'Authentication is required. Redirecting to login.');
+      setTimeout(function(){ window.location.href='/login?next=/admin'; }, 700);
+      return null;
+    }
+    if(!response.ok){
+      setStatus('err','Request failed', payload.message || payload.error || 'The request could not be completed.');
+      return null;
+    }
+    return payload;
+  }catch(error){
+    setStatus('err','Network error','The admin console could not reach the dashboard API.');
+    return null;
+  }
+}
+async function sendActivityPing(){
+  if(activityPingTimer){ return; }
+  activityPingTimer = setTimeout(function(){ activityPingTimer = null; }, 30000);
+  await api('/api/session/activity', {method:'POST'});
+}
+function resetIdleTimer(){
+  clearTimeout(idleTimer);
+  $('#idleCountdown').textContent = 'Session is active. Idle logout triggers after 10 minutes without input.';
+  idleTimer = setTimeout(function(){ logout('Logged out automatically after 10 minutes of inactivity.'); }, SESSION_IDLE_MS);
+}
+function handleUserActivity(){
+  resetIdleTimer();
+  sendActivityPing();
+}
 function renderSummary(){
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
@@ -1260,150 +1358,61 @@ function renderSummary(){
   $('#mPeers').textContent = N(state.mesh&&state.mesh.peers ? state.mesh.peers.length : 0);
   $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
   $('#runtimeUptime').textContent = 'Uptime: '+((state.health&&state.health.uptime)||'--');
-  $('#lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+  $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
 }
-
 function renderEvents(){
-  var rows = state.events.slice();
-  var q = filterText();
-  var plugin = $('#eventPluginFilter').value;
-  var threat = $('#eventThreatFilter').value;
-  var sort = $('#eventSort').value;
-  rows = rows.filter(function(e){
-    var blob = [e.ip_hash,e.connection_type,e.country_code,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase();
-    return (!q || blob.indexOf(q)!==-1) && (!plugin || e.connection_type===plugin) && (!threat || e.threat_level===threat);
-  });
-  rows.sort(function(a,b){
-    if(sort==='risk') return (b.risk_score||0)-(a.risk_score||0);
-    return String(b.timestamp||'').localeCompare(String(a.timestamp||''));
-  });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr>'
-    + '<td>'+ago(e.timestamp)+'</td>'
-    + '<td class="mono" title="'+E(e.ip_hash)+'">'+E((e.ip_hash||'').slice(0,16))+'…</td>'
-    + '<td>'+E((e.connection_type||'unknown').toUpperCase())+'</td>'
-    + '<td>'+E(e.country_code||'-')+'</td>'
-    + '<td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td>'
-    + '<td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td>'
-    + '<td>'+E(e.asn_org||'-')+'</td>'
-    + '</tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
+  var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
+  rows=rows.filter(function(e){ var blob=[e.ip_hash,e.connection_type,e.country_code,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
+  rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.timestamp||'').localeCompare(String(a.timestamp||'')); });
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono" title="'+E(e.ip_hash)+'">'+E((e.ip_hash||'').slice(0,16))+'…</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td>'+E(e.country_code||'-')+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+E(e.asn_org||'-')+'</td></tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
 }
-
 function renderBans(){
-  var rows = state.bans.slice();
-  var q = filterText();
-  var sort = $('#banSort').value;
-  rows = rows.filter(function(b){ return !q || [b.ip_hash,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
-  rows.sort(function(a,b){
-    if(sort==='risk') return (b.risk_score||0)-(a.risk_score||0);
-    return String(b.banned_at||'').localeCompare(String(a.banned_at||''));
-  });
-  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ return '<tr>'
-    + '<td class="mono" title="'+E(b.ip_hash)+'">'+E((b.ip_hash||'').slice(0,16))+'…</td>'
-    + '<td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td>'
-    + '<td>'+E(b.reason||'-')+'</td>'
-    + '<td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td>'
-    + '</tr>'; }).join('') : '<tr><td colspan="4" class="empty">No active bans match the current filters.</td></tr>';
+  var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;
+  rows=rows.filter(function(b){ return !q || [b.ip_hash,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
+  rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.banned_at||'').localeCompare(String(a.banned_at||'')); });
+  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ return '<tr><td class="mono" title="'+E(b.ip_hash)+'">'+E((b.ip_hash||'').slice(0,16))+'…</td><td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td><td>'+E(b.reason||'-')+'</td><td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td><td><button class="btn small ghost ban-action" data-hash="'+E(b.ip_hash)+'">Deactivate</button></td></tr>'; }).join('') : '<tr><td colspan="5" class="empty">No active bans match the current filters.</td></tr>';
 }
-
 function renderFirewall(){
-  var rows = state.firewall.slice();
-  var q = filterText();
-  var family = $('#ipFamilyFilter').value;
-  rows = rows.filter(function(item){ return (!q || [item.ip,item.family].join(' ').toLowerCase().indexOf(q)!==-1) && (!family || item.family===family); });
-  $('#firewallRows').innerHTML = rows.length ? rows.map(function(item){ return '<tr><td class="mono">'+E(item.ip)+'</td><td>'+E(item.family)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="empty">No firewall IPs match the current filters.</td></tr>';
+  var rows=state.firewall.slice(); var q=filterText(); var family=$('#ipFamilyFilter').value;
+  rows=rows.filter(function(item){ return (!q||[item.ip,item.family].join(' ').toLowerCase().indexOf(q)!==-1)&&(!family||item.family===family); });
+  $('#firewallRows').innerHTML = rows.length ? rows.map(function(item){ return '<tr><td class="mono">'+E(item.ip)+'</td><td>'+E(item.family)+'</td><td><button class="btn small primary fw-action" data-ip="'+E(item.ip)+'">Unban</button></td></tr>'; }).join('') : '<tr><td colspan="3" class="empty">No firewall IPs match the current filters.</td></tr>';
 }
-
-function renderAttackers(){
-  $('#attackerList').innerHTML = state.attackers.length ? state.attackers.map(function(a){
-    return '<div class="list-item"><strong class="mono">'+E((a.ip_hash||'').slice(0,20))+'…</strong><div class="sub">Bans: '+N(a.ban_count)+' · Max risk: '+N(a.max_risk||0)+' · Last: '+ago(a.last_ban)+'</div></div>';
-  }).join('') : '<div class="empty">No attacker history yet.</div>';
-}
-
-function renderMesh(){
-  var mesh = state.mesh;
-  if(!mesh || !mesh.enabled){ $('#meshList').innerHTML = '<div class="empty">Threat mesh is disabled.</div>'; return; }
-  $('#meshList').innerHTML = (mesh.peers&&mesh.peers.length ? mesh.peers : []).map(function(peer){
-    return '<div class="list-item"><strong>'+E(peer.peer||'peer')+'</strong><div class="sub">Status: '+(peer.reachable?'online':'offline')+' · New hashes: '+N(peer.last_received_count||0)+' · Total received: '+N(peer.total_received||0)+' · Last success: '+ago(peer.last_success_at)+'</div></div>';
-  }).join('') || '<div class="empty">Threat mesh enabled, but no peers configured.</div>';
-}
-
+function renderAttackers(){ $('#attackerList').innerHTML = state.attackers.length ? state.attackers.map(function(a){ return '<div class="list-item"><strong class="mono">'+E((a.ip_hash||'').slice(0,20))+'…</strong><div class="sub">Bans: '+N(a.ban_count)+' · Max risk: '+N(a.max_risk||0)+' · Last: '+ago(a.last_ban)+'</div></div>'; }).join('') : '<div class="empty">No attacker history yet.</div>'; }
+function renderMesh(){ var mesh=state.mesh; if(!mesh||!mesh.enabled){ $('#meshList').innerHTML='<div class="empty">Threat mesh is disabled.</div>'; return; } $('#meshList').innerHTML=(mesh.peers&&mesh.peers.length?mesh.peers:[]).map(function(peer){ return '<div class="list-item"><strong>'+E(peer.peer||'peer')+'</strong><div class="sub">Status: '+(peer.reachable?'online':'offline')+' · New hashes: '+N(peer.last_received_count||0)+' · Total received: '+N(peer.total_received||0)+' · Last success: '+ago(peer.last_success_at)+'</div></div>'; }).join('') || '<div class="empty">Threat mesh enabled, but no peers configured.</div>'; }
 function renderAdvice(){
-  var items = [];
-  var stats = state.stats || {};
-  var highRiskEvents = state.events.filter(function(event){ return (event.risk_score || 0) >= 70; }).length;
-  var offlinePeers = state.mesh && state.mesh.peers ? state.mesh.peers.filter(function(peer){ return !peer.reachable; }).length : 0;
-
-  if(stats.simulation_mode){
-    items.push({title:'Simulation mode is still enabled', body:'Useful for validation, but no real firewall action happens until you switch to live enforcement.'});
-  }
-  if((stats.active_bans || 0) > 0 && state.firewall.length === 0){
-    items.push({title:'Database bans do not match firewall entries', body:'Check firewall permissions or service startup ordering because active ban state appears to be drifting.'});
-  }
-  if(highRiskEvents >= 10){
-    items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'});
-  }
-  if(offlinePeers > 0){
-    items.push({title:'Some threat mesh peers are offline', body:'Investigate peer reachability or shared API keys so correlation remains complete across nodes.'});
-  }
-  if(!items.length){
-    items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream and peer health.'});
-  }
-
-  $('#adviceList').innerHTML = items.map(function(item){
-    return '<div class="advice-item"><strong>'+E(item.title)+'</strong><div class="sub">'+E(item.body)+'</div></div>';
-  }).join('');
+  var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length; var offlinePeers=state.mesh&&state.mesh.peers?state.mesh.peers.filter(function(peer){ return !peer.reachable; }).length:0;
+  if(stats.simulation_mode){ items.push({title:'Simulation mode is still enabled', body:'Useful for validation, but no real firewall action happens until you switch to live enforcement.'}); }
+  if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'Check firewall permissions or service startup ordering because active ban state appears to be drifting.'}); }
+  if(highRiskEvents>=10){ items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'}); }
+  if(offlinePeers>0){ items.push({title:'Some threat mesh peers are offline', body:'Investigate peer reachability or shared API keys so correlation remains complete across nodes.'}); }
+  if(!items.length){ items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream and peer health.'}); }
+  $('#adviceList').innerHTML=items.map(function(item){ return '<div class="advice-item"><strong>'+E(item.title)+'</strong><div class="sub">'+E(item.body)+'</div></div>'; }).join('');
 }
-
-function syncPluginFilter(){
-  var select = $('#eventPluginFilter');
-  var current = select.value;
-  var values = Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort();
-  select.innerHTML = '<option value="">All Plugins</option>' + values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join('');
-  select.value = values.indexOf(current)!==-1 ? current : '';
+function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort(); select.innerHTML='<option value="">All Plugins</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
+async function refresh(){
+  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-attackers?limit=12'),api('/api/threat-intel')]);
+  if(results.some(function(item){ return item===null; })){ return; }
+  state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.attackers=results[5]&&results[5].attackers?results[5].attackers:[]; state.mesh=results[6]||null;
+  syncPluginFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh(); renderAdvice();
 }
-
-  async function refresh(){
-    var results = await Promise.all([
-      api('/api/health'),
-      api('/api/stats'),
-      api('/api/events?limit=120'),
-      api('/api/bans'),
-      api('/api/firewall-bans?limit=1000'),
-      api('/api/top-attackers?limit=12'),
-      api('/api/threat-intel')
-    ]);
-    state.health = results[0]||null;
-    state.stats = results[1]||null;
-    state.events = results[2]&&results[2].events ? results[2].events : [];
-    state.bans = results[3]&&results[3].bans ? results[3].bans : [];
-    state.firewall = results[4]&&results[4].items ? results[4].items : [];
-    state.attackers = results[5]&&results[5].attackers ? results[5].attackers : [];
-    state.mesh = results[6]||null;
-    syncPluginFilter();
-    renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh(); renderAdvice();
-  }
-
-  async function logout(){
-    try {
-      await fetch('/api/logout', {method:'POST'});
-    } finally {
-      window.location.href = '/login';
-    }
-  }
-
-  function bind(){
-    ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter'].forEach(function(id){
-      $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); });
-      $('#'+id).addEventListener('change', function(){ debounce(id + '-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); });
-    });
-    $('#refreshNow').addEventListener('click', refresh);
-    $('#logoutBtn').addEventListener('click', logout);
-    $('#refreshRate').addEventListener('change', function(){ if(timer) clearInterval(timer); timer = setInterval(refresh, parseInt(this.value,10)||1000); });
-  }
-
-  bind();
-  refresh();
-  timer = setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+async function performAction(path, body, successTitle, successMessage){ var payload = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); if(!payload){ return false; } setStatus('ok', successTitle, successMessage(payload)); await refresh(); return true; }
+async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
+function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
+function bind(){
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  $('#refreshNow').addEventListener('click', function(){ handleUserActivity(); refresh(); });
+  $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
+  $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
+  $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
+  $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
+  $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
+  $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
+  $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });
+  $('#banRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.ban-action'); if(!button){ return; } var hash = button.getAttribute('data-hash'); if(!hash || !confirm('Deactivate this database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-ban', {ip_hash:hash}, 'Ban record updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' matching records.'; }); });
+  $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
+}
+var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
+bind(); bindActivity(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 })();
 </script>
 </body>

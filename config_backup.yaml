@@ -71,7 +71,7 @@ dashboard:
   api_key: ""
   username: "admin"
   password: ""
-  session_ttl: 43200
+  session_ttl: 600
   login_rate_limit_per_minute: 10
 
 plugins:

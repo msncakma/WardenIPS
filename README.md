@@ -93,6 +93,7 @@ Dashboard auth notes:
 - Set `dashboard.username` and `dashboard.password` to enable browser login.
 - If `dashboard.password` is empty, `dashboard.api_key` is accepted as a fallback login password for compatibility.
 - Login attempts are rate-limited server-side.
+- Admin sessions expire after 10 minutes of inactivity by default.
 
 What it deliberately does not do automatically:
 

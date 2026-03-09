@@ -485,6 +485,73 @@ class DatabaseManager:
 
         return stats
 
+    # ── Admin Maintenance ──
+
+    async def clear_events(self) -> int:
+        """Deletes all connection event records and returns the number removed."""
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    "DELETE FROM connection_events"
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount if cursor.rowcount is not None else 0
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to clear event history: {exc}"
+                ) from exc
+
+    async def clear_ban_history(self) -> int:
+        """Deletes all ban history records and returns the number removed."""
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    "DELETE FROM ban_history"
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount if cursor.rowcount is not None else 0
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to clear ban history: {exc}"
+                ) from exc
+
+    async def deactivate_all_bans(self) -> int:
+        """Marks every active ban as inactive and returns the number updated."""
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    """
+                    UPDATE ban_history
+                    SET is_active = 0
+                    WHERE is_active = 1
+                    """
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount if cursor.rowcount is not None else 0
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to deactivate active bans: {exc}"
+                ) from exc
+
+    async def deactivate_ban_by_hash(self, ip_hash: str) -> int:
+        """Marks active bans for a specific hashed IP as inactive."""
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    """
+                    UPDATE ban_history
+                    SET is_active = 0
+                    WHERE ip_hash = ? AND is_active = 1
+                    """,
+                    (ip_hash,),
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount if cursor.rowcount is not None else 0
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to deactivate ban record: {exc}"
+                ) from exc
+
     # ── Resource Management ──
 
     async def close(self) -> None:
