@@ -493,6 +493,10 @@ class DashboardAPI:
     html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
     html = html.replace("__AUTH_READY__", "true" if self._dashboard_auth_configured() else "false")
     html = html.replace(
+      "__PUBLIC_DASHBOARD_ENABLED__",
+      "true" if self._public_dashboard_enabled else "false",
+    )
+    html = html.replace(
       "__SETUP_MESSAGE__",
       json.dumps(
         "Configure dashboard.password or dashboard.api_key in config.yaml and restart WardenIPS before using /admin."
@@ -667,12 +671,21 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#08101d;--panel:#111b2c;--panel2:#0d1626;--b:#23314a;--txt:#edf2fb;--muted:#8ea1bf;--blue:#4f8cff;--cyan:#15c2d8;--red:#f15b6c;--green:#20c997}
-body{min-height:100vh;display:grid;place-items:center;font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 20% 20%,#173056 0%,#0b1322 45%,#060b13 100%);color:var(--txt);padding:20px}
-.shell{width:min(100%,460px)}
-.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:26px;box-shadow:0 30px 80px #00000055}
+body{min-height:100vh;display:grid;place-items:center;font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 20% 20%,#173056 0%,#0b1322 45%,#060b13 100%);color:var(--txt);padding:20px;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 82% 18%,#22d3ee18 0%,transparent 28%),radial-gradient(circle at 15% 78%,#4f8cff18 0%,transparent 26%);pointer-events:none}
+.shell{width:min(100%,1020px);display:grid;grid-template-columns:1.05fr .95fr;gap:22px;align-items:stretch}
+.info-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:24px;padding:28px;box-shadow:0 30px 80px #00000055;position:relative;overflow:hidden}
+.info-card::after,.card::after{content:'';position:absolute;inset:auto -15% -35% auto;width:220px;height:220px;background:radial-gradient(circle,#4f8cff1f 0%,transparent 72%);pointer-events:none}
 .eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:#0c203d;border:1px solid #244676;color:#9ac0ff;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
 h1{font-size:2rem;letter-spacing:-.04em;margin-bottom:8px}
 p{color:var(--muted);line-height:1.6;margin-bottom:18px}
+.lead{font-size:1.02rem;color:#d8e4f7;max-width:34ch}
+.feature-list{display:grid;gap:12px;margin:22px 0}
+.feature{padding:14px 16px;border-radius:16px;border:1px solid #223453;background:#0c1628}
+.feature strong{display:block;font-size:.9rem;margin-bottom:6px}
+.feature span{font-size:.82rem;color:var(--muted);line-height:1.5}
+.quick-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:auto}
+.quick-meta span{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:#0c1628;border:1px solid #21314b;font-size:.76rem;color:#c9d7ec}
 .field{display:grid;gap:7px;margin-bottom:14px}
 label{font-size:.8rem;font-weight:700;color:#bfd0ea}
 input{width:100%;background:#0b1526;border:1px solid var(--b);color:var(--txt);border-radius:12px;padding:13px 14px;font-size:.95rem;outline:none;transition:border-color .2s ease,box-shadow .2s ease}
@@ -687,14 +700,32 @@ button[disabled]{opacity:.65;cursor:wait}
 .msg.ok{display:block;background:#0d2e26;color:#8ef0c7;border:1px solid #175343}
 .foot{margin-top:14px;font-size:.76rem;color:var(--muted)}
 .secondary-actions{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
+.secondary-actions[hidden]{display:none}
+@media(max-width:900px){.shell{grid-template-columns:1fr}.info-card{order:2}.card{order:1}}
+@media(max-width:640px){.row,.secondary-actions{flex-direction:column;align-items:stretch}button,a.button-link{width:100%}}
 </style>
 </head>
 <body>
 <div class="shell">
+  <div class="info-card">
+    <div class="eyebrow">Security Overview</div>
+    <h1>Monitor first. Escalate only when needed.</h1>
+    <p class="lead">The public dashboard stays readable for guests while the admin console keeps state-changing actions behind a timed session.</p>
+    <div class="feature-list">
+      <div class="feature"><strong>Public overview</strong><span>Events, bans, countries, plugins, and threat trends are visible without exposing admin actions.</span></div>
+      <div class="feature"><strong>Protected admin access</strong><span>Firewall changes, history cleanup, and ban maintenance stay behind the login gate.</span></div>
+      <div class="feature"><strong>Idle session expiry</strong><span>Admin sessions expire automatically after 10 minutes of inactivity.</span></div>
+    </div>
+    <div class="quick-meta">
+      <span>Route: /dashboard</span>
+      <span>Admin: /admin</span>
+      <span>Protocol: HTTP by default</span>
+    </div>
+  </div>
   <div class="card">
     <div class="eyebrow">Admin Access</div>
     <h1>Sign in to WardenIPS</h1>
-    <p id="intro">The admin console now uses a browser session. If dashboard auth is enabled, log in with the configured dashboard username and password. If no dashboard password is set, the existing API key works as the password for compatibility.</p>
+    <p id="intro">The admin console uses a browser session. Use the configured dashboard username and password, or the API key as a compatibility fallback if no password is set.</p>
     <form id="loginForm">
       <div class="field">
         <label for="username">Username</label>
@@ -710,7 +741,7 @@ button[disabled]{opacity:.65;cursor:wait}
       </div>
       <div id="message" class="msg"></div>
     </form>
-    <div class="secondary-actions">
+    <div id="guestActions" class="secondary-actions">
       <a class="button-link" href="/dashboard">View Dashboard Without Login</a>
     </div>
     <div class="foot">Default username: <span id="defaultUser"></span></div>
@@ -722,6 +753,7 @@ button[disabled]{opacity:.65;cursor:wait}
 var nextPath = __NEXT_PATH__;
 var defaultUser = __USERNAME__;
 var authReady = __AUTH_READY__;
+var publicDashboardEnabled = __PUBLIC_DASHBOARD_ENABLED__;
 var setupMessage = __SETUP_MESSAGE__;
 var typingTimer = null;
 var submitLocked = false;
@@ -732,6 +764,7 @@ function rateLimitedInput(handler, wait){ return function(ev){ clearTimeout(typi
 
 $('#defaultUser').textContent = defaultUser || 'admin';
 $('#username').value = defaultUser || 'admin';
+if(!publicDashboardEnabled){ $('#guestActions').hidden = true; }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message');
 if(flashMessage){
   showMessage('ok', flashMessage);
@@ -777,7 +810,7 @@ $('#loginForm').addEventListener('submit', async function(ev){
       return;
     }
     showMessage('ok', 'Login accepted, redirecting...');
-    window.location.href = payload.redirect_to || '/admin';
+    window.location.href = payload.redirect_to || nextPath || '/dashboard';
   } catch (error) {
     showMessage('err', 'Login request failed.');
   } finally {
@@ -821,12 +854,21 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 .logo{display:flex;align-items:center;gap:.75rem}
 .logo svg{width:36px;height:36px;filter:drop-shadow(0 0 8px var(--accent-g))}
 .logo h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo-copy{display:grid;gap:.3rem}
+.hero-note{font-size:.9rem;color:#a8bbd6;max-width:48ch}
 .meta{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
 .bdg{display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:20px;font-size:.75rem;font-weight:600;letter-spacing:.03em}
 .bdg-live{background:var(--grn-d);color:var(--grn);animation:pls 2s infinite}
 .bdg-sim{background:var(--warn-d);color:var(--warn)}
 .admin-link{display:inline-flex;align-items:center;justify-content:center;padding:.65rem 1rem;border-radius:999px;border:1px solid #334155;background:#111827;color:var(--txt);text-decoration:none;font-size:.82rem;font-weight:800;transition:border-color .2s ease,transform .2s ease}
 .admin-link:hover{border-color:var(--accent);transform:translateY(-1px)}
+.hero-band{display:grid;grid-template-columns:1.35fr .9fr;gap:1rem;margin-bottom:1.5rem}
+.hero-panel,.signal-panel{background:linear-gradient(180deg,#0f172a,#0c1322);border:1px solid var(--bdr);border-radius:18px;padding:1.1rem 1.2rem;box-shadow:0 20px 45px #00000026}
+.hero-panel strong,.signal-panel strong{display:block;font-size:.88rem;margin-bottom:.4rem}
+.hero-panel p,.signal-panel p{font-size:.82rem;line-height:1.6;color:var(--dim);margin:0}
+.signal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:.8rem}
+.signal-grid div{padding:.75rem;border-radius:12px;background:#09111f;border:1px solid #1b2940}
+.signal-grid span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.3rem}
 @keyframes pls{0%,100%{opacity:1}50%{opacity:.6}}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:4px}
 
@@ -929,8 +971,8 @@ footer a:hover{text-decoration:underline}
 @keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .ai{animation:fi .4s cubic-bezier(.4,0,.2,1) both}
 .d1{animation-delay:.05s}.d2{animation-delay:.1s}.d3{animation-delay:.15s}.d4{animation-delay:.2s}.d5{animation-delay:.25s}.d6{animation-delay:.3s}
-@media(max-width:900px){.mesh-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:640px){.sg{grid-template-columns:repeat(2,1fr)}.sc .vl{font-size:1.5rem}.logo h1{font-size:1.2rem}.sh{padding:1rem}.kofi-fab{right:12px;bottom:12px;padding:.5rem .75rem}.kofi-fab .sub{display:none}.mesh-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.mesh-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.hero-band{grid-template-columns:1fr}.signal-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:640px){.sg{grid-template-columns:repeat(2,1fr)}.sc .vl{font-size:1.5rem}.logo h1{font-size:1.2rem}.sh{padding:1rem}.kofi-fab{right:12px;bottom:12px;padding:.5rem .75rem}.kofi-fab .sub{display:none}.mesh-grid{grid-template-columns:1fr}.signal-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -938,7 +980,10 @@ footer a:hover{text-decoration:underline}
   <header>
     <div class="logo">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--accent)"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <h1>WardenIPS</h1>
+      <div class="logo-copy">
+        <h1>WardenIPS</h1>
+        <div class="hero-note">Public security overview with a separate admin entry point for operational actions.</div>
+      </div>
     </div>
     <div class="meta">
       <span class="bdg bdg-live" id="sb"><span class="dot"></span>LIVE</span>
@@ -946,6 +991,21 @@ footer a:hover{text-decoration:underline}
       <a class="admin-link" href="__ADMIN_HREF__">__ADMIN_LABEL__</a>
     </div>
   </header>
+
+  <div class="hero-band ai d1">
+    <div class="hero-panel">
+      <strong>What you can see here</strong>
+      <p>Live totals, attacker concentration, event history, country spread, plugin activity, and threat-intel visibility are available without exposing write operations.</p>
+    </div>
+    <div class="signal-panel">
+      <strong>Access split</strong>
+      <div class="signal-grid">
+        <div><span>Public</span>Overview only</div>
+        <div><span>Admin</span>Maintenance actions</div>
+        <div><span>Session</span>10m idle timeout</div>
+      </div>
+    </div>
+  </div>
 
   <div class="sg">
     <div class="sc ai d1"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Uptime</div><div class="vl bl" id="su">--:--:--</div></div>
@@ -1216,12 +1276,13 @@ DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
 body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at top,#12203a 0%,#08111f 45%,#070d18 100%);color:var(--txt);min-height:100vh}
 .app{max-width:1600px;margin:0 auto;padding:24px}
 .top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}.brand h1{font-size:1.9rem;font-weight:800;letter-spacing:-.03em}.brand p{font-size:.9rem;color:var(--muted);margin-top:4px}
+.utility-strip{display:grid;grid-template-columns:1.4fr .9fr;gap:16px;margin-bottom:16px}.utility-card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:14px 16px}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.8rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.utility-metrics div{padding:10px;border-radius:12px;background:#0b1527;border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
 .actions,.toolbar,.action-grid{display:flex;gap:10px;flex-wrap:wrap}.ctrl,.btn{background:var(--panel);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:10px 12px;font-size:.88rem}.btn{cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,var(--blue),#375ff5);border-color:#4f8cff}.btn.warn{background:linear-gradient(135deg,#c2410c,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#991b1b,#dc2626);border-color:#f87171}.btn.ghost{background:#0b1527}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}
 .hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.6rem;font-weight:800}
 .layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:#0f1d32}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
 .list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:#175343;background:#0d2e26}.status.err{border-color:#6a2432;background:#32131a}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}.empty{padding:24px;text-align:center;color:var(--muted)}
-@media(max-width:1100px){.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:1100px){.utility-strip,.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions,.toolbar,.action-grid{width:100%}.ctrl,.btn{width:100%}}
 </style>
 </head>
@@ -1232,8 +1293,8 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
       <h1>WardenIPS Admin Console</h1>
       <p>Interactive operational view for bans, firewall state, events, and peer intelligence.</p>
       <div class="linkbar">
-        <a href="/">Open Dashboard v1</a>
-        <a href="/admin">Canonical admin route</a>
+        <a href="/dashboard">Open Public Dashboard</a>
+        <a href="/admin">Admin Route</a>
         <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">Repository</a>
         <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
       </div>
@@ -1247,6 +1308,20 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
       </select>
       <button id="logoutBtn" class="btn">Log Out</button>
       <button id="refreshNow" class="btn primary">Refresh Now</button>
+    </div>
+  </div>
+
+  <div class="utility-strip">
+    <div class="utility-card">
+      <strong>Admin scope</strong>
+      <p>This view is intentionally separate from the public dashboard. It exposes firewall mutations, record cleanup, ban maintenance, and richer operational filtering.</p>
+    </div>
+    <div class="utility-card">
+      <div class="utility-metrics">
+        <div><span>Access</span>Login required</div>
+        <div><span>Session</span>Idle expires</div>
+        <div><span>Route</span>/admin</div>
+      </div>
     </div>
   </div>
 
