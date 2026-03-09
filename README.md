@@ -41,6 +41,7 @@ WardenIPS ships with a built-in web dashboard for real-time visibility.
 - Live auto-refreshing UI.
 - Active bans, recent events, risk levels, countries, plugins, and attacker concentration.
 - Fast operational feedback without external observability tooling.
+- Advanced admin console available at `/v2` with live filters, raw active firewall IP view, and threat mesh status.
 
 ### Privacy-Preserving Threat Mesh
 
@@ -174,11 +175,30 @@ sudo journalctl -u wardenips -f
 python3 main.py --status
 ```
 
+### Dashboard Routes
+
+```text
+/     -> dashboard v1
+/v2   -> advanced admin dashboard
+```
+
 ### Docker
 
 ```bash
 docker compose up -d --build
 docker compose logs -f wardenips
+```
+
+### Uninstall
+
+```bash
+sudo sh uninstall.sh
+```
+
+Full removal including config, logs, and database:
+
+```bash
+sudo sh uninstall.sh --purge
 ```
 
 ## Release Policy

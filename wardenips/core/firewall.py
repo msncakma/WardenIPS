@@ -404,6 +404,53 @@ class FirewallManager:
 
         return total
 
+    async def list_banned_ips(self, limit: int = 500) -> list[dict[str, str]]:
+        """
+        Returns raw IPs currently present in the firewall ipset(s).
+
+        This is intended for operational/admin visibility. Database records
+        remain hash-based for privacy, but the firewall necessarily holds
+        currently blocked source IPs in plaintext.
+        """
+        if self._simulation_mode:
+            return []
+
+        items: list[dict[str, str]] = []
+        sets_to_load = [(self._set_name, "ipv4")]
+        if self._ipv6_supported:
+            sets_to_load.append((self._set_name_v6, "ipv6"))
+
+        for set_name, family in sets_to_load:
+            try:
+                cmd = []
+                if self._use_sudo:
+                    cmd = [self._sudo_cmd, "-n"]
+                cmd += [self._ipset_cmd, "list", set_name]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode != 0:
+                    continue
+
+                in_members = False
+                for line in stdout.decode(errors="replace").splitlines():
+                    stripped = line.strip()
+                    if stripped == "Members:":
+                        in_members = True
+                        continue
+                    if in_members and stripped:
+                        ip_value = stripped.split()[0]
+                        items.append({"ip": ip_value, "family": family})
+                        if len(items) >= limit:
+                            return items
+            except Exception as exc:
+                logger.debug("Failed to list banned IPs for %s: %s", set_name, exc)
+
+        return items
+
     # ── Sudo probe ──
 
     async def _probe_sudo(self, sudo_path: str) -> bool:

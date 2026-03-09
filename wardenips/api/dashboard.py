@@ -10,6 +10,7 @@ Endpoints:
   GET  /api/health              — Health check / uptime
   GET  /api/stats               — Database statistics
   GET  /api/bans                — Active ban list (hashed IPs)
+  GET  /api/firewall-bans       — Active firewall IPs (plaintext operational view)
   GET  /api/events?limit=N      — Recent events
   GET  /api/firewall            — Firewall status
   GET  /api/top-attackers       — Top attacking IP hashes
@@ -18,6 +19,7 @@ Endpoints:
   GET  /api/threat-distribution — Events grouped by threat level
   GET  /api/plugin-stats        — Events grouped by plugin/connection type
   GET  /                        — Full SPA dashboard
+  GET  /v2                      — Advanced admin dashboard
 
 The API is completely optional and controlled by the 'dashboard' section
 in config.yaml.  When disabled, no port is opened.
@@ -99,9 +101,11 @@ class DashboardAPI:
 
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_dashboard)
+        self._app.router.add_get("/v2", self._handle_dashboard_v2)
         self._app.router.add_get("/api/health", self._handle_health)
         self._app.router.add_get("/api/stats", self._handle_stats)
         self._app.router.add_get("/api/bans", self._handle_bans)
+        self._app.router.add_get("/api/firewall-bans", self._handle_firewall_bans)
         self._app.router.add_get("/api/events", self._handle_events)
         self._app.router.add_get("/api/firewall", self._handle_firewall)
         self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
@@ -202,6 +206,16 @@ class DashboardAPI:
             "active_bans": count,
             "firewall": repr(self._firewall),
         })
+
+    async def _handle_firewall_bans(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        limit = min(int(request.query.get("limit", "500")), 2000)
+        try:
+            items = await self._firewall.list_banned_ips(limit=limit)
+            return web.json_response({"items": items, "count": len(items)})
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
 
     # ── Analytics Handlers ──
 
@@ -333,6 +347,9 @@ class DashboardAPI:
 
     async def _handle_dashboard(self, request: web.Request) -> web.Response:
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+    async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
+      return web.Response(text=DASHBOARD_V2_HTML, content_type="text/html")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -741,6 +758,306 @@ async function refresh(){
 
 refresh();
 setInterval(refresh,R);
+})();
+</script>
+</body>
+</html>"""
+
+
+DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WardenIPS Dashboard V2</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#08111f;--bg2:#0d1728;--panel:#111c30;--panel2:#0f1a2c;--b:#22304a;
+  --txt:#e7edf7;--muted:#8da0bd;--blue:#4f8cff;--cyan:#19c2d8;--green:#13c38b;--yellow:#f4b740;--red:#f15b6c;
+}
+body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at top,#12203a 0%,#08111f 45%,#070d18 100%);color:var(--txt);min-height:100vh}
+.app{max-width:1560px;margin:0 auto;padding:24px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.brand h1{font-size:1.8rem;font-weight:800;letter-spacing:-.03em}
+.brand p{font-size:.88rem;color:var(--muted);margin-top:4px}
+.actions{display:flex;gap:10px;flex-wrap:wrap}
+.ctrl,.btn{background:var(--panel);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:10px 12px;font-size:.88rem}
+.btn{cursor:pointer;font-weight:700}.btn.primary{background:linear-gradient(135deg,var(--blue),#375ff5);border-color:#4f8cff}
+.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}
+.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}
+.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}
+.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}
+.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}
+.metric .v{font-size:1.6rem;font-weight:800}
+.layout{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
+.stack{display:grid;gap:16px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.search{flex:1;min-width:220px}
+.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}
+th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
+tr:hover td{background:#0f1d32}
+.mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}
+.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}
+.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.list{display:grid;gap:10px}
+.list-item{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}
+.list-item strong{display:block;margin-bottom:6px}
+.sub{font-size:.78rem;color:var(--muted);line-height:1.5}
+.empty{padding:24px;text-align:center;color:var(--muted)}
+.small{font-size:.76rem;color:var(--muted)}
+.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}
+@media(max-width:1100px){.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions{width:100%}.ctrl,.btn{width:100%}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div class="brand">
+      <h1>WardenIPS Admin Console</h1>
+      <p>Interactive operational view for bans, firewall state, events, and peer intelligence.</p>
+      <div class="linkbar">
+        <a href="/">Open Dashboard v1</a>
+        <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
+      </div>
+    </div>
+    <div class="actions">
+      <input id="globalSearch" class="ctrl search" placeholder="Filter events, hashes, plugins, countries, IPs...">
+      <select id="refreshRate" class="ctrl">
+        <option value="1000">Refresh 1s</option>
+        <option value="3000">Refresh 3s</option>
+        <option value="5000">Refresh 5s</option>
+      </select>
+      <button id="refreshNow" class="btn primary">Refresh Now</button>
+    </div>
+  </div>
+
+  <div class="hero">
+    <div class="hero-card">
+      <h2>Operational Summary</h2>
+      <div class="hero-meta">
+        <div class="metric"><div class="k">Total Events</div><div class="v" id="mEvents">0</div></div>
+        <div class="metric"><div class="k">Active DB Bans</div><div class="v" id="mDbBans">0</div></div>
+        <div class="metric"><div class="k">Firewall IPs</div><div class="v" id="mFwBans">0</div></div>
+        <div class="metric"><div class="k">Threat Mesh Peers</div><div class="v" id="mPeers">0</div></div>
+      </div>
+    </div>
+    <div class="side-card">
+      <h2>Runtime</h2>
+      <div class="list">
+        <div class="list-item"><strong id="runtimeMode">Mode: --</strong><span class="sub" id="runtimeUptime">Uptime: --</span></div>
+        <div class="list-item"><strong>Privacy Model</strong><span class="sub">Database events and ban history store hashed IP identifiers. Raw IPs are shown only for currently active firewall entries.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="stack">
+      <div class="card">
+        <h2>Recent Security Events</h2>
+        <div class="toolbar">
+          <select id="eventPluginFilter" class="ctrl">
+            <option value="">All Plugins</option>
+          </select>
+          <select id="eventThreatFilter" class="ctrl">
+            <option value="">All Threats</option>
+            <option value="CRITICAL">Critical</option>
+            <option value="HIGH">High</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="LOW">Low</option>
+            <option value="NONE">None</option>
+          </select>
+          <select id="eventSort" class="ctrl">
+            <option value="time">Sort: Newest</option>
+            <option value="risk">Sort: Highest Risk</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Hash</th><th>Plugin</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th></tr></thead>
+            <tbody id="eventsRows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="card">
+          <h2>Active Database Bans</h2>
+          <div class="toolbar">
+            <select id="banSort" class="ctrl">
+              <option value="recent">Sort: Recent</option>
+              <option value="risk">Sort: Highest Risk</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Hash</th><th>Risk</th><th>Reason</th><th>Expires</th></tr></thead>
+              <tbody id="banRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Active Firewall IPs</h2>
+          <div class="toolbar">
+            <select id="ipFamilyFilter" class="ctrl">
+              <option value="">All Families</option>
+              <option value="ipv4">IPv4</option>
+              <option value="ipv6">IPv6</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>IP Address</th><th>Family</th></tr></thead>
+              <tbody id="firewallRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <h2>Threat Mesh</h2>
+        <div class="list" id="meshList"></div>
+      </div>
+      <div class="card">
+        <h2>Top Attackers</h2>
+        <div class="list" id="attackerList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+'use strict';
+var timer = null;
+var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null};
+function $(s){return document.querySelector(s)}
+function N(n){return (n||0).toLocaleString()}
+function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
+function ago(iso){ if(!iso) return '-'; var d=new Date(iso+'Z'), n=new Date(), df=Math.floor((n-d)/1000); if(df<60)return df+'s'; if(df<3600)return Math.floor(df/60)+'m'; if(df<86400)return Math.floor(df/3600)+'h'; return Math.floor(df/86400)+'d'; }
+function tagRisk(r){ return r>=70?'t-red':r>=40?'t-yellow':'t-green'; }
+function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'?'t-green':'t-blue'; }
+async function api(p){ try{ var r=await fetch(p); if(!r.ok)return null; return await r.json(); }catch(e){ return null; } }
+function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
+
+function renderSummary(){
+  $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
+  $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
+  $('#mFwBans').textContent = N(state.firewall.length);
+  $('#mPeers').textContent = N(state.mesh&&state.mesh.peers ? state.mesh.peers.length : 0);
+  $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
+  $('#runtimeUptime').textContent = 'Uptime: '+((state.health&&state.health.uptime)||'--');
+}
+
+function renderEvents(){
+  var rows = state.events.slice();
+  var q = filterText();
+  var plugin = $('#eventPluginFilter').value;
+  var threat = $('#eventThreatFilter').value;
+  var sort = $('#eventSort').value;
+  rows = rows.filter(function(e){
+    var blob = [e.ip_hash,e.connection_type,e.country_code,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase();
+    return (!q || blob.indexOf(q)!==-1) && (!plugin || e.connection_type===plugin) && (!threat || e.threat_level===threat);
+  });
+  rows.sort(function(a,b){
+    if(sort==='risk') return (b.risk_score||0)-(a.risk_score||0);
+    return String(b.timestamp||'').localeCompare(String(a.timestamp||''));
+  });
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr>'
+    + '<td>'+ago(e.timestamp)+'</td>'
+    + '<td class="mono" title="'+E(e.ip_hash)+'">'+E((e.ip_hash||'').slice(0,16))+'…</td>'
+    + '<td>'+E((e.connection_type||'unknown').toUpperCase())+'</td>'
+    + '<td>'+E(e.country_code||'-')+'</td>'
+    + '<td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td>'
+    + '<td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td>'
+    + '<td>'+E(e.asn_org||'-')+'</td>'
+    + '</tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
+}
+
+function renderBans(){
+  var rows = state.bans.slice();
+  var q = filterText();
+  var sort = $('#banSort').value;
+  rows = rows.filter(function(b){ return !q || [b.ip_hash,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
+  rows.sort(function(a,b){
+    if(sort==='risk') return (b.risk_score||0)-(a.risk_score||0);
+    return String(b.banned_at||'').localeCompare(String(a.banned_at||''));
+  });
+  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ return '<tr>'
+    + '<td class="mono" title="'+E(b.ip_hash)+'">'+E((b.ip_hash||'').slice(0,16))+'…</td>'
+    + '<td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td>'
+    + '<td>'+E(b.reason||'-')+'</td>'
+    + '<td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td>'
+    + '</tr>'; }).join('') : '<tr><td colspan="4" class="empty">No active bans match the current filters.</td></tr>';
+}
+
+function renderFirewall(){
+  var rows = state.firewall.slice();
+  var q = filterText();
+  var family = $('#ipFamilyFilter').value;
+  rows = rows.filter(function(item){ return (!q || [item.ip,item.family].join(' ').toLowerCase().indexOf(q)!==-1) && (!family || item.family===family); });
+  $('#firewallRows').innerHTML = rows.length ? rows.map(function(item){ return '<tr><td class="mono">'+E(item.ip)+'</td><td>'+E(item.family)+'</td></tr>'; }).join('') : '<tr><td colspan="2" class="empty">No firewall IPs match the current filters.</td></tr>';
+}
+
+function renderAttackers(){
+  $('#attackerList').innerHTML = state.attackers.length ? state.attackers.map(function(a){
+    return '<div class="list-item"><strong class="mono">'+E((a.ip_hash||'').slice(0,20))+'…</strong><div class="sub">Bans: '+N(a.ban_count)+' · Max risk: '+N(a.max_risk||0)+' · Last: '+ago(a.last_ban)+'</div></div>';
+  }).join('') : '<div class="empty">No attacker history yet.</div>';
+}
+
+function renderMesh(){
+  var mesh = state.mesh;
+  if(!mesh || !mesh.enabled){ $('#meshList').innerHTML = '<div class="empty">Threat mesh is disabled.</div>'; return; }
+  $('#meshList').innerHTML = (mesh.peers&&mesh.peers.length ? mesh.peers : []).map(function(peer){
+    return '<div class="list-item"><strong>'+E(peer.peer||'peer')+'</strong><div class="sub">Status: '+(peer.reachable?'online':'offline')+' · New hashes: '+N(peer.last_received_count||0)+' · Total received: '+N(peer.total_received||0)+' · Last success: '+ago(peer.last_success_at)+'</div></div>';
+  }).join('') || '<div class="empty">Threat mesh enabled, but no peers configured.</div>';
+}
+
+function syncPluginFilter(){
+  var select = $('#eventPluginFilter');
+  var current = select.value;
+  var values = Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort();
+  select.innerHTML = '<option value="">All Plugins</option>' + values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join('');
+  select.value = values.indexOf(current)!==-1 ? current : '';
+}
+
+  async function refresh(){
+    var results = await Promise.all([
+      api('/api/health'),
+      api('/api/stats'),
+      api('/api/events?limit=120'),
+      api('/api/bans'),
+      api('/api/firewall-bans?limit=1000'),
+      api('/api/top-attackers?limit=12'),
+      api('/api/threat-intel')
+    ]);
+    state.health = results[0]||null;
+    state.stats = results[1]||null;
+    state.events = results[2]&&results[2].events ? results[2].events : [];
+    state.bans = results[3]&&results[3].bans ? results[3].bans : [];
+    state.firewall = results[4]&&results[4].items ? results[4].items : [];
+    state.attackers = results[5]&&results[5].attackers ? results[5].attackers : [];
+    state.mesh = results[6]||null;
+    syncPluginFilter();
+    renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh();
+  }
+
+  function bind(){
+    ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter'].forEach(function(id){ $( '#'+id ).addEventListener('input', function(){ renderEvents(); renderBans(); renderFirewall(); }); $( '#'+id ).addEventListener('change', function(){ renderEvents(); renderBans(); renderFirewall(); }); });
+    $('#refreshNow').addEventListener('click', refresh);
+    $('#refreshRate').addEventListener('change', function(){ if(timer) clearInterval(timer); timer = setInterval(refresh, parseInt(this.value,10)||1000); });
+  }
+
+  bind();
+  refresh();
+  timer = setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 })();
 </script>
 </body>
