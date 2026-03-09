@@ -12,6 +12,8 @@ REPO_BRANCH="${WARDENIPS_REPO_BRANCH:-master}"
 AUTOSTART="${WARDENIPS_AUTOSTART:-0}"
 ENABLE_DASHBOARD="${WARDENIPS_ENABLE_DASHBOARD:-1}"
 CLI_WRAPPER="/usr/local/bin/wardenips"
+VERBOSE="${WARDENIPS_VERBOSE:-0}"
+DEBUG_MODE="${WARDENIPS_DEBUG:-0}"
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -25,6 +27,22 @@ NC='\033[0m'
 log() { printf "%b\n" "${GREEN}[+]${NC} $1"; }
 warn() { printf "%b\n" "${YELLOW}[!]${NC} $1"; }
 error() { printf "%b\n" "${RED}[X]${NC} $1"; exit 1; }
+
+is_verbose() {
+    [ "$VERBOSE" = "1" ] || [ "$DEBUG_MODE" = "1" ]
+}
+
+run_quiet() {
+    if is_verbose; then
+        "$@"
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
+if [ "$DEBUG_MODE" = "1" ]; then
+    set -x
+fi
 
 cleanup() {
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
@@ -47,10 +65,16 @@ printf "\n"
 install_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
         log "Installing system dependencies..."
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog \
-            >/dev/null
+        if is_verbose; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog
+        else
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog \
+                >/dev/null
+        fi
         return
     fi
 
@@ -128,8 +152,13 @@ ensure_venv() {
         python3 -m venv "$INSTALL_DIR/venv"
     fi
 
-    "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
-    "$INSTALL_DIR/venv/bin/python" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt"
+    if is_verbose; then
+        "$INSTALL_DIR/venv/bin/python" -m pip install --upgrade pip
+        "$INSTALL_DIR/venv/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt"
+    else
+        "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --upgrade pip
+        "$INSTALL_DIR/venv/bin/python" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt"
+    fi
 }
 
 merge_config_template() {
@@ -341,7 +370,7 @@ install_service() {
     log "Installing systemd service..."
     cp "$INSTALL_DIR/wardenips.service" "$SERVICE_FILE"
     systemctl daemon-reload
-    systemctl enable wardenips >/dev/null 2>&1
+    run_quiet systemctl enable wardenips
 
     if [ "$AUTOSTART" = "1" ]; then
         log "Starting WardenIPS service..."
@@ -390,4 +419,7 @@ printf "%b\n" "    wardenips shell"
 printf "\n"
 printf "%b\n" "  ${GREEN}One-line install:${NC}"
 printf "%b\n" "    sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)\""
+printf "%b\n" "  ${GREEN}Verbose debug:${NC}"
+printf "%b\n" "    WARDENIPS_VERBOSE=1 sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)\""
+printf "%b\n" "    WARDENIPS_DEBUG=1 sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)\""
 printf "\n"
