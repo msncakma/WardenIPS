@@ -152,9 +152,20 @@ class DatabaseManager:
         try:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError:
+            # Sudo olmadan calistirilmissa lokal bir klasore fallback yapalim
+            fallback_dir = Path.cwd() / "data"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            self._db_path = fallback_dir / "warden.db"
+            
+            logger.warning(
+                "Permission denied for '%s'. Falling back to local directory: '%s'. "
+                "Did you forget to use 'sudo'?",
+                db_path_str, self._db_path
+            )
+        except Exception as exc:
             raise WardenDatabaseError(
-                f"Veritabani dizini olusturulamadi (izin hatasi): "
-                f"{self._db_path.parent}"
+                f"Failed to create database directory: "
+                f"{self._db_path.parent} - {exc}"
             )
 
         try:

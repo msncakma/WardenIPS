@@ -33,23 +33,23 @@ def setup_logging(
     log_file: Optional[str] = None,
 ) -> logging.Logger:
     """
-    WardenIPS loglama sistemini yapılandırır.
+    Configures the WardenIPS logging system.
 
-    Bu fonksiyon uygulama ömründe yalnızca bir kez çağrılmalıdır.
-    Sonraki çağrılar mevcut yapılandırmayı döndürür.
+    This function should be called only once during the application's lifetime.
+    Subsequent calls will return the current configuration.
 
     Args:
-        level:    Log seviyesi (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-        log_file: Log dosyasının tam yolu. None ise sadece konsola yazar.
+        level:    Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        log_file: Log file path. None for console only.
 
     Returns:
-        Yapılandırılmış kök logger nesnesi.
+        Configured root logger object.
     """
     global _configured
 
     logger = logging.getLogger(_ROOT_LOGGER_NAME)
 
-    # Tekrar yapılandırmayı engelle
+    # Prevent reconfiguration
     if _configured:
         return logger
 
@@ -117,36 +117,36 @@ def setup_logging(
             logger.addHandler(file_handler)
         except PermissionError:
             logger.warning(
-                "Log dosyasına yazılamıyor (izin hatası): %s — "
-                "Sadece konsola yazılacak.",
+                "Log file cannot be written (permission error): %s — "
+                "Only console output will be used.",
                 log_file,
             )
         except OSError as exc:
             logger.warning(
-                "Log dosyası oluşturulamadı: %s — %s",
+                "Log file cannot be created: %s — %s",
                 log_file,
                 exc,
             )
 
     _configured = True
-    logger.info("WardenIPS Logging sistemi başlatıldı. Seviye: %s", level)
+    logger.info("WardenIPS Logging system started. Level: %s", level)
     return logger
 
 
 def get_logger(name: str) -> logging.Logger:
     """
-    Alt modeüller için child logger döndürür.
+    Returns a child logger for a module.
 
-    Kullanım:
+    Usage:
         from wardenips.core.logger import get_logger
         logger = get_logger(__name__)
-        logger.info("Mesaj")
+        logger.info("Message")
 
     Args:
-        name: Modül adı (__name__ kullanılması önerilir).
+        name: Module name (__name__ is recommended).
 
     Returns:
-        'wardenips' altında isimlendirilmiş logger.
+        'wardenips' undernamed logger.
     """
     if name.startswith(_ROOT_LOGGER_NAME):
         return logging.getLogger(name)
