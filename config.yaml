@@ -71,6 +71,6 @@ plugins:
     max_failed_attempts: 5    # Attempts within analysis_interval before triggering a high score
     
   minecraft:
-    enabled: true
+    enabled: false
     log_path: "/opt/minecraft/logs/latest.log"
     rapid_connection_threshold: 10  # Connections within analysis_interval signaling a botnet

@@ -15,3 +15,6 @@ aiosqlite>=0.19.0
 
 # Asenkron HTTP İstemci (AbuseIPDB - Faz 3)
 aiohttp>=3.9.0
+
+# Terminal Renklendirme
+colorama>=0.4.6

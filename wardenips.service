@@ -1,0 +1,21 @@
+[Unit]
+Description=WardenIPS - Autonomous Intrusion Prevention System
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Change the path below to match your actual installation path
+WorkingDirectory=/opt/wardenips
+ExecStart=/opt/wardenips/venv/bin/python /opt/wardenips/main.py --config /opt/wardenips/config.yaml
+
+# Restart policies
+Restart=always
+RestartSec=5
+
+# Logging handling (StandardOutput goes to journalctl)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
