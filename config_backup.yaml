@@ -64,6 +64,16 @@ abuseipdb:
   api_key: ""
   rate_limit_per_minute: 10
 
+dashboard:
+  enabled: false
+  host: "127.0.0.1"
+  port: 7680
+  api_key: ""
+  username: "admin"
+  password: ""
+  session_ttl: 43200
+  login_rate_limit_per_minute: 10
+
 plugins:
   ssh:
     enabled: true

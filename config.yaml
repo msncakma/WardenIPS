@@ -83,7 +83,11 @@ dashboard:
   enabled: false
   host: "127.0.0.1"          # Bind address (use 0.0.0.0 for external access)
   port: 7680
-  api_key: ""                # Optional Bearer token for API auth (leave empty to disable)
+  api_key: ""                # Optional Bearer token for API auth and fallback login password
+  username: "admin"          # Dashboard login username
+  password: ""               # Preferred password for browser login
+  session_ttl: 43200          # Dashboard session lifetime in seconds
+  login_rate_limit_per_minute: 10
 
 threat_intel:
   enabled: false

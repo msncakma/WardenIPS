@@ -18,8 +18,10 @@ Endpoints:
   GET  /api/country-stats       — Events grouped by country
   GET  /api/threat-distribution — Events grouped by threat level
   GET  /api/plugin-stats        — Events grouped by plugin/connection type
+  GET  /login                   — Dashboard login page
   GET  /                        — Full SPA dashboard
-  GET  /v2                      — Advanced admin dashboard
+  GET  /admin                   — Advanced admin dashboard
+  GET  /v2                      — Legacy redirect to /admin
 
 The API is completely optional and controlled by the 'dashboard' section
 in config.yaml.  When disabled, no port is opened.
@@ -28,9 +30,12 @@ in config.yaml.  When disabled, no port is opened.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import secrets
 import time
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import quote
 
 from wardenips.core.logger import get_logger
 
@@ -73,6 +78,13 @@ class DashboardAPI:
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._api_key: str = ""
+        self._dashboard_username: str = "admin"
+        self._dashboard_password: str = ""
+        self._session_ttl: int = 43200
+        self._login_rate_limit_per_minute: int = 10
+        self._session_cookie_name: str = "wardenips_dashboard_session"
+        self._sessions: dict[str, float] = {}
+        self._login_attempts: dict[str, list[float]] = {}
         self._initialize_config()
 
     def _initialize_config(self) -> None:
@@ -83,17 +95,114 @@ class DashboardAPI:
         self._host = dash.get("host", "127.0.0.1")
         self._port = dash.get("port", 7680)
         self._api_key = dash.get("api_key", "")
+        self._dashboard_username = dash.get("username", "admin")
+        self._dashboard_password = dash.get("password", "")
+        self._session_ttl = max(int(dash.get("session_ttl", 43200)), 300)
+        self._login_rate_limit_per_minute = max(
+          int(dash.get("login_rate_limit_per_minute", 10)), 1
+        )
 
     @property
     def enabled(self) -> bool:
         return self._enabled and _AIOHTTP_WEB_AVAILABLE
 
+    def _get_dashboard_secrets(self) -> set[str]:
+        return {
+            value
+            for value in (self._dashboard_password, self._api_key)
+            if value
+        }
+
+    def _dashboard_auth_enabled(self) -> bool:
+        return bool(self._get_dashboard_secrets())
+
+    def _cleanup_expired_sessions(self) -> None:
+        now = time.time()
+        expired = [token for token, expires_at in self._sessions.items() if expires_at <= now]
+        for token in expired:
+            self._sessions.pop(token, None)
+
+    def _client_ip(self, request: web.Request) -> str:
+        forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        return forwarded_for or request.remote or "unknown"
+
+    def _consume_rate_limit(
+        self,
+        bucket: dict[str, list[float]],
+        key: str,
+        limit: int,
+        window_seconds: int,
+    ) -> bool:
+        now = time.monotonic()
+        entries = [value for value in bucket.get(key, []) if now - value < window_seconds]
+        if len(entries) >= limit:
+            bucket[key] = entries
+            return True
+        entries.append(now)
+        bucket[key] = entries
+        return False
+
+    def _is_session_authenticated(self, request: web.Request) -> bool:
+        if not self._dashboard_auth_enabled():
+            return True
+
+        self._cleanup_expired_sessions()
+        token = request.cookies.get(self._session_cookie_name, "")
+        if not token:
+            return False
+
+        expires_at = self._sessions.get(token)
+        if not expires_at or expires_at <= time.time():
+            self._sessions.pop(token, None)
+            return False
+
+        self._sessions[token] = time.time() + self._session_ttl
+        return True
+
+    def _password_matches(self, candidate: str) -> bool:
+        return any(
+            hmac.compare_digest(candidate, secret)
+            for secret in self._get_dashboard_secrets()
+        )
+
     def _check_auth(self, request: web.Request) -> bool:
         """Verify API key if configured."""
-        if not self._api_key:
+        if not self._dashboard_auth_enabled():
+            return True
+        if self._is_session_authenticated(request):
             return True
         auth = request.headers.get("Authorization", "")
-        return auth == f"Bearer {self._api_key}"
+        if not auth.startswith("Bearer "):
+            return False
+        token = auth[7:]
+        return token in self._get_dashboard_secrets()
+
+    def _require_dashboard_auth(self, request: web.Request) -> Optional[web.Response]:
+        if self._is_session_authenticated(request):
+            return None
+        if not self._dashboard_auth_enabled():
+            return None
+        next_path = quote(request.path_qs or "/admin", safe="/%?=&")
+        raise web.HTTPFound(f"/login?next={next_path}")
+
+    def _issue_session(self, response: web.StreamResponse, request: web.Request) -> None:
+        token = secrets.token_urlsafe(32)
+        self._sessions[token] = time.time() + self._session_ttl
+        response.set_cookie(
+            self._session_cookie_name,
+            token,
+            max_age=self._session_ttl,
+            httponly=True,
+            secure=request.secure,
+            samesite="Lax",
+            path="/",
+        )
+
+    def _clear_session(self, request: web.Request, response: web.StreamResponse) -> None:
+        token = request.cookies.get(self._session_cookie_name, "")
+        if token:
+            self._sessions.pop(token, None)
+        response.del_cookie(self._session_cookie_name, path="/")
 
     async def start(self) -> None:
         if not self.enabled:
@@ -101,7 +210,12 @@ class DashboardAPI:
 
         self._app = web.Application()
         self._app.router.add_get("/", self._handle_dashboard)
+        self._app.router.add_get("/admin", self._handle_dashboard_v2)
         self._app.router.add_get("/v2", self._handle_dashboard_v2)
+        self._app.router.add_get("/login", self._handle_login_page)
+        self._app.router.add_post("/api/login", self._handle_login)
+        self._app.router.add_post("/api/logout", self._handle_logout)
+        self._app.router.add_get("/logout", self._handle_logout)
         self._app.router.add_get("/api/health", self._handle_health)
         self._app.router.add_get("/api/stats", self._handle_stats)
         self._app.router.add_get("/api/bans", self._handle_bans)
@@ -345,16 +459,196 @@ class DashboardAPI:
 
     # ── Dashboard SPA ──
 
+    async def _handle_login_page(self, request: web.Request) -> web.Response:
+        if not self._dashboard_auth_enabled() or self._is_session_authenticated(request):
+            raise web.HTTPFound("/admin")
+
+        next_path = request.query.get("next", "/admin")
+        if not next_path.startswith("/"):
+            next_path = "/admin"
+        html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
+        html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
+        return web.Response(text=html, content_type="text/html")
+
+    async def _handle_login(self, request: web.Request) -> web.Response:
+        client_ip = self._client_ip(request)
+        if self._consume_rate_limit(
+            self._login_attempts,
+            client_ip,
+            self._login_rate_limit_per_minute,
+            60,
+        ):
+            return web.json_response(
+                {"error": "too_many_attempts", "message": "Too many login attempts."},
+                status=429,
+            )
+
+        payload: dict[str, str]
+        try:
+            payload = await request.json()
+        except Exception:
+            form_data = await request.post()
+            payload = dict(form_data)
+
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        next_path = str(payload.get("next", "/admin")).strip() or "/admin"
+        if not next_path.startswith("/"):
+            next_path = "/admin"
+
+        if not self._dashboard_auth_enabled():
+            return web.json_response({"ok": True, "redirect_to": next_path})
+
+        if username != self._dashboard_username or not self._password_matches(password):
+            return web.json_response(
+                {"error": "invalid_credentials", "message": "Invalid username or password."},
+                status=401,
+            )
+
+        response = web.json_response({"ok": True, "redirect_to": next_path})
+        self._issue_session(response, request)
+        return response
+
+    async def _handle_logout(self, request: web.Request) -> web.Response:
+      if request.method == "GET":
+        response = web.HTTPFound("/login")
+      else:
+        response = web.json_response({"ok": True, "redirect_to": "/login"})
+        self._clear_session(request, response)
+        return response
+
     async def _handle_dashboard(self, request: web.Request) -> web.Response:
+        auth_redirect = self._require_dashboard_auth(request)
+        if auth_redirect is not None:
+            return auth_redirect
         return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
     async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
-      return web.Response(text=DASHBOARD_V2_HTML, content_type="text/html")
+        auth_redirect = self._require_dashboard_auth(request)
+        if auth_redirect is not None:
+            return auth_redirect
+        if request.path == "/v2":
+            raise web.HTTPFound("/admin")
+        return web.Response(text=DASHBOARD_V2_HTML, content_type="text/html")
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  Full SPA Dashboard — Dark theme, auto-refresh, CSS-only charts
 # ══════════════════════════════════════════════════════════════════════
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WardenIPS Login</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#08101d;--panel:#111b2c;--panel2:#0d1626;--b:#23314a;--txt:#edf2fb;--muted:#8ea1bf;--blue:#4f8cff;--cyan:#15c2d8;--red:#f15b6c;--green:#20c997}
+body{min-height:100vh;display:grid;place-items:center;font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 20% 20%,#173056 0%,#0b1322 45%,#060b13 100%);color:var(--txt);padding:20px}
+.shell{width:min(100%,460px)}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:26px;box-shadow:0 30px 80px #00000055}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:#0c203d;border:1px solid #244676;color:#9ac0ff;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+h1{font-size:2rem;letter-spacing:-.04em;margin-bottom:8px}
+p{color:var(--muted);line-height:1.6;margin-bottom:18px}
+.field{display:grid;gap:7px;margin-bottom:14px}
+label{font-size:.8rem;font-weight:700;color:#bfd0ea}
+input{width:100%;background:#0b1526;border:1px solid var(--b);color:var(--txt);border-radius:12px;padding:13px 14px;font-size:.95rem;outline:none;transition:border-color .2s ease,box-shadow .2s ease}
+input:focus{border-color:var(--blue);box-shadow:0 0 0 4px #4f8cff20}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
+button{appearance:none;border:0;background:linear-gradient(135deg,var(--blue),#355bf2);color:white;padding:13px 16px;border-radius:12px;font-size:.95rem;font-weight:800;cursor:pointer;min-width:150px}
+button[disabled]{opacity:.65;cursor:wait}
+.hint{font-size:.78rem;color:var(--muted)}
+.msg{margin-top:14px;padding:12px 14px;border-radius:12px;font-size:.85rem;display:none}
+.msg.err{display:block;background:#32131a;color:#ffb3bc;border:1px solid #6a2432}
+.msg.ok{display:block;background:#0d2e26;color:#8ef0c7;border:1px solid #175343}
+.foot{margin-top:14px;font-size:.76rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="eyebrow">Admin Access</div>
+    <h1>Sign in to WardenIPS</h1>
+    <p>The admin console now uses a browser session. If dashboard auth is enabled, log in with the configured dashboard username and password. If no dashboard password is set, the existing API key works as the password for compatibility.</p>
+    <form id="loginForm">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password">
+      </div>
+      <div class="row">
+        <div class="hint" id="hint">Input changes are throttled and login attempts are rate-limited.</div>
+        <button id="submitBtn" type="submit">Sign In</button>
+      </div>
+      <div id="message" class="msg"></div>
+    </form>
+    <div class="foot">Default username: <span id="defaultUser"></span></div>
+  </div>
+</div>
+<script>
+(function(){
+'use strict';
+var nextPath = __NEXT_PATH__;
+var defaultUser = __USERNAME__;
+var typingTimer = null;
+var submitLocked = false;
+function $(s){return document.querySelector(s)}
+function showMessage(kind, text){ var box = $('#message'); box.className = 'msg ' + kind; box.textContent = text; }
+function clearMessage(){ var box = $('#message'); box.className = 'msg'; box.textContent = ''; }
+function rateLimitedInput(handler, wait){ return function(ev){ clearTimeout(typingTimer); typingTimer = setTimeout(function(){ handler(ev); }, wait); }; }
+
+$('#defaultUser').textContent = defaultUser || 'admin';
+$('#username').value = defaultUser || 'admin';
+['username','password'].forEach(function(id){
+  $('#'+id).addEventListener('input', rateLimitedInput(function(){
+    $('#hint').textContent = 'Ready to submit';
+    clearMessage();
+  }, 250));
+});
+
+$('#loginForm').addEventListener('submit', async function(ev){
+  ev.preventDefault();
+  if(submitLocked){ return; }
+  submitLocked = true;
+  $('#submitBtn').disabled = true;
+  $('#hint').textContent = 'Submitting login request';
+  clearMessage();
+
+  try {
+    var response = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: $('#username').value.trim(),
+        password: $('#password').value,
+        next: nextPath
+      })
+    });
+    var payload = await response.json();
+    if(!response.ok){
+      showMessage('err', payload.message || 'Login failed.');
+      return;
+    }
+    showMessage('ok', 'Login accepted, redirecting...');
+    window.location.href = payload.redirect_to || '/admin';
+  } catch (error) {
+    showMessage('err', 'Login request failed.');
+  } finally {
+    setTimeout(function(){
+      submitLocked = false;
+      $('#submitBtn').disabled = false;
+      $('#hint').textContent = 'Input changes are throttled and login attempts are rate-limited.';
+    }, 900);
+  }
+});
+})();
+</script>
+</body>
+</html>"""
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -769,7 +1063,7 @@ DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WardenIPS Dashboard V2</title>
+<title>WardenIPS Admin Console</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -808,6 +1102,9 @@ tr:hover td{background:#0f1d32}
 .list-item{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}
 .list-item strong{display:block;margin-bottom:6px}
 .sub{font-size:.78rem;color:var(--muted);line-height:1.5}
+.advice{display:grid;gap:10px}
+.advice-item{padding:12px;border-radius:12px;border:1px solid var(--b);background:#0b1527}
+.advice-item strong{display:block;margin-bottom:6px}
 .empty{padding:24px;text-align:center;color:var(--muted)}
 .small{font-size:.76rem;color:var(--muted)}
 .linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}
@@ -823,6 +1120,7 @@ tr:hover td{background:#0f1d32}
       <p>Interactive operational view for bans, firewall state, events, and peer intelligence.</p>
       <div class="linkbar">
         <a href="/">Open Dashboard v1</a>
+        <a href="/admin">Canonical admin route</a>
         <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
       </div>
     </div>
@@ -833,6 +1131,7 @@ tr:hover td{background:#0f1d32}
         <option value="3000">Refresh 3s</option>
         <option value="5000">Refresh 5s</option>
       </select>
+      <button id="logoutBtn" class="btn">Log Out</button>
       <button id="refreshNow" class="btn primary">Refresh Now</button>
     </div>
   </div>
@@ -851,6 +1150,7 @@ tr:hover td{background:#0f1d32}
       <h2>Runtime</h2>
       <div class="list">
         <div class="list-item"><strong id="runtimeMode">Mode: --</strong><span class="sub" id="runtimeUptime">Uptime: --</span></div>
+        <div class="list-item"><strong id="lastUpdated">Last updated: --</strong><span class="sub">Admin UI input handlers are throttled so search and filters do not spam rerenders.</span></div>
         <div class="list-item"><strong>Privacy Model</strong><span class="sub">Database events and ban history store hashed IP identifiers. Raw IPs are shown only for currently active firewall entries.</span></div>
       </div>
     </div>
@@ -922,6 +1222,10 @@ tr:hover td{background:#0f1d32}
 
     <div class="stack">
       <div class="card">
+        <h2>Operator Advice</h2>
+        <div class="advice" id="adviceList"></div>
+      </div>
+      <div class="card">
         <h2>Threat Mesh</h2>
         <div class="list" id="meshList"></div>
       </div>
@@ -937,6 +1241,7 @@ tr:hover td{background:#0f1d32}
 (function(){
 'use strict';
 var timer = null;
+var inputTimers = {};
 var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
@@ -946,6 +1251,7 @@ function tagRisk(r){ return r>=70?'t-red':r>=40?'t-yellow':'t-green'; }
 function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'?'t-green':'t-blue'; }
 async function api(p){ try{ var r=await fetch(p); if(!r.ok)return null; return await r.json(); }catch(e){ return null; } }
 function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
+function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[key] = setTimeout(fn, wait); }
 
 function renderSummary(){
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
@@ -954,6 +1260,7 @@ function renderSummary(){
   $('#mPeers').textContent = N(state.mesh&&state.mesh.peers ? state.mesh.peers.length : 0);
   $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
   $('#runtimeUptime').textContent = 'Uptime: '+((state.health&&state.health.uptime)||'--');
+  $('#lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
 }
 
 function renderEvents(){
@@ -1020,6 +1327,33 @@ function renderMesh(){
   }).join('') || '<div class="empty">Threat mesh enabled, but no peers configured.</div>';
 }
 
+function renderAdvice(){
+  var items = [];
+  var stats = state.stats || {};
+  var highRiskEvents = state.events.filter(function(event){ return (event.risk_score || 0) >= 70; }).length;
+  var offlinePeers = state.mesh && state.mesh.peers ? state.mesh.peers.filter(function(peer){ return !peer.reachable; }).length : 0;
+
+  if(stats.simulation_mode){
+    items.push({title:'Simulation mode is still enabled', body:'Useful for validation, but no real firewall action happens until you switch to live enforcement.'});
+  }
+  if((stats.active_bans || 0) > 0 && state.firewall.length === 0){
+    items.push({title:'Database bans do not match firewall entries', body:'Check firewall permissions or service startup ordering because active ban state appears to be drifting.'});
+  }
+  if(highRiskEvents >= 10){
+    items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'});
+  }
+  if(offlinePeers > 0){
+    items.push({title:'Some threat mesh peers are offline', body:'Investigate peer reachability or shared API keys so correlation remains complete across nodes.'});
+  }
+  if(!items.length){
+    items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream and peer health.'});
+  }
+
+  $('#adviceList').innerHTML = items.map(function(item){
+    return '<div class="advice-item"><strong>'+E(item.title)+'</strong><div class="sub">'+E(item.body)+'</div></div>';
+  }).join('');
+}
+
 function syncPluginFilter(){
   var select = $('#eventPluginFilter');
   var current = select.value;
@@ -1046,12 +1380,24 @@ function syncPluginFilter(){
     state.attackers = results[5]&&results[5].attackers ? results[5].attackers : [];
     state.mesh = results[6]||null;
     syncPluginFilter();
-    renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh();
+    renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh(); renderAdvice();
+  }
+
+  async function logout(){
+    try {
+      await fetch('/api/logout', {method:'POST'});
+    } finally {
+      window.location.href = '/login';
+    }
   }
 
   function bind(){
-    ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter'].forEach(function(id){ $( '#'+id ).addEventListener('input', function(){ renderEvents(); renderBans(); renderFirewall(); }); $( '#'+id ).addEventListener('change', function(){ renderEvents(); renderBans(); renderFirewall(); }); });
+    ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter'].forEach(function(id){
+      $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); });
+      $('#'+id).addEventListener('change', function(){ debounce(id + '-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); });
+    });
     $('#refreshNow').addEventListener('click', refresh);
+    $('#logoutBtn').addEventListener('click', logout);
     $('#refreshRate').addEventListener('change', function(){ if(timer) clearInterval(timer); timer = setInterval(refresh, parseInt(this.value,10)||1000); });
   }
 

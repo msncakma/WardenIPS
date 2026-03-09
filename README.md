@@ -41,7 +41,7 @@ WardenIPS ships with a built-in web dashboard for real-time visibility.
 - Live auto-refreshing UI.
 - Active bans, recent events, risk levels, countries, plugins, and attacker concentration.
 - Fast operational feedback without external observability tooling.
-- Advanced admin console available at `/v2` with live filters, raw active firewall IP view, and threat mesh status.
+- Advanced admin console available at `/admin` with live filters, raw active firewall IP view, operator advice, and threat mesh status.
 
 ### Privacy-Preserving Threat Mesh
 
@@ -86,6 +86,13 @@ What the installer does:
 - Generates a secure hashing salt automatically.
 - Enables the dashboard by default on `127.0.0.1:7680`.
 - Installs and enables the systemd service.
+
+Dashboard auth notes:
+
+- `/admin` is the canonical admin console route.
+- Set `dashboard.username` and `dashboard.password` to enable browser login.
+- If `dashboard.password` is empty, `dashboard.api_key` is accepted as a fallback login password for compatibility.
+- Login attempts are rate-limited server-side.
 
 What it deliberately does not do automatically:
 
@@ -179,7 +186,8 @@ python3 main.py --status
 
 ```text
 /     -> dashboard v1
-/v2   -> advanced admin dashboard
+/admin -> advanced admin dashboard
+/v2    -> legacy redirect to /admin
 ```
 
 ### Docker
