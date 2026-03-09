@@ -338,6 +338,9 @@ async def main() -> None:
     await warden.start()
     await warden.run_forever()
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Suppress the KeyboardInterrupt traceback for a clean console output
+        pass
