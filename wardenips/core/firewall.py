@@ -52,7 +52,7 @@ class FirewallManager:
     def __init__(self) -> None:
         self._set_name: str = "warden_blacklist"
         self._default_ban_duration: int = 3600
-        self._simulation_modee: bool = False
+        self._simulation_mode: bool = False
         self._whitelist = None
         self._initialized: bool = False
 
@@ -98,7 +98,7 @@ class FirewallManager:
             has_ipset = False
 
         if not is_linux or not has_ipset:
-            self._simulation_modee = True
+            self._simulation_mode = True
             reason = "Linux degil" if not is_linux else "ipset bulunamadi"
             logger.warning(
                 "Guvenlik duvari SIMULASYON modeunda! Reason: %s. "
@@ -109,7 +109,7 @@ class FirewallManager:
             # Root kontrolu
             import os
             if os.geteuid() != 0:
-                self._simulation_modee = True
+                self._simulation_mode = True
                 logger.warning(
                     "Root yetkisi yok — guvenlik duvari SIMULASYON modeunda!"
                 )
@@ -139,7 +139,7 @@ class FirewallManager:
         logger.info(
             "Firewall started. Set: '%s', "
             "Default ban duration: %ds, Simulation: %s",
-            self._set_name, self._default_ban_duration, self._simulation_modee,
+            self._set_name, self._default_ban_duration, self._simulation_mode,
         )
 
     # ── Ana API ──
@@ -255,7 +255,7 @@ class FirewallManager:
         Returns:
             ipset setindeki eleman sayisi.
         """
-        if self._simulation_modee:
+        if self._simulation_mode:
             return 0
 
         try:
@@ -309,7 +309,7 @@ class FirewallManager:
         """
         cmd_str = " ".join(args)
 
-        if self._simulation_modee:
+        if self._simulation_mode:
             logger.debug("[SIMULASYON] %s", cmd_str)
             return True
 
@@ -348,13 +348,13 @@ class FirewallManager:
             return False
 
     @property
-    def simulation_modee(self) -> bool:
+    def simulation_mode(self) -> bool:
         """Simulasyon modeunda mi?"""
-        return self._simulation_modee
+        return self._simulation_mode
 
     def __repr__(self) -> str:
         return (
             f"<FirewallManager "
             f"set='{self._set_name}' "
-            f"simulation={self._simulation_modee}>"
+            f"simulation={self._simulation_mode}>"
         )

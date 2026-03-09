@@ -160,7 +160,7 @@ class DatabaseManager:
         try:
             self._db = await aiosqlite.connect(str(self._db_path))
             # WAL modeu — okuma ve yazma islemleri birbirini engellemez
-            await self._db.execute("PRAGMA journal_modee=WAL")
+            await self._db.execute("PRAGMA journal_mode=WAL")
             # Foreign key destegi
             await self._db.execute("PRAGMA foreign_keys=ON")
             # Semalari olustur

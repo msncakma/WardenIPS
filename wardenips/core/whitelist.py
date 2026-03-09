@@ -49,7 +49,7 @@ class WhitelistManager:
         self._whitelisted_ips: Set[IPAddress] = set()
         self._whitelisted_networks: List[IPNetwork] = []
         self._geofencing_enabled: bool = False
-        self._geofencing_modee: str = "allow"
+        self._geofencing_mode: str = "allow"
         self._geofencing_countries: Set[str] = set()
         self._enabled: bool = True
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -132,7 +132,7 @@ class WhitelistManager:
             # Ülke tespit edilemediyse varsayılan davranış:
             # - "allow" modeunda izin VERME (güvenli taraf)
             # - "deny" modeunda izin VER
-            if self._geofencing_modee == "allow":
+            if self._geofencing_mode == "allow":
                 logger.warning(
                     "Ülke kodu tespit edilemedi ve geofencing 'allow' modeunda — "
                     "bağlantı reddedildi."
@@ -142,7 +142,7 @@ class WhitelistManager:
 
         code = country_code.upper()
 
-        if self._geofencing_modee == "allow":
+        if self._geofencing_mode == "allow":
             allowed = code in self._geofencing_countries
             if not allowed:
                 logger.info(
@@ -151,7 +151,7 @@ class WhitelistManager:
                 )
             return allowed
 
-        elif self._geofencing_modee == "deny":
+        elif self._geofencing_mode == "deny":
             denied = code in self._geofencing_countries
             if denied:
                 logger.info(
@@ -161,7 +161,7 @@ class WhitelistManager:
             return not denied
 
         # Bilinmeyen mode — güvenli tarafta kal, izin ver
-        logger.warning("Geofencing: Bilinmeyen mode '%s', izin veriliyor.", self._geofencing_modee)
+        logger.warning("Geofencing: Bilinmeyen mode '%s', izin veriliyor.", self._geofencing_mode)
         return True
 
     async def reload(self, config: ConfigManager) -> None:
@@ -189,7 +189,7 @@ class WhitelistManager:
             "ip_count": len(self._whitelisted_ips),
             "cidr_count": len(self._whitelisted_networks),
             "geofencing_enabled": self._geofencing_enabled,
-            "geofencing_modee": self._geofencing_modee,
+            "geofencing_mode": self._geofencing_mode,
             "geofencing_countries": sorted(self._geofencing_countries),
         }
 
@@ -242,14 +242,14 @@ class WhitelistManager:
         # ── Geofencing ──
         geo_section = config.get_section("geofencing")
         self._geofencing_enabled = geo_section.get("enabled", False)
-        self._geofencing_modee = geo_section.get("modee", "allow").lower()
+        self._geofencing_mode = geo_section.get("mode", "allow").lower()
         raw_countries: List[str] = geo_section.get("countries", [])
         self._geofencing_countries = {c.upper() for c in raw_countries}
 
         if self._geofencing_enabled:
             logger.info(
                 "Geofencing aktif — Mod: %s, Ülkeler: %s",
-                self._geofencing_modee,
+                self._geofencing_mode,
                 sorted(self._geofencing_countries),
             )
 

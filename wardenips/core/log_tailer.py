@@ -178,7 +178,7 @@ class LogTailer:
         while self._running:
             try:
                 async with aiofiles.open(
-                    str(self._file_path), modee="r", encoding="utf-8", errors="replace"
+                    str(self._file_path), mode="r", encoding="utf-8", errors="replace"
                 ) as f:
                     # Pozisyona atla
                     await f.seek(position)

@@ -39,21 +39,24 @@ class IPHasher:
     # Desteklenen hash algoritmalari
     _SUPPORTED_ALGORITHMS = {"sha256", "sha384", "sha512"}
 
-    def __init__(self, salt: str, algorithm: str = "sha256") -> None:
+    def __init__(self, salt: str, algorithm: str = "sha256", enabled: bool = True) -> None:
         """
         IP hasher'i baslatir.
 
         Args:
             salt:      Hash'lemede kullanilacak gizli salt degeri.
             algorithm: Hash algoritmasi ("sha256", "sha384", "sha512").
+            enabled:   If false, skips hashing and returns the original IP.
 
         Raises:
             ValueError: Salt bos ise veya algoritma desteklenmiyorsa.
         """
-        if not salt or salt == "BURAYA-GUCLU-BIR-SALT-DEGERI-YAZIN":
+        self._enabled = enabled
+
+        if self._enabled and (not salt or salt == "BURAYA-GUCLU-BIR-SALT-DEGERI-YAZIN" or salt == "YOUR-RANDOM-SECURE-SALT-STRING-HERE"):
             logger.warning(
-                "IP hash salt degeri degistirilmemis veya bos! "
-                "Guvenlik riski — config.yaml'da salt degerini guncelleyin."
+                "IP hash salt is unchanged or empty! Security risk "
+                "— please update the salt in config.yaml."
             )
 
         if algorithm not in self._SUPPORTED_ALGORITHMS:
