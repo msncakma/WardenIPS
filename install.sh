@@ -14,6 +14,7 @@ ENABLE_DASHBOARD="${WARDENIPS_ENABLE_DASHBOARD:-1}"
 CLI_WRAPPER="/usr/local/bin/wardenips"
 
 TMP_DIR=""
+SOURCE_DIR=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,20 +62,21 @@ detect_source_dir() {
     SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" 2>/dev/null && pwd || pwd)"
 
     if [ -f "$SCRIPT_DIR/main.py" ] && [ -d "$SCRIPT_DIR/wardenips" ] && [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-        printf "%s" "$SCRIPT_DIR"
+        SOURCE_DIR="$SCRIPT_DIR"
         return
     fi
 
     if [ -f "./main.py" ] && [ -d "./wardenips" ] && [ -f "./requirements.txt" ]; then
-        printf "%s" "$(pwd)"
+        SOURCE_DIR="$(pwd)"
         return
     fi
 
     TMP_DIR="$(mktemp -d)"
-    printf "%b\n" "${GREEN}[+]${NC} Fetching WardenIPS from ${REPO_URL} (${REPO_BRANCH})..." >&2
-    git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TMP_DIR/repo" >/dev/null 2>&1 || \
+    SOURCE_DIR="$TMP_DIR/repo"
+    log "Fetching WardenIPS from ${REPO_URL} (${REPO_BRANCH})..."
+    if ! git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$SOURCE_DIR"; then
         error "Failed to download repository from ${REPO_URL}"
-    printf "%s" "$TMP_DIR/repo"
+    fi
 }
 
 deploy_files() {
@@ -349,8 +351,8 @@ install_service() {
     fi
 }
 
-SOURCE_DIR="$(detect_source_dir)"
 install_dependencies
+detect_source_dir
 deploy_files "$SOURCE_DIR"
 ensure_venv
 merge_config_template
