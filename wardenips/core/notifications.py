@@ -18,6 +18,7 @@ import time
 from collections import deque
 from typing import Optional
 
+from wardenips import __author__, __version__
 from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -125,13 +126,14 @@ class NotificationManager:
             return
 
         dur_str = f"{duration}s" if duration > 0 else "permanent"
-        title = "🚨 WardenIPS — IP Banned"
+        title = f"🚨 WardenIPS v{__version__} — IP Banned"
         body = (
             f"**IP:** `{ip}`\n"
             f"**Risk Score:** {risk}\n"
             f"**Duration:** {dur_str}\n"
             f"**Plugin:** {plugin}\n"
-            f"**Reason:** {reason}"
+            f"**Reason:** {reason}\n"
+            f"**Version:** v{__version__} ({__author__})"
         )
 
         tasks = []
@@ -159,12 +161,13 @@ class NotificationManager:
         if self._rate_limited():
             return
 
-        title = "⚡ WardenIPS — Burst Flood Detected"
+        title = f"⚡ WardenIPS v{__version__} — Burst Flood Detected"
         body = (
             f"**IP:** `{ip}`\n"
             f"**Events:** {event_count} in {window}s\n"
             f"**Plugin:** {plugin}\n"
-            f"Auto-banned immediately."
+            f"Auto-banned immediately.\n"
+            f"**Version:** v{__version__} ({__author__})"
         )
 
         tasks = []
@@ -216,6 +219,7 @@ class NotificationManager:
             "title": title,
             "description": body,
             "color": 0xFF4444,  # red
+            "footer": {"text": f"WardenIPS v{__version__} • {__author__}"},
         }
         payload = {"embeds": [embed]}
 

@@ -9,6 +9,7 @@ LOG_DIR="${LOG_DIR:-/var/log/wardenips}"
 SERVICE_NAME="wardenips"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CONFIG_FILE="${INSTALL_DIR}/config.yaml"
+CLI_WRAPPER="/usr/local/bin/wardenips"
 PURGE="${WARDENIPS_PURGE:-0}"
 
 RED='\033[0;31m'
@@ -98,6 +99,7 @@ remove_service() {
 }
 
 remove_files() {
+    rm -f "$CLI_WRAPPER"
     if [ "$PURGE" = "1" ]; then
         warn "Purge mode enabled — removing install directory, logs, and database."
         rm -rf "$INSTALL_DIR"

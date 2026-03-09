@@ -11,6 +11,7 @@ REPO_URL="${WARDENIPS_REPO_URL:-https://github.com/msncakma/WardenIPS.git}"
 REPO_BRANCH="${WARDENIPS_REPO_BRANCH:-master}"
 AUTOSTART="${WARDENIPS_AUTOSTART:-0}"
 ENABLE_DASHBOARD="${WARDENIPS_ENABLE_DASHBOARD:-1}"
+CLI_WRAPPER="/usr/local/bin/wardenips"
 
 TMP_DIR=""
 
@@ -129,6 +130,81 @@ ensure_venv() {
     "$INSTALL_DIR/venv/bin/python" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt"
 }
 
+merge_config_template() {
+    if [ ! -f "$INSTALL_DIR/config.yaml" ] || [ ! -f "$INSTALL_DIR/config_backup.yaml" ]; then
+        return
+    fi
+
+    if [ ! -f "$INSTALL_DIR/config.yaml.backup" ]; then
+        log "Fresh install detected, no config merge needed."
+        return
+    fi
+
+    MERGE_RESULT="$($INSTALL_DIR/venv/bin/python - "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/config_backup.yaml" <<'PY'
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+import sys
+
+import yaml
+
+
+def merge_missing(current, template):
+    changed = False
+    if not isinstance(current, dict) or not isinstance(template, dict):
+        return changed
+
+    for key, value in template.items():
+        if key not in current:
+            current[key] = deepcopy(value)
+            changed = True
+            continue
+        if isinstance(current.get(key), dict) and isinstance(value, dict):
+            if merge_missing(current[key], value):
+                changed = True
+    return changed
+
+
+config_path = Path(sys.argv[1])
+template_path = Path(sys.argv[2])
+original_text = config_path.read_text(encoding="utf-8")
+current = yaml.safe_load(original_text) or {}
+template = yaml.safe_load(template_path.read_text(encoding="utf-8")) or {}
+
+if not isinstance(current, dict) or not isinstance(template, dict):
+    print("invalid")
+    raise SystemExit(0)
+
+if not merge_missing(current, template):
+    print("unchanged")
+    raise SystemExit(0)
+
+timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+backup_name = f"config.yaml.pre-update-{timestamp}.bak"
+config_path.with_name(backup_name).write_text(original_text, encoding="utf-8")
+config_path.write_text(
+    yaml.safe_dump(current, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+print(backup_name)
+PY
+)"
+
+    case "$MERGE_RESULT" in
+        unchanged)
+            log "Config already contains the current template keys."
+            ;;
+        invalid)
+            warn "Config merge skipped because config.yaml or config_backup.yaml is not a valid YAML mapping."
+            ;;
+        *)
+            log "Merged new config keys from config_backup.yaml (backup: $INSTALL_DIR/$MERGE_RESULT)."
+            ;;
+    esac
+}
+
 configure_defaults() {
     if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
         error "config.yaml was not found after deployment."
@@ -178,6 +254,87 @@ PY
     fi
 }
 
+install_cli_wrapper() {
+    log "Installing CLI wrapper..."
+    cat > "$CLI_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+
+INSTALL_DIR="__INSTALL_DIR__"
+CONFIG_FILE="$INSTALL_DIR/config.yaml"
+PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
+MAIN_FILE="$INSTALL_DIR/main.py"
+SERVICE_NAME="wardenips"
+
+usage() {
+    printf "WardenIPS command wrapper\n"
+    printf "Usage: wardenips <command> [args]\n\n"
+    printf "Commands:\n"
+    printf "  version         Show installed version\n"
+    printf "  status          Show WardenIPS database summary\n"
+    printf "  start           Start the systemd service\n"
+    printf "  stop            Stop the systemd service\n"
+    printf "  restart         Restart the systemd service\n"
+    printf "  service-status  Show systemd service status\n"
+    printf "  logs            Tail service logs\n"
+    printf "  config          Print config path\n"
+    printf "  path            Print install path\n"
+    printf "  ls              List install directory\n"
+    printf "  shell           Open a shell in the install directory\n"
+    printf "  run [args]      Run main.py directly with the installed config\n"
+}
+
+case "${1:-help}" in
+    help|-h|--help)
+        usage
+        ;;
+    version)
+        exec "$PYTHON_BIN" "$MAIN_FILE" --version
+        ;;
+    status)
+        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+        ;;
+    start)
+        exec systemctl start "$SERVICE_NAME"
+        ;;
+    stop)
+        exec systemctl stop "$SERVICE_NAME"
+        ;;
+    restart)
+        exec systemctl restart "$SERVICE_NAME"
+        ;;
+    service-status)
+        exec systemctl status "$SERVICE_NAME"
+        ;;
+    logs)
+        exec journalctl -u "$SERVICE_NAME" -f
+        ;;
+    config)
+        printf "%s\n" "$CONFIG_FILE"
+        ;;
+    path)
+        printf "%s\n" "$INSTALL_DIR"
+        ;;
+    ls)
+        exec ls -la "$INSTALL_DIR"
+        ;;
+    shell)
+        cd "$INSTALL_DIR"
+        exec "${SHELL:-/bin/sh}"
+        ;;
+    run)
+        shift
+        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+        ;;
+    *)
+        exec "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+        ;;
+esac
+EOF
+    sed -i "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$CLI_WRAPPER"
+    chmod +x "$CLI_WRAPPER"
+}
+
 install_service() {
     log "Installing systemd service..."
     cp "$INSTALL_DIR/wardenips.service" "$SERVICE_FILE"
@@ -196,7 +353,9 @@ SOURCE_DIR="$(detect_source_dir)"
 install_dependencies
 deploy_files "$SOURCE_DIR"
 ensure_venv
+merge_config_template
 configure_defaults
+install_cli_wrapper
 install_service
 
 printf "\n"
@@ -220,6 +379,12 @@ printf "%b\n" "  ${GREEN}Start manually:${NC}"
 printf "%b\n" "    sudo systemctl start wardenips"
 printf "%b\n" "    sudo systemctl status wardenips"
 printf "%b\n" "    sudo journalctl -u wardenips -f"
+printf "\n"
+printf "%b\n" "  ${GREEN}Direct commands:${NC}"
+printf "%b\n" "    wardenips status"
+printf "%b\n" "    wardenips logs"
+printf "%b\n" "    wardenips service-status"
+printf "%b\n" "    wardenips shell"
 printf "\n"
 printf "%b\n" "  ${GREEN}One-line install:${NC}"
 printf "%b\n" "    sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)\""

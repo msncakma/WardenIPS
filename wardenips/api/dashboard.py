@@ -40,6 +40,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
+from wardenips import __author__, __version__
 from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.logger import get_logger
 
@@ -188,6 +189,19 @@ class DashboardAPI:
       return True
     return self._check_auth(request)
 
+  def _normalize_next_path(self, candidate: str, default: str = "/dashboard") -> str:
+    value = str(candidate or "").strip()
+    if not value.startswith("/") or value.startswith("//"):
+      return default
+    return value
+
+  def _render_ui_template(self, html: str) -> str:
+    return (
+      html
+      .replace("__APP_VERSION__", __version__)
+      .replace("__APP_AUTHOR__", __author__)
+    )
+
   def _json_auth_error(self) -> web.Response:
     if not self._dashboard_auth_configured():
       return web.json_response(
@@ -202,7 +216,10 @@ class DashboardAPI:
   def _require_dashboard_auth(self, request: web.Request) -> Optional[web.Response]:
     if self._is_session_authenticated(request):
       return None
-    next_path = quote(request.path_qs or "/admin", safe="/%?=&")
+    next_path = quote(
+      self._normalize_next_path(request.path_qs or "/admin", "/admin"),
+      safe="/%?=&",
+    )
     raise web.HTTPFound(f"/login?next={next_path}")
 
   def _issue_session(self, response: web.StreamResponse, request: web.Request) -> None:
@@ -484,9 +501,10 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_login_page(self, request: web.Request) -> web.Response:
-    next_path = request.query.get("next", "/dashboard")
-    if not next_path.startswith("/"):
-      next_path = "/dashboard"
+    next_path = self._normalize_next_path(
+      request.query.get("next", "/dashboard"),
+      "/dashboard",
+    )
     if self._is_session_authenticated(request):
       raise web.HTTPFound(next_path)
     html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
@@ -502,6 +520,7 @@ class DashboardAPI:
         "Configure dashboard.password or dashboard.api_key in config.yaml and restart WardenIPS before using /admin."
       ),
     )
+    html = self._render_ui_template(html)
     return web.Response(text=html, content_type="text/html")
 
   async def _handle_login(self, request: web.Request) -> web.Response:
@@ -524,9 +543,10 @@ class DashboardAPI:
 
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
-    next_path = str(payload.get("next", "/dashboard")).strip() or "/dashboard"
-    if not next_path.startswith("/"):
-      next_path = "/dashboard"
+    next_path = self._normalize_next_path(
+      str(payload.get("next", "/dashboard")).strip() or "/dashboard",
+      "/dashboard",
+    )
     if not self._dashboard_auth_configured():
       return self._json_auth_error()
     if username != self._dashboard_username or not self._password_matches(password):
@@ -645,6 +665,7 @@ class DashboardAPI:
     admin_label = "Open Admin" if is_authenticated else "Admin Login"
     html = DASHBOARD_HTML.replace("__ADMIN_HREF__", admin_href)
     html = html.replace("__ADMIN_LABEL__", admin_label)
+    html = self._render_ui_template(html)
     return web.Response(text=html, content_type="text/html")
 
   async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
@@ -655,6 +676,7 @@ class DashboardAPI:
       raise web.HTTPFound("/admin")
     self._touch_session(request)
     html = DASHBOARD_V2_HTML.replace("__SESSION_TIMEOUT_MS__", str(self._session_ttl * 1000))
+    html = self._render_ui_template(html)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -744,7 +766,7 @@ button[disabled]{opacity:.65;cursor:wait}
     <div id="guestActions" class="secondary-actions">
       <a class="button-link" href="/dashboard">View Dashboard Without Login</a>
     </div>
-    <div class="foot">Default username: <span id="defaultUser"></span></div>
+    <div class="foot">Default username: <span id="defaultUser"></span> · WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__</div>
   </div>
 </div>
 <script>
@@ -1070,7 +1092,7 @@ footer a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <footer>WardenIPS &mdash; Autonomous Intrusion Prevention &middot; <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></footer>
+  <footer>WardenIPS v__APP_VERSION__ &mdash; by __APP_AUTHOR__ &middot; Autonomous Intrusion Prevention &middot; <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></footer>
 </div>
 
 <a class="kofi-fab" href="https://ko-fi.com/msncakma" target="_blank" rel="noopener" title="Support WardenIPS on Ko-fi">
@@ -1281,7 +1303,7 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
 .hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:16px;padding:16px}.hero-card h2,.card h2,.side-card h2{font-size:.96rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.6rem;font-weight:800}
 .layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #1b2940;font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:#0b1527;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:#0f1d32}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:#3b131b;color:#ff97a4}.t-green{background:#0e2d25;color:#79efc6}.t-yellow{background:#392b0d;color:#ffd27f}.t-blue{background:#102543;color:#8eb8ff}
-.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:#175343;background:#0d2e26}.status.err{border-color:#6a2432;background:#32131a}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}.empty{padding:24px;text-align:center;color:var(--muted)}
+.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:12px;border:1px solid var(--b);border-radius:12px;background:#0b1527}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:#175343;background:#0d2e26}.status.err{border-color:#6a2432;background:#32131a}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.linkbar a{color:#9fc5ff;text-decoration:none;font-size:.82rem}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:#9fc5ff;text-decoration:none}
 @media(max-width:1100px){.utility-strip,.hero,.layout,.split{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){.app{padding:14px}.hero-meta{grid-template-columns:1fr}.actions,.toolbar,.action-grid{width:100%}.ctrl,.btn{width:100%}}
 </style>
@@ -1407,6 +1429,8 @@ body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(
       <div class="card"><h2>Top Attackers</h2><div class="list" id="attackerList"></div></div>
     </div>
   </div>
+
+  <div class="admin-footer">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__ · Authenticated operational console · <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></div>
 </div>
 
 <script>

@@ -20,6 +20,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from wardenips import __author__, __version__
 from wardenips.core.config import ConfigManager
 from wardenips.core.logger import setup_logging, get_logger
 from wardenips.core.whitelist import WhitelistManager
@@ -38,9 +39,6 @@ from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
 from wardenips.plugins.nginx_plugin import NginxPlugin
-
-# Version
-__version__ = "0.1.0"
 
 
 class WardenIPS:
@@ -93,6 +91,7 @@ class WardenIPS:
 
         self._logger.info("=" * 60)
         self._logger.info("  Starting WardenIPS v%s...", __version__)
+        self._logger.info("  Maintainer: %s", __author__)
         self._logger.info("=" * 60)
 
         # ── 2.1 System Info Logging ──
@@ -564,7 +563,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version=f"WardenIPS v{__version__}",
+        version=f"WardenIPS v{__version__} by {__author__}",
     )
     parser.add_argument(
         "--status",
@@ -583,6 +582,7 @@ async def print_status(config_path: str) -> None:
 
     print("="*50)
     print(f"  WardenIPS v{__version__} — Status Report")
+    print(f"  Maintainer     : {__author__}")
     print("="*50)
     print(f"  Database       : {stats.get('db_path', 'N/A')}")
     print(f"  Total events   : {stats.get('total_events', 0)}")

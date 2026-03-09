@@ -4,6 +4,8 @@ WardenIPS is a Linux-native, asynchronous intrusion prevention platform that wat
 
 It is built for operators who want something lighter than a SIEM, faster than manual log review, and more modern than static fail2ban-style rules.
 
+Maintainer: `msncakma`
+
 If you want a cleaner product-style overview for sharing or presentation, see [docs/index.md](docs/index.md).
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
@@ -84,8 +86,10 @@ What the installer does:
 - Creates and repairs the Python virtual environment if needed.
 - Installs Python dependencies.
 - Generates a secure hashing salt automatically.
+- Preserves the previous `config.yaml`, then merges any newly added template keys from `config_backup.yaml` into the active config.
 - Enables the dashboard by default on `127.0.0.1:7680`.
 - Installs and enables the systemd service.
+- Installs a `wardenips` command wrapper so common checks do not require changing into the install directory.
 
 Dashboard auth notes:
 
@@ -109,6 +113,16 @@ Bootstrap installer flags:
 - `WARDENIPS_AUTOSTART=1` starts the service automatically after install.
 - `WARDENIPS_ENABLE_DASHBOARD=0` keeps the dashboard disabled during bootstrap.
 - `WARDENIPS_REPO_BRANCH=branch-name` installs from a different branch.
+
+Direct terminal commands after install:
+
+```sh
+wardenips version
+wardenips status
+wardenips service-status
+wardenips logs
+wardenips shell
+```
 
 ## Quick Start
 

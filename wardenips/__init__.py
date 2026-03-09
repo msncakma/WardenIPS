@@ -7,4 +7,4 @@ tespit edip otonom savunma yapan yüksek performanslı IPS yazılımı.
 """
 
 __version__ = "0.1.0"
-__author__ = "WardenIPS Team"
+__author__ = "msncakma"
