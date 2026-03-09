@@ -33,7 +33,7 @@ echo ""
 # ── 1. System dependencies ──
 log "Installing system dependencies..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv ipset iptables git > /dev/null
+apt-get install -y -qq python3 rsync rsyslog python3-venv ipset iptables git > /dev/null
 
 # ── 2. Create directories ──
 log "Creating directories..."
