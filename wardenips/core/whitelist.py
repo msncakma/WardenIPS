@@ -1,11 +1,11 @@
 """
-WardenIPS - Asenkron Whitelist Yöneticisi
+WardenIPS - Asynchronously manages IP whitelists.
 ==========================================
 
-IP ve CIDR tabanlı whitelist kontrolü, geofencing desteği
-ve hot-reload yeteneği sağlar.
+IP and CIDR-based whitelist control, geofencing support,
+and hot-reload capability.
 
-Yöneticilerin kendi sunucularından kilitlenmesini engeller.
+Prevents managers from being locked out of their own servers.
 """
 
 from __future__ import annotations
@@ -27,22 +27,22 @@ IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 class WhitelistManager:
     """
-    Asenkron Whitelist yöneticisi.
+    Asynchronously manages IP whitelists.
 
-    config.yaml'daki whitelist ve geofencing ayarlarını okuyarak
-    gelen IP adreslerinin güvenli olup olmadığını kontrol eder.
+    Reads whitelist and geofencing settings from config.yaml
+    and checks if incoming IP addresses are authorized.
 
-    Özellikler:
-        - IPv4 ve IPv6 unique IP desteği
-        - CIDR blokları (ağ aralıkları) desteği
-        - Geofencing — ülke bazlı izin/engelleme
-        - Hot-reload — yapılandırma değişikliklerinde listeyi güncelleme
-        - O(1) unique IP arama, O(n) CIDR tarama (n = CIDR sayısı)
+    Features:
+        - IPv4 and IPv6 unique IP support.
+        - CIDR block (network ranges) support.
+        - Geofencing — country-based allow/deny rules.
+        - Hot-reload — automatically updates the list on configuration changes.
+        - O(1) lookup for unique IPs, O(n) for CIDR scanning (n = number of CIDRs).
 
-    Kullanım:
+    Usage:
         wl = await WhitelistManager.create(config)
         if await wl.is_whitelisted("192.168.1.1"):
-            print("IP güvenli listede!")
+            print("IP is in the safe list!")
     """
 
     def __init__(self) -> None:
@@ -59,13 +59,13 @@ class WhitelistManager:
     @classmethod
     async def create(cls, config: ConfigManager) -> WhitelistManager:
         """
-        ConfigManager'dan yapılandırmayı okuyarak WhitelistManager oluşturur.
+        Creates a WhitelistManager instance from a ConfigManager.
 
         Args:
-            config: Yüklenmiş ConfigManager instance.
+            config: Loaded ConfigManager instance.
 
         Returns:
-            Yapılandırılmış WhitelistManager.
+            Configured WhitelistManager.
         """
         instance = cls()
         await instance._load_from_config(config)
@@ -75,18 +75,18 @@ class WhitelistManager:
 
     async def is_whitelisted(self, ip_str: str) -> bool:
         """
-        Bir IP adresinin whitelist'te olup olmadığını kontrol eder.
+        Checks if an IP address is whitelisted.
 
-        Kontrol sırası:
-            1. Whitelist devre dışı ise → False (her IP değerlendirilir)
-            2. Tekil IP eşleşmesi (O(1) set lookup)
-            3. CIDR ağ aralığı eşleşmesi
+        Control order:
+            1. Whitelist disabled → False (all IPs are evaluated)
+            2. Unique IP match (O(1) set lookup)
+            3. CIDR network match
 
         Args:
-            ip_str: Kontrol edilecek IP adresi (string).
+            ip_str: IP address to check (string).
 
         Returns:
-            True ise IP güvenli, banlanmamalı.
+            True if IP is whitelisted, False otherwise.
         """
         if not self._enabled:
             return False
@@ -94,19 +94,19 @@ class WhitelistManager:
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            logger.warning("Geçersiz IP formatı, whitelist kontrolü başarısız: %s", ip_str)
+            logger.warning("Invalid IP format, whitelist check failed: %s", ip_str)
             return False
 
         # 1. Tekil IP kontrolü — O(1)
         if ip in self._whitelisted_ips:
-            logger.debug("IP whitelist'te bulundu (tekil): %s", ip_str)
+            logger.debug("IP whitelist'te bulundu (unique): %s", ip_str)
             return True
 
         # 2. CIDR ağ kontrolü
         for network in self._whitelisted_networks:
             if ip in network:
                 logger.debug(
-                    "IP whitelist'te bulundu (CIDR %s): %s",
+                    "IP found in whitelist (CIDR %s): %s",
                     network,
                     ip_str,
                 )
@@ -116,14 +116,14 @@ class WhitelistManager:
 
     async def is_country_allowed(self, country_code: Optional[str]) -> bool:
         """
-        Geofencing kurallarına göre bir ülke kodunun izinli olup olmadığını kontrol eder.
+        Checks if a country code is allowed based on geofencing rules.
 
         Args:
-            country_code: ISO 3166-1 alpha-2 ülke kodu (örn: "TR").
-                          None ise ülke bilinmiyor demektir.
+            country_code: ISO 3166-1 alpha-2 country code (e.g., "TR").
+                          None if country is unknown.
 
         Returns:
-            True ise bağlantıya izin verilir.
+            True if the connection is allowed.
         """
         if not self._geofencing_enabled:
             return True
@@ -134,8 +134,8 @@ class WhitelistManager:
             # - "deny" modeunda izin VER
             if self._geofencing_mode == "allow":
                 logger.warning(
-                    "Ülke kodu tespit edilemedi ve geofencing 'allow' modeunda — "
-                    "bağlantı reddedildi."
+                    "Country code not detected and geofencing 'allow' mode — "
+                    "connection denied."
                 )
                 return False
             return True
@@ -146,7 +146,7 @@ class WhitelistManager:
             allowed = code in self._geofencing_countries
             if not allowed:
                 logger.info(
-                    "Geofencing: %s ülkesi 'allow' listesinde değil — reddedildi.",
+                    "Geofencing: %s country code not in 'allow' list — connection denied.",
                     code,
                 )
             return allowed
@@ -155,35 +155,35 @@ class WhitelistManager:
             denied = code in self._geofencing_countries
             if denied:
                 logger.info(
-                    "Geofencing: %s ülkesi 'deny' listesinde — reddedildi.",
+                    "Geofencing: %s country code in 'deny' list — connection denied.",
                     code,
                 )
             return not denied
 
         # Bilinmeyen mode — güvenli tarafta kal, izin ver
-        logger.warning("Geofencing: Bilinmeyen mode '%s', izin veriliyor.", self._geofencing_mode)
+        logger.warning("Geofencing: Unknown mode '%s', allowing connection.", self._geofencing_mode)
         return True
 
     async def reload(self, config: ConfigManager) -> None:
         """
-        Whitelist yapılandırmasını güncellenmiş config'den yeniden yükler.
-        Thread-safe; yeniden yükleme sırasında kontroller bekletilir.
+        Reloads the whitelist configuration from the updated config.
+        Thread-safe; locks during reload to prevent concurrent access.
 
         Args:
-            config: Güncel ConfigManager instance.
+            config: Updated ConfigManager instance.
         """
         async with self._lock:
             self._whitelisted_ips.clear()
             self._whitelisted_networks.clear()
             self._geofencing_countries.clear()
             await self._load_from_config(config)
-            logger.info("Whitelist yeniden yüklendi.")
+            logger.info("Whitelist reloaded.")
 
-    # ── Bilgi ──
+    # ── Information ──
 
     @property
     def stats(self) -> dict:
-        """Whitelist istatistiklerini döndürür."""
+        """Returns whitelist statistics."""
         return {
             "enabled": self._enabled,
             "ip_count": len(self._whitelisted_ips),
@@ -193,11 +193,11 @@ class WhitelistManager:
             "geofencing_countries": sorted(self._geofencing_countries),
         }
 
-    # ── Dahili Metodlar ──
+    # ── Internal Methods ──
 
     async def _load_from_config(self, config: ConfigManager) -> None:
         """
-        ConfigManager'dan whitelist ve geofencing ayarlarını okur.
+        Loads whitelist and geofencing settings from ConfigManager.
 
         Args:
             config: ConfigManager instance.
@@ -208,21 +208,21 @@ class WhitelistManager:
 
         if not self._enabled:
             logger.warning(
-                "Whitelist DEVRE DIŞI! Tüm IP'ler analiz edilecek (yönetici kilidi riski)."
+                "Whitelist disabled! All IPs will be evaluated (manager lock risk)."
             )
             return
 
-        # Tekil IP'ler
+        # Unique IPs
         raw_ips: List[str] = wl_section.get("ips", [])
         for raw_ip in raw_ips:
             try:
                 self._whitelisted_ips.add(ipaddress.ip_address(raw_ip.strip()))
             except ValueError:
                 logger.error(
-                    "Geçersiz whitelist IP adresi atlanıyor: '%s'", raw_ip
+                    "Invalid whitelist IP address skipped: '%s'", raw_ip
                 )
 
-        # CIDR ağ aralıkları
+        # CIDR networks
         raw_cidrs: List[str] = wl_section.get("cidr_ranges", [])
         for raw_cidr in raw_cidrs:
             try:
@@ -230,11 +230,11 @@ class WhitelistManager:
                 self._whitelisted_networks.append(network)
             except ValueError:
                 logger.error(
-                    "Geçersiz whitelist CIDR aralığı atlanıyor: '%s'", raw_cidr
+                    "Invalid whitelist CIDR range skipped: '%s'", raw_cidr
                 )
 
         logger.info(
-            "Whitelist loaded — %d unique IP, %d CIDR aralığı.",
+            "Whitelist loaded — %d unique IP, %d CIDR networks.",
             len(self._whitelisted_ips),
             len(self._whitelisted_networks),
         )

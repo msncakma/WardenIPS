@@ -34,12 +34,12 @@ logger = get_logger(__name__)
 
 class BasePlugin(abc.ABC):
     """
-    WardenIPS plugin soyut temel sinifi.
+    WardenIPS plugin abstract base class.
 
-    Tum pluginler bu siniftan turetilmeli ve
-    soyut metodlari implement etmelidir.
+    All plugins must inherit from this class and implement
+    abstract methods.
 
-    Ornek:
+    Example:
         class SSHPlugin(BasePlugin):
             @property
             def name(self) -> str:
@@ -50,17 +50,16 @@ class BasePlugin(abc.ABC):
                 return self._config.get("plugins.ssh.log_path", "/var/log/auth.log")
 
             async def parse_line(self, line: str) -> Optional[ConnectionEvent]:
-                # regex ile auth.log satirini ayristir
-                ...
+                # parse the log line
 
             async def calculate_risk(self, event, context) -> int:
-                # risk skoru hesapla
+                # calculate the risk score
                 ...
     """
 
     def __init__(self, config: ConfigManager) -> None:
         """
-        Plugin'i yapilandirir.
+        Initialize the plugin.
 
         Args:
             config: ConfigManager instance.
@@ -72,17 +71,17 @@ class BasePlugin(abc.ABC):
         self._logger = get_logger(f"plugin.{self.name.lower()}")
 
     # ══════════════════════════════════════════════════════════
-    #  SOYUT METODLAR (Her plugin BUNLARI implement ETMELI)
+    #  ABSTRACT METHODS (All plugins MUST implement these)
     # ══════════════════════════════════════════════════════════
 
     @property
     @abc.abstractmethod
     def name(self) -> str:
         """
-        Plugin adi (benzersiz olmali).
+        Plugin name (must be unique).
 
         Returns:
-            Plugin adi string (orn: "SSH", "Minecraft", "Nginx").
+            Plugin name string (e.g., "SSH", "Minecraft", "Nginx").
         """
         ...
 
@@ -90,26 +89,26 @@ class BasePlugin(abc.ABC):
     @abc.abstractmethod
     def log_file_path(self) -> str:
         """
-        Izlenecek log dosyasinin yolu.
+        Path to the log file to be monitored.
 
         Returns:
-            Log dosyasi tam yolu.
+            Full path to the log file.
         """
         ...
 
     @abc.abstractmethod
     async def parse_line(self, line: str) -> Optional[ConnectionEvent]:
         """
-        Bir log satirini ayristirir ve ConnectionEvent olusturur.
+        Parse a log line and create a ConnectionEvent.
 
-        Bu metod her yeni log satiri icin cagrilir.
-        Satir plugin ile ilgili degilse None dondurmelidir.
+        This method is called for each new log line.
+        If the line is not related to the plugin, return None.
 
         Args:
-            line: Ham log satiri.
+            line: Raw log line.
 
         Returns:
-            ConnectionEvent nesnesi veya None (ilgisiz satir).
+            ConnectionEvent object or None (irrelevant line).
         """
         ...
 
@@ -120,18 +119,18 @@ class BasePlugin(abc.ABC):
         context: dict,
     ) -> int:
         """
-        Bir events icin risk skoru hesaplar (0-100).
+        Calculate the risk score for a connection event (0-100).
 
-        Context, gecmis eventslar ve ASN bilgisi gibi
-        ek verileri iceren sozluktur.
+        Context, past events and ASN info etc.
+        is a dictionary containing additional analysis data.
 
         Args:
             event:   Ayristirilmis ConnectionEvent.
             context: Ek analiz verileri:
-                     - "recent_events": Son N dakikadaki eventslar
-                     - "event_count": Olay sayisi
-                     - "asn_result": ASN lookup sonucu
-                     - "is_datacenter": Datacenter IP'si mi?
+                     - "recent_events": Recent events N minutes
+                     - "event_count": Event count
+                     - "asn_result": ASN lookup result
+                     - "is_datacenter": Is it Datacenter IP?
 
         Returns:
             0-100 arasi risk skoru.
@@ -144,8 +143,8 @@ class BasePlugin(abc.ABC):
 
     async def on_start(self) -> None:
         """
-        Plugin baslatildiginda cagrilir.
-        Override ederek ozel baslangic islemi yapilabilir.
+        Plugin started.
+        Override to perform custom startup actions.
         """
         self._logger.info("Plugin started: %s", self.name)
         self._logger.info("If you encounter any issues, please open an Issue on GitHub!")
@@ -153,8 +152,8 @@ class BasePlugin(abc.ABC):
 
     async def on_stop(self) -> None:
         """
-        Plugin durduruldugunda cagrilir.
-        Override ederek ozel temizlik islemi yapilabilir.
+        Plugin stopped.
+        Override to perform custom cleanup actions.
         """
         self._logger.info(
             "Plugin stopped: %s — Processed: %d events",
@@ -164,23 +163,23 @@ class BasePlugin(abc.ABC):
 
     async def on_event(self, event: ConnectionEvent) -> None:
         """
-        Basarili parse sonrasi events isleme hook'u.
-        Override ederek ek islem yapilabilir (orn: metrik toplama).
+        Successful parse after events processing hook.
+        Override to perform custom actions (e.g., metric aggregation).
 
         Args:
-            event: Olusan ConnectionEvent.
+            event: Generated ConnectionEvent.
         """
         pass
 
     def get_action_recommendation(self, risk_score: int) -> str:
         """
-        Risk skoruna gore aksiyon onerisi dondurur.
+        Returns action recommendation based on risk score.
 
         Args:
-            risk_score: Hesaplanan risk skoru (0-100).
+            risk_score: Calculated risk score (0-100).
 
         Returns:
-            Aksiyon onerisi string.
+            Action recommendation string.
         """
         ban_threshold = self._config.get("firewall.ban_threshold", 70)
 
@@ -199,18 +198,18 @@ class BasePlugin(abc.ABC):
 
     async def handle_line(self, line: str) -> Optional[ConnectionEvent]:
         """
-        LogTailer tarafindan her yeni satir icin cagrilan callback.
+        LogTailer calls this callback for each new line.
 
-        Bu metod:
-        1. parse_line() ile satiri ayristirir
-        2. Basarili parse'ta on_event() hook'unu calistirir
-        3. Istatistikleri gunceller
+        This method:
+        1. Parses the line using parse_line()
+        2. Calls on_event() hook if parsing is successful
+        3. Updates statistics
 
         Args:
-            line: Ham log satiri.
+            line: Raw log line.
 
         Returns:
-            ConnectionEvent veya None.
+            ConnectionEvent or None.
         """
         self._lines_processed += 1
 
@@ -229,12 +228,12 @@ class BasePlugin(abc.ABC):
         return None
 
     # ══════════════════════════════════════════════════════════
-    #  BILGI
+    #  INFO
     # ══════════════════════════════════════════════════════════
 
     @property
     def is_enabled(self) -> bool:
-        """Plugin aktif mi?"""
+        """Plugin enabled?"""
         return self._enabled
 
     @is_enabled.setter
@@ -243,7 +242,7 @@ class BasePlugin(abc.ABC):
 
     @property
     def stats(self) -> dict:
-        """Plugin istatistikleri."""
+        """Plugin statistics."""
         return {
             "name": self.name,
             "enabled": self._enabled,
@@ -264,10 +263,10 @@ class BasePlugin(abc.ABC):
 
 class PluginManager:
     """
-    Plugin yoneticisi.
+    Plugin manager.
 
-    Pluginleri yukleme, baslatma, durdurma ve listeleme islerini yonetir.
-    LogTailer ile pluginleri otomatik olarak iliskilendirir.
+    Loads, starts, stops and lists plugins.
+    Automatically links plugins with LogTailer.
 
     Usage:
         manager = PluginManager(config)
@@ -285,13 +284,13 @@ class PluginManager:
 
     def register(self, plugin: BasePlugin) -> None:
         """
-        Bir plugin'i kaydeder.
+        Register a plugin.
 
         Args:
             plugin: BasePlugin'den turetilmis plugin instance.
 
         Raises:
-            ValueError: Ayni isimde plugin zaten kayitliysa.
+            ValueError: Plugin already registered.
         """
         if plugin.name in self._plugins:
             raise ValueError(
@@ -305,21 +304,21 @@ class PluginManager:
         )
 
     def get_plugin(self, name: str) -> Optional[BasePlugin]:
-        """Ismine gore plugin dondurur."""
+        """Get plugin by name."""
         return self._plugins.get(name)
 
     @property
     def plugins(self) -> List[BasePlugin]:
-        """Kayitli tum pluginlerin listesi."""
+        """List of all registered plugins."""
         return list(self._plugins.values())
 
     @property
     def enabled_plugins(self) -> List[BasePlugin]:
-        """Sadece aktif pluginlerin listesi."""
+        """List of enabled plugins."""
         return [p for p in self._plugins.values() if p.is_enabled]
 
     async def start_all(self) -> None:
-        """Tum aktif pluginleri baslatir."""
+        """Start all enabled plugins."""
         for plugin in self.enabled_plugins:
             try:
                 await plugin.on_start()
@@ -330,7 +329,7 @@ class PluginManager:
                 )
 
     async def stop_all(self) -> None:
-        """Tum pluginleri durdurur."""
+        """Stop all plugins."""
         for plugin in self._plugins.values():
             try:
                 await plugin.on_stop()
@@ -342,7 +341,7 @@ class PluginManager:
 
     @property
     def stats(self) -> dict:
-        """Tum plugin istatistikleri."""
+        """Plugin statistics."""
         return {
             "total_plugins": len(self._plugins),
             "enabled_plugins": len(self.enabled_plugins),

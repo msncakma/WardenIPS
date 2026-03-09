@@ -3,17 +3,16 @@ WardenIPS - Async Firewall Module (ipset)
 =====================================================
 
 Blocks IP addresses with high performance using ipset + iptables.
-Standart iptables'a tek tek kural eklemek yerine ipset hash tablosu
-kullanir — binlerce IP banlansa bile sunucu yuku artmaz.
+Standard iptables rules are added to the set — even if there are
+thousands of IP bans, the server load remains low.
 
-Mimari:
-  1. 'warden_blacklist' adinda bir ipset seti olusturulur
-  2. iptables'a bu sete yonlendiren tek bir DROP kurali eklenir
-  3. Ban islemi: ipset'e IP eklenir (timeout ile)
-  4. Unban islemi: ipset'ten IP cikarilir
-
-NOT: Bu modeul root (sudo) yetkisi gerektirir.
-     Windows'ta simulation modeunda calisir (komutlar loglanir ama calistirilmaz).
+Architecture:
+  # 1. Initialize the ipset for blacklisted IPs
+  # 2. Add a single iptables rule to DROP traffic matching the 'warden_blacklist' set
+  # 3. Ban: Add IP to the set with an automated timeout
+  # 4. Unban: Explicitly remove IP or let it expire
+  NOT: This module requires root (sudo) permissions.
+     Windows runs in simulation mode (commands are logged but not executed).
 """
 
 from __future__ import annotations
@@ -31,22 +30,22 @@ logger = get_logger(__name__)
 
 class FirewallManager:
     """
-    Asenkron ipset tabanli guvenlik duvari yoneticisi.
+    Asynchronous ipset-based firewall manager.
 
-    ipset hash:ip seti olusturur, IP ekler/cikarir.
-    iptables ile DROP kurali iliskilendirir.
+    Creates an 'ipset hash:ip' set, manages IP addition/removal, 
+    and links a single 'iptables' DROP rule to the set.
 
-    Ozellikler:
-        - ipset hash:ip: O(1) lookup — binlerce IP yuku artirmaz
-        - Otomatik timeout: Belirtilen sureden sonra ban kalkar
-        - Whitelist korumasi: Banlama oncesi whitelist kontrolu yapilir
-        - Simulation modeu: Root degilse veya Windows'ta gerçek komut calistirmaz
+    Features:
+    - ipset hash:ip: O(1) lookup — constant performance even with thousands of IPs.
+    - Automatic timeout: Ban expires automatically after a specified duration.
+    - Whitelist protection: Performs a whitelist check before enforcing a ban.
+    - Simulation mode: Skips real command execution if not root or running on Windows.
 
     Usage:
-        fw = await FirewallManager.create(config, whitelist_manager)
-        await fw.ban_ip("203.0.113.50", duration=3600, reason="Brute-force")
-        await fw.unban_ip("203.0.113.50")
-        await fw.shutdown()
+    fw = await FirewallManager.create(config, whitelist_manager)
+    await fw.ban_ip("203.0.113.50", duration=3600, reason="Brute-force")
+    await fw.unban_ip("203.0.113.50")
+    await fw.shutdown()
     """
 
     def __init__(self) -> None:
@@ -61,7 +60,7 @@ class FirewallManager:
     @classmethod
     async def create(cls, config, whitelist_manager=None) -> FirewallManager:
         """
-        FirewallManager olusturur ve ipset setini hazirlar.
+        Creates a FirewallManager instance and initializes the ipset set.
 
         Args:
             config:            ConfigManager instance.
@@ -77,7 +76,7 @@ class FirewallManager:
 
     async def _initialize(self, config) -> None:
         """
-        ipset setini ve iptables kuralini olusturur.
+        Initializes the ipset set and iptables rule.
         """
         fw_section = config.get_section("firewall")
         ipset_section = fw_section.get("ipset", {})
@@ -99,9 +98,9 @@ class FirewallManager:
 
         if not is_linux or not has_ipset:
             self._simulation_mode = True
-            reason = "Linux degil" if not is_linux else "ipset bulunamadi"
+            reason = "Not Linux" if not is_linux else "ipset not found"
             logger.warning(
-                "Guvenlik duvari SIMULASYON modeunda! Reason: %s. "
+                "Firewall is in SIMULATION mode! Reason: %s. "
                 "Commands will be logged but not executed.",
                 reason,
             )
@@ -111,7 +110,7 @@ class FirewallManager:
             if os.geteuid() != 0:
                 self._simulation_mode = True
                 logger.warning(
-                    "Root yetkisi yok — guvenlik duvari SIMULASYON modeunda!"
+                    "Root permissions not found — firewall is in SIMULATION mode!"
                 )
 
         # ipset setini olustur
@@ -151,21 +150,21 @@ class FirewallManager:
         reason: str = "",
     ) -> bool:
         """
-        Bir IP adresini banlar (ipset'e ekler).
+        Bans an IP address (adds it to the ipset).
 
-        Ban oncesi whitelist kontrolu yapar — whitelist'teki IP'ler
-        ASLA banlanmaz (yonetici kilidi korumasi).
+        Performs a whitelist check before banning — IP addresses in the whitelist
+        are never banned (admin lock protection).
 
         Args:
-            ip_str:   Banlanacak IP adresi.
-            duration: Ban suresi (saniye). None = config varsayilani.
-                      0 = kalici (timeout yok).
-            reason:   Ban sebebi (loglama icin).
+            ip_str:   IP address to ban.
+            duration: Ban duration (seconds). None = config default.
+                      0 = permanent (no timeout).
+            reason:   Ban reason (for logging).
 
         Returns:
-            True ise ban basarili, False ise atlanmis (whitelist vb.)
+            True if ban was successful, False if skipped (whitelist, etc.)
         """
-        # Whitelist korumasi
+        # Whitelist protection
         if self._whitelist:
             if await self._whitelist.is_whitelisted(ip_str):
                 logger.warning(
@@ -200,13 +199,13 @@ class FirewallManager:
 
     async def unban_ip(self, ip_str: str) -> bool:
         """
-        Bir IP adresinin banini kaldirir (ipset'ten cikarir).
+        Unbans an IP address (removes it from the ipset).
 
         Args:
-            ip_str: Bani kaldirilacak IP adresi.
+            ip_str: IP address to unban.
 
         Returns:
-            True ise basarili.
+            True if unban was successful.
         """
         success = await self._exec_command(
             "ipset", "del", self._set_name, ip_str,
@@ -218,13 +217,13 @@ class FirewallManager:
 
     async def is_banned(self, ip_str: str) -> bool:
         """
-        Bir IP'nin ipset setinde olup olmadigini kontrol eder.
+        Checks if an IP is banned (exists in the ipset).
 
         Args:
-            ip_str: Kontrol edilecek IP.
+            ip_str: IP address to check.
 
         Returns:
-            True ise IP banli.
+            True if the IP is banned.
         """
         success = await self._exec_command(
             "ipset", "test", self._set_name, ip_str,
@@ -234,12 +233,12 @@ class FirewallManager:
 
     async def flush(self) -> bool:
         """
-        Tum banlari kaldirir (ipset setini bosaltir).
+        Removes all bans (clears the ipset).
 
-        DIKKAT: Tum aktif banlar silinir!
+        WARNING: All active bans will be removed!
 
         Returns:
-            True ise basarili.
+            True if flush was successful.
         """
         success = await self._exec_command(
             "ipset", "flush", self._set_name
@@ -250,10 +249,10 @@ class FirewallManager:
 
     async def get_banned_count(self) -> int:
         """
-        Aktif ban sayisini dondurur.
+        Returns the number of active bans.
 
         Returns:
-            ipset setindeki eleman sayisi.
+            Number of entries in the ipset set.
         """
         if self._simulation_mode:
             return 0
@@ -279,11 +278,11 @@ class FirewallManager:
 
     async def shutdown(self) -> None:
         """
-        Guvenlik duvari modeulu kapatilirken cagrilir.
-        ipset seti ve iptables kurallari korunur (banlar devam eder).
+        Called when the firewall module is shutting down.
+        ipset set and iptables rules are preserved (bans continue).
         """
         logger.info(
-            "Guvenlik duvari modeulu kapatiliyor. "
+            "Firewall module shutting down. "
             "Note: ipset set '%s' and rules will be preserved.",
             self._set_name,
         )
@@ -296,13 +295,13 @@ class FirewallManager:
         ignore_errors: bool = False,
     ) -> bool:
         """
-        Bir sistem komutunu asenkron olarak calistirir.
+        Asynchronously executes a system command.
 
-        Simulasyon modeunda komut calistirilmaz, sadece loglanir.
+        In simulation mode, the command is not executed, only logged.
 
         Args:
-            *args:         Komut ve argumanlari.
-            ignore_errors: True ise hata durumunda False doner (exception firlatmaz).
+            *args:         Command and arguments.
+            ignore_errors: True to return False on error (do not raise exception).
 
         Returns:
             True ise komut basarili.
@@ -349,7 +348,7 @@ class FirewallManager:
 
     @property
     def simulation_mode(self) -> bool:
-        """Simulasyon modeunda mi?"""
+        """Returns True if in simulation mode."""
         return self._simulation_mode
 
     def __repr__(self) -> str:

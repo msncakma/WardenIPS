@@ -2,14 +2,13 @@
 WardenIPS - SSH Plugin
 ========================
 
-/var/log/auth.log dosyasini izleyerek SSH brute-force
-saldirilarini tespit eder.
+Monitors /var/log/auth.log for SSH brute-force attacks.
 
-Tespit edilen kaliplar:
-  - Failed password denemeleri (Failed password)
-  - Invalid user denemeleri (Invalid user)
-  - Anahtar dogrulama basarisizliklari
-  - Connection closedlari (connection closed/reset)
+Detected events:
+  - Failed password try (Failed password)
+  - Invalid user try (Invalid user)
+  - Key authentication failure
+  - Connection closed (connection closed/reset)
 """
 
 from __future__ import annotations
@@ -59,10 +58,10 @@ _RE_SYSLOG_DATE = re.compile(
 
 class SSHPlugin(BasePlugin):
     """
-    SSH brute-force tespit plugini.
+    SSH brute-force detection plugin.
 
-    auth.log dosyasindaki basarisiz giris denemelerini
-    regex ile ayristirir ve risk skoru hesaplar.
+    Parses failed login attempts from auth.log
+    using regex and calculates risk scores.
     """
 
     def __init__(self, config) -> None:
@@ -81,9 +80,9 @@ class SSHPlugin(BasePlugin):
         return self._config.get("plugins.ssh.log_path", "/var/log/auth.log")
 
     async def parse_line(self, line: str) -> Optional[ConnectionEvent]:
-        """auth.log satirini ayristirir."""
+        """Parse an auth.log line."""
 
-        # Zaman damgasini cikart
+        # Extract timestamp
         timestamp = self._parse_timestamp(line)
 
         # 1. Failed password
@@ -153,13 +152,13 @@ class SSHPlugin(BasePlugin):
 
     async def calculate_risk(self, event: ConnectionEvent, context: dict) -> int:
         """
-        SSH eventslari icin risk skoru hesaplar.
+        Calculate risk score for SSH events.
 
-        Faktörler:
-          - Olay tipi (invalid_user > failed_password > connection_closed)
-          - Son N dakikadaki deneme sayisi (tekrar eden denemeler riski arttirir)
-          - Datacenter IP mi? (datacenter = yuksek risk)
-          - root kullanicisi mi? (root = ek risk)
+        Factors:
+          - Event type (invalid_user > failed_password > connection_closed)
+          - Number of attempts in the last N minutes (repeated attempts increase risk)
+          - Datacenter IP? (datacenter = high risk)
+          - root user? (root = additional risk)
         """
         score = 0
         event_type = event.details.get("event_type", "")
@@ -192,7 +191,7 @@ class SSHPlugin(BasePlugin):
         return min(score, 100)
 
     def _parse_timestamp(self, line: str) -> datetime:
-        """Syslog tarih formatini ayrıstırır."""
+        """Parse syslog timestamp."""
         match = _RE_SYSLOG_DATE.match(line)
         if match:
             try:

@@ -1,9 +1,9 @@
 """
-WardenIPS - Merkezi Logging Yapılandırması
+WardenIPS - Centralized Logging Configuration
 ============================================
 
-Tüm modeüller tarafından kullanılan async-safe loglama altyapısı.
-Hem konsola hem dosyaya eşzamanlı yazar.
+Used by all modules as an async-safe logging system.
+Writes to both console and file simultaneously.
 """
 
 from __future__ import annotations

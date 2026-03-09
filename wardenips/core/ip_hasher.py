@@ -2,15 +2,15 @@
 WardenIPS - KVKK Uyumlu IP Hash'leme Modulu
 ==============================================
 
-KVKK (Kisisel Verilerin Korunmasi Kanunu) geregi IP adresleri
-veritabanina duz metin olarak YAZILMAZ.
+This module anonymizes IP addresses using a SHA-256 hash, 
+based on a salt value defined in the configuration. 
 
-Bu modeul, IP adreslerini yapilandirmada tanimlanan bir Salt degeri
-ile SHA-256 hash'leyerek anonimlestirir. Ayni IP + ayni Salt
-= her zaman ayni hash, boylece korelasyon analizi yapilabilir
-ama IP geri elde edilemez.
+The same IP + same salt = always the same hash, 
+allowing correlation analysis, but the IP cannot be 
+retrieved. 
 
-DİKKAT: Salt degeri degistirilirse eski hash'ler eslesmez!
+WARNING: If the salt value is changed, the old hashes 
+will not match!
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ logger = get_logger(__name__)
 
 class IPHasher:
     """
-    KVKK uyumlu IP anonimlestiricisi.
-
-    HMAC + SHA-256 kullanarak IP adreslerini tek yonlu hash'ler.
-    Salt degeri config.yaml'dan alinir.
+    Using HMAC + SHA-256 to anonymize IP addresses.
+    The same IP + same salt = always the same hash, 
+    allowing correlation analysis, but the IP cannot be 
+    retrieved. 
 
     Usage:
         hasher = IPHasher(salt="guclu-salt-degeri", algorithm="sha256")
@@ -36,20 +36,20 @@ class IPHasher:
         # hashed = "a3f2b8c1d4e5..."  (64 char hex)
     """
 
-    # Desteklenen hash algoritmalari
+    # Supported hash algorithms
     _SUPPORTED_ALGORITHMS = {"sha256", "sha384", "sha512"}
 
     def __init__(self, salt: str, algorithm: str = "sha256", enabled: bool = True) -> None:
         """
-        IP hasher'i baslatir.
+        Starting the IP hasher.
 
         Args:
-            salt:      Hash'lemede kullanilacak gizli salt degeri.
-            algorithm: Hash algoritmasi ("sha256", "sha384", "sha512").
+            salt:      Hash algorithm salt value.
+            algorithm: Hash algorithm ("sha256", "sha384", "sha512").
             enabled:   If false, skips hashing and returns the original IP.
 
         Raises:
-            ValueError: Salt bos ise veya algoritma desteklenmiyorsa.
+            ValueError: If salt is empty or algorithm is unsupported.
         """
         self._enabled = enabled
 
@@ -61,8 +61,8 @@ class IPHasher:
 
         if algorithm not in self._SUPPORTED_ALGORITHMS:
             raise ValueError(
-                f"Desteklenmeyen hash algoritmasi: '{algorithm}'. "
-                f"Desteklenenler: {self._SUPPORTED_ALGORITHMS}"
+                f"Unsupported hash algorithm: '{algorithm}'. "
+                f"Supported algorithms: {self._SUPPORTED_ALGORITHMS}"
             )
 
         self._salt: bytes = salt.encode("utf-8")
@@ -75,16 +75,16 @@ class IPHasher:
 
     def hash_ip(self, ip_str: str) -> str:
         """
-        Bir IP adresini HMAC + hash ile anonimlestirir.
+        Anonymizes an IP address using HMAC + hash.
 
-        HMAC kullanimi basit hash+salt'a gore daha guvenlidir
-        (length extension saldirilarina karsi koruma saglar).
+        HMAC usage is more secure than simple hash+salt
+        (prevents length extension attacks).
 
         Args:
-            ip_str: Hash'lenecek IP adresi (duz metin).
+            ip_str: IP address to hash (plain text).
 
         Returns:
-            Hex formatinda hash string (orn: "a3f2b8..." 64 karakter).
+            Hex formatted hash string (e.g. "a3f2b8..." 64 characters).
         """
         if not self._enabled:
             return ip_str.strip()
@@ -95,16 +95,16 @@ class IPHasher:
 
     def verify_ip(self, ip_str: str, expected_hash: str) -> bool:
         """
-        Bir IP'nin bilinen bir hash ile eslesip eslesmedigini dogrular.
+        Verifies if an IP matches a known hash.
 
-        Zamanlama saldirilarina karsi hmac.compare_digest kullanir.
+        Uses hmac.compare_digest to prevent timing attacks.
 
         Args:
-            ip_str:        Dogrulanacak IP adresi.
-            expected_hash: Beklenen hash degeri.
+            ip_str:        IP address to verify.
+            expected_hash: Expected hash value.
 
         Returns:
-            True ise hash'ler eslesir.
+            True if the hashes match.
         """
         if not self._enabled:
             return ip_str.strip() == expected_hash.strip()
@@ -115,8 +115,7 @@ class IPHasher:
     @classmethod
     def from_config(cls, config) -> IPHasher:
         """
-        ConfigManager'dan salt ve algoritma ayarlarini okuyarak
-        IPHasher olusturur.
+        Creates an IPHasher instance based on configuration.
 
         Args:
             config: ConfigManager instance.

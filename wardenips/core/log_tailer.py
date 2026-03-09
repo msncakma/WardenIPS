@@ -2,16 +2,16 @@
 WardenIPS - Async Log Tailing Engine
 =========================================
 
-Log dosyalarini asenkron olarak izler (tail -f benzeri).
-Yeni satirlar eklendikce bunlari aninda yakalar ve
+Log files are asynchronously monitored (tail -f like).
+New lines are immediately captured and
 bagli plugin'e iletir.
 
-Ozellikler:
-    - Tamamen asenkron (asyncio + aiofiles)
-    - Dosya rotasyonu destegi (log dosyasi yeniden olusturulursa algilar)
-    - Dosya silinip tekrar olusturulursa otomatik yeniden baglanir
-    - Durdurulabilir (graceful shutdown)
-    - Her plugin icin ayri bir tailer gorevi calisir
+Features:
+    - Fully asynchronous (asyncio + aiofiles)
+    - File rotation support (log file recreated -> detected)
+    - File deleted and recreated -> automatically reconnects
+    - Graceful shutdown
+    - Each plugin has its own tailer task
 """
 
 from __future__ import annotations
@@ -36,14 +36,11 @@ _ROTATION_CHECK_INTERVAL = 5.0
 
 class LogTailer:
     """
-    Asenkron log dosyasi izleyici (tail -f).
+    Asynchronously monitors a log file (tail -f).
 
-    Bir log dosyasini surekli izler ve yeni satirlari
-    asenkron olarak ilgili callback fonksiyonuna iletir.
-
-    Ozellikler:
-        - Poll-based izleme (inotify'a gerek yok — tum platformlarda calisir)
-        - Dosya rotasyonu: log dosyasi yeniden olusturulursa algilar
+    Features:
+        - Poll-based monitoring (inotify is not required — works on all platforms)
+        - File rotation support (log file recreated -> detected)
         - Graceful shutdown: stop() cagrildiginda temiz kapanir
         - Bastan okuma veya sondan baslama secenegi
 
@@ -53,7 +50,7 @@ class LogTailer:
             line_callback=my_async_handler,
         )
         task = asyncio.create_task(tailer.start())
-        # ... daha sonra
+        # ... then
         await tailer.stop()
     """
 
@@ -66,16 +63,16 @@ class LogTailer:
         name: str = "",
     ) -> None:
         """
-        LogTailer olusturur.
+        Creates a LogTailer instance.
 
         Args:
-            file_path:      Izlenecek log dosyasinin tam yolu.
-            line_callback:  Her yeni satir icin cagrilacak async fonksiyon.
-                            Imza: async def callback(line: str) -> None
-            poll_interval:  Yeni satir kontrol araligi (saniye).
-            start_from_end: True ise dosyanin sonundan baslar (mevcut satirlari atlar).
-                            False ise dosyanin basindan okur.
-            name:           Tailer adi (loglama icin).
+            file_path:      Path to the log file to monitor.
+            line_callback:  Async function to call for each new line.
+                            Signature: async def callback(line: str) -> None
+            poll_interval:  Polling interval for new lines (seconds).
+            start_from_end: True to start from the end of the file (skip existing lines).
+                            False to start from the beginning of the file.
+            name:           Tailer name (for logging).
         """
         self._file_path = Path(file_path)
         self._callback = line_callback
@@ -90,9 +87,9 @@ class LogTailer:
 
     async def start(self) -> None:
         """
-        Log izlemeyi baslatir. Bu metod durdurana kadar calisir.
+        Starts the log tailer. This method runs until stopped.
 
-        Dosya mevcut degilse, olusturulmasini bekler.
+        Waits for the file to be created if it doesn't exist.
         """
         self._running = True
         logger.info(
@@ -131,10 +128,10 @@ class LogTailer:
 
     def create_task(self) -> asyncio.Task:
         """
-        Tailer'i asyncio task olarak olusturur ve dondurur.
+        Creates an asyncio task for the tailer.
 
         Returns:
-            asyncio.Task nesnesi.
+            asyncio.Task object.
         """
         self._task = asyncio.create_task(self.start())
         return self._task
@@ -143,10 +140,10 @@ class LogTailer:
 
     async def _tail_file(self) -> None:
         """
-        Dosyayi izleme ana dongusu.
+        File tailing main loop.
         """
 
-        # Dosyanin olusturulmasini bekle
+        # Wait for the file to be created
         while self._running and not self._file_path.exists():
             logger.debug(
                 "[%s] File not found, waiting: %s",
@@ -236,11 +233,11 @@ class LogTailer:
 
     async def _check_rotation(self, original_inode) -> bool:
         """
-        Dosya rotasyonu olup olmadigini kontrol eder.
+        Checks if the file has been rotated.
 
-        Rotasyon algilama:
-        - inode degismesi (Linux)
-        - Dosya boyutunun kuculmesi (tum platformlar)
+        Rotation detection:
+        - inode change (Linux)
+        - File size decrease (all platforms)
         """
         try:
             current_stat = os.stat(self._file_path)
@@ -259,24 +256,24 @@ class LogTailer:
 
     @staticmethod
     def _get_inode(stat_result) -> int:
-        """Dosya inode degerini dondurur (Windows'ta st_ino 0 olabilir)."""
+        """Returns the file's inode value (Windows st_ino can be 0)."""
         return getattr(stat_result, "st_ino", 0)
 
     # ── Bilgi ──
 
     @property
     def is_running(self) -> bool:
-        """Tailer calisiyor mu?"""
+        """Is the tailer running?"""
         return self._running
 
     @property
     def lines_processed(self) -> int:
-        """Toplam islenen satir sayisi."""
+        """Total lines processed."""
         return self._lines_processed
 
     @property
     def stats(self) -> dict:
-        """Tailer istatistikleri."""
+        """Tailer statistics."""
         return {
             "name": self._name,
             "file_path": str(self._file_path),

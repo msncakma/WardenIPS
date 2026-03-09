@@ -2,14 +2,14 @@
 WardenIPS - Minecraft Plugin
 ===============================
 
-Minecraft sunucu log dosyasini (latest.log) izleyerek
-botnet ve DDoS saldirilarini tespit eder.
+To monitor Minecraft server log file (latest.log),
+this plugin detects botnet and DDoS attacks.
 
-Tespit edilen kaliplar:
-  - Oyuncu baglantilari (login)
-  - Oyuncu baglantilarinin kesilmesi (disconnect/lost connection)
-  - Hizli art arda baglanti denemeleri (botnet isareti)
-  - Gecersiz paket/protokol hatalari
+Detected patterns:
+  - Player connections (login)
+  - Player disconnections (disconnect/lost connection)
+  - Fast sequential connection attempts (botnet indicator)
+  - Invalid packet/protocol errors
 """
 
 from __future__ import annotations
@@ -59,13 +59,12 @@ _RE_MC_TIMESTAMP = re.compile(
 
 class MinecraftPlugin(BasePlugin):
     """
-    Minecraft botnet/DDoS tespit plugini.
+    Minecraft botnet/DDoS dedect plugin.
 
     latest.log dosyasindaki baglanti eventslarini
     regex ile ayristirir ve risk skoru hesaplar.
 
-    Hizli art arda baglanti denemeleri botnet isareti olarak
-    degerlendirilir.
+    It evaluates fast sequential connection attempts as botnet indicator.
     """
 
     def __init__(self, config) -> None:
@@ -87,7 +86,7 @@ class MinecraftPlugin(BasePlugin):
         )
 
     async def parse_line(self, line: str) -> Optional[ConnectionEvent]:
-        """latest.log satirini ayristirir."""
+        """Parse latest.log line."""
 
         timestamp = self._parse_timestamp(line)
 
@@ -106,7 +105,7 @@ class MinecraftPlugin(BasePlugin):
                 details={"event_type": "login"},
             )
 
-        # 2. GameProfile baglantisi (bazi server versiyonlari)
+        # 2. GameProfile connection (some server versions)
         match = _RE_GAMEPROFILE_LOGIN.search(line)
         if match:
             player, ip = match.group(1), match.group(2)
@@ -121,7 +120,7 @@ class MinecraftPlugin(BasePlugin):
                 details={"event_type": "login"},
             )
 
-        # 3. IP ile baglanti kopma (nick olmadan)
+        # 3. IP connection loss (without nickname)
         match = _RE_IP_DISCONNECT.search(line)
         if match:
             ip, reason = match.group(1), match.group(2)
@@ -154,34 +153,34 @@ class MinecraftPlugin(BasePlugin):
                 details={"event_type": "failed_packet"},
             )
 
-        # Bu satir Minecraft baglantisi ile ilgili degil
+        # This line is not related to Minecraft connection
         return None
 
     async def calculate_risk(self, event: ConnectionEvent, context: dict) -> int:
         """
-        Minecraft eventslari icin risk skoru hesaplar.
+        Calculate risk score for Minecraft events.
 
-        Faktorler:
-          - Olay tipi (failed_packet > ip_disconnect > login)
-          - Son N saniyedeki baglanti sayisi (hizli = botnet)
-          - Datacenter IP mi?
-          - Oyuncu ismi yok mu? (bot isareti)
+        Factors:
+          - Event type (failed_packet > ip_disconnect > login)
+          - Number of connections in the last N seconds (fast = botnet)
+          - Datacenter IP?
+          - Player name missing? (bot indicator)
         """
         score = 0
         event_type = event.details.get("event_type", "")
         event_count = context.get("event_count", 0)
         is_datacenter = context.get("is_datacenter", False)
 
-        # Olay tipi bazli taban skor
+        # Event type based base score
         if event_type == "failed_packet":
-            score += 30  # Gecersiz paket = saldiri isareti
+            score += 30  # Invalid packet = attack indicator
         elif event_type == "ip_disconnect":
-            score += 15  # Hizli baglan/kopar = bot
+            score += 15  # Fast connect/disconnect = bot
         elif event_type == "login":
-            score += 5   # Normal giris = dusuk risk
+            score += 5   # Normal login = low risk
 
-        # Hizli baglanti denemeleri (botnet kalıbı)
-        # Her baglanti 10 puan ekler, boylece kisa surede cok sayida baglanti yapilinca skor artar
+        # Fast connection attempts (botnet pattern)
+        # Each connection adds 10 points, so a large number of connections in a short time raises the score
         if event_count > 0:
             score += min(event_count * 10, 60)
 
@@ -189,14 +188,14 @@ class MinecraftPlugin(BasePlugin):
         if is_datacenter:
             score += 20
 
-        # Oyuncu ismi yoksa (bot)
+        # Player name missing? (bot indicator)
         if not event.player_name:
             score += 10
 
         return min(score, 100)
 
     def _parse_timestamp(self, line: str) -> datetime:
-        """Minecraft log tarih formatini ayristirir."""
+        """Parse Minecraft log timestamp."""
         match = _RE_MC_TIMESTAMP.search(line)
         if match:
             try:

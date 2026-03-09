@@ -2,15 +2,15 @@
 WardenIPS - AbuseIPDB Async Reporter
 =============================================
 
-Tespit edilen zararli IP adreslerini AbuseIPDB API'sine
-asenkron olarak raporlar. Rate limit kurallarina uyar.
+Reports detected malicious IP addresses to AbuseIPDB API asynchronously.
+Respects rate limit rules.
 
-AbuseIPDB Kategorileri (sik kullanilanlar):
+AbuseIPDB Categories (commonly used):
   14 = Port Scan
   18 = Brute-Force
   22 = SSH
 
-API Dokumantasyonu: https://docs.abuseipdb.com/
+API Documentation: https://docs.abuseipdb.com/
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ except ImportError:
     _AIOHTTP_AVAILABLE = False
     logger.warning(
         "aiohttp library not found. AbuseIPDB disabled. "
-        "Yuklemek icin: pip install aiohttp"
+        "For installation: pip install aiohttp"
     )
 
 # AbuseIPDB API endpoint
@@ -45,14 +45,14 @@ class AbuseIPDBReporter:
     """
     AbuseIPDB asenkron raporlayici.
 
-    Tespit edilen zararli IP'leri AbuseIPDB'ye raporlar.
-    Rate limit'e uyar — dakika basina maksimum rapor sayisini asmaZ.
+    Detects malicious IP addresses and reports them to AbuseIPDB API asynchronously.
+    Respects rate limit rules.
 
-    Ozellikler:
-        - Asenkron HTTP (aiohttp)
+    Features:
+        - Asynchronous HTTP (aiohttp)
         - Sliding window rate limiting
-        - Retry mekanizmasi (basarisiz raporlar tekrar denenir)
-        - Graceful degradation (API key yoksa veya aiohttp kurulu degilse devre disi)
+        - Retry mechanism (failed reports are retried)
+        - Graceful degradation (API key missing or aiohttp not installed)
 
     Usage:
         reporter = await AbuseIPDBReporter.create(config)
@@ -79,20 +79,20 @@ class AbuseIPDBReporter:
     @classmethod
     async def create(cls, config) -> AbuseIPDBReporter:
         """
-        ConfigManager'dan ayarlari okuyarak AbuseIPDBReporter olusturur.
+        Creates an AbuseIPDBReporter instance based on configuration.
 
         Args:
             config: ConfigManager instance.
 
         Returns:
-            Yapilandirilmis AbuseIPDBReporter.
+            Configured AbuseIPDBReporter.
         """
         instance = cls()
         await instance._initialize(config)
         return instance
 
     async def _initialize(self, config) -> None:
-        """AbuseIPDB ayarlarini yukler ve HTTP session olusturur."""
+        """Loads AbuseIPDB settings and creates an HTTP session."""
 
         abuse_section = config.get_section("abuseipdb")
         self._enabled = abuse_section.get("enabled", False)
@@ -141,18 +141,18 @@ class AbuseIPDBReporter:
         comment: str = "",
     ) -> bool:
         """
-        Bir IP adresini AbuseIPDB'ye raporlar.
+        Reports an IP address to AbuseIPDB.
 
-        Rate limit kontrolu yapilir — limit asilirsa rapor atlanir.
+        Rate limit control is performed — if limit is exceeded, the report is skipped.
 
         Args:
-            ip:         Raporlanacak IP adresi.
-            categories: AbuseIPDB kategori kodlari listesi.
-                        Ornek: [18, 22] = Brute-Force + SSH
-            comment:    Raporla birlikte gonderilecek aciklama.
+            ip:         IP address to report.
+            categories: List of AbuseIPDB category codes.
+                        Example: [18, 22] = Brute-Force + SSH
+            comment:    Comment to send with the report.
 
         Returns:
-            True ise rapor basarili.
+            True if the report was successful.
         """
         if not self._enabled or self._session is None:
             logger.debug(
@@ -228,13 +228,13 @@ class AbuseIPDBReporter:
 
     async def check_ip(self, ip: str) -> Optional[Dict[str, Any]]:
         """
-        Bir IP adresini AbuseIPDB'de sorgular.
+        Queries an IP address in AbuseIPDB.
 
         Args:
-            ip: Sorgulanacak IP.
+            ip: IP address to query.
 
         Returns:
-            API yaniti (dict) veya None.
+            API response (dict) or None.
         """
         if not self._enabled or self._session is None:
             return None
@@ -273,12 +273,12 @@ class AbuseIPDBReporter:
 
     def _check_rate_limit(self) -> bool:
         """
-        Sliding window rate limit kontrolu.
+        Sliding window rate limit control.
 
-        Son 60 saniye icerisindeki istek sayisini kontrol eder.
+        Checks the number of requests in the last 60 seconds.
 
         Returns:
-            True ise istek gondermeye izin var.
+            True if allowed to send a request.
         """
         now = time.monotonic()
         window_start = now - 60.0  # 1 dakikalik pencere
