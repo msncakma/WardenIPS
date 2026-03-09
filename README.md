@@ -89,7 +89,11 @@ What the installer does:
 
 Dashboard auth notes:
 
+- The built-in dashboard serves plain HTTP by default, so open it as `http://HOST:PORT`, not `https://HOST:PORT`, unless you put it behind a TLS reverse proxy.
+- `/dashboard` is the public read-only dashboard route.
 - `/admin` is the canonical admin console route.
+- `/` follows `dashboard.homepage` and defaults to the public dashboard.
+- Set `dashboard.public_dashboard: true` to let guests view the overview without logging in.
 - Set `dashboard.username` and `dashboard.password` to enable browser login.
 - If `dashboard.password` is empty, `dashboard.api_key` is accepted as a fallback login password for compatibility.
 - Login attempts are rate-limited server-side.

@@ -19,7 +19,8 @@ Endpoints:
   GET  /api/threat-distribution — Events grouped by threat level
   GET  /api/plugin-stats        — Events grouped by plugin/connection type
   GET  /login                   — Dashboard login page
-  GET  /                        — Full SPA dashboard
+  GET  /                        — Configurable landing route
+  GET  /dashboard               — Public read-only dashboard
   GET  /admin                   — Advanced admin dashboard
   GET  /v2                      — Legacy redirect to /admin
 
@@ -73,6 +74,8 @@ class DashboardAPI:
     self._dashboard_password: str = ""
     self._session_ttl: int = 600
     self._login_rate_limit_per_minute: int = 10
+    self._public_dashboard_enabled: bool = True
+    self._homepage: str = "dashboard"
     self._session_cookie_name: str = "wardenips_dashboard_session"
     self._sessions: dict[str, float] = {}
     self._login_attempts: dict[str, list[float]] = {}
@@ -96,6 +99,9 @@ class DashboardAPI:
       int(dash.get("login_rate_limit_per_minute", 10)),
       1,
     )
+    self._public_dashboard_enabled = bool(dash.get("public_dashboard", True))
+    homepage = str(dash.get("homepage", "dashboard")).strip().lower()
+    self._homepage = homepage if homepage in {"dashboard", "login", "admin"} else "dashboard"
 
   @property
   def enabled(self) -> bool:
@@ -177,6 +183,11 @@ class DashboardAPI:
     token = auth[7:]
     return token in self._get_dashboard_secrets()
 
+  def _check_public_dashboard_access(self, request: web.Request) -> bool:
+    if self._public_dashboard_enabled:
+      return True
+    return self._check_auth(request)
+
   def _json_auth_error(self) -> web.Response:
     if not self._dashboard_auth_configured():
       return web.json_response(
@@ -218,7 +229,8 @@ class DashboardAPI:
       return
 
     self._app = web.Application()
-    self._app.router.add_get("/", self._handle_dashboard)
+    self._app.router.add_get("/", self._handle_root)
+    self._app.router.add_get("/dashboard", self._handle_dashboard)
     self._app.router.add_get("/admin", self._handle_dashboard_v2)
     self._app.router.add_get("/v2", self._handle_dashboard_v2)
     self._app.router.add_get("/login", self._handle_login_page)
@@ -269,7 +281,7 @@ class DashboardAPI:
     )
 
   async def _handle_stats(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     stats = await self._db.get_stats()
     stats["firewall_active_bans"] = await self._firewall.get_banned_count()
@@ -277,7 +289,7 @@ class DashboardAPI:
     return web.json_response(stats)
 
   async def _handle_bans(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
       async with self._db._lock:
@@ -299,7 +311,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_events(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     limit = min(int(request.query.get("limit", "50")), 200)
     try:
@@ -346,7 +358,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_top_attackers(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     limit = min(int(request.query.get("limit", "10")), 50)
     try:
@@ -372,7 +384,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_events_timeline(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     hours = min(int(request.query.get("hours", "24")), 168)
     try:
@@ -395,7 +407,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_country_stats(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
       async with self._db._lock:
@@ -417,7 +429,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_threat_distribution(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
       async with self._db._lock:
@@ -436,7 +448,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_plugin_stats(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
       async with self._db._lock:
@@ -455,7 +467,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_threat_intel(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
+    if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     if not self._threat_intel:
       return web.json_response(
@@ -472,11 +484,11 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_login_page(self, request: web.Request) -> web.Response:
-    if self._is_session_authenticated(request):
-      raise web.HTTPFound("/admin")
-    next_path = request.query.get("next", "/admin")
+    next_path = request.query.get("next", "/dashboard")
     if not next_path.startswith("/"):
-      next_path = "/admin"
+      next_path = "/dashboard"
+    if self._is_session_authenticated(request):
+      raise web.HTTPFound(next_path)
     html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
     html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
     html = html.replace("__AUTH_READY__", "true" if self._dashboard_auth_configured() else "false")
@@ -508,9 +520,9 @@ class DashboardAPI:
 
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
-    next_path = str(payload.get("next", "/admin")).strip() or "/admin"
+    next_path = str(payload.get("next", "/dashboard")).strip() or "/dashboard"
     if not next_path.startswith("/"):
-      next_path = "/admin"
+      next_path = "/dashboard"
     if not self._dashboard_auth_configured():
       return self._json_auth_error()
     if username != self._dashboard_username or not self._password_matches(password):
@@ -522,6 +534,13 @@ class DashboardAPI:
     response = web.json_response({"ok": True, "redirect_to": next_path})
     self._issue_session(response, request)
     return response
+
+  async def _handle_root(self, request: web.Request) -> web.Response:
+    if self._homepage == "login":
+      raise web.HTTPFound("/login")
+    if self._homepage == "admin":
+      raise web.HTTPFound("/admin")
+    raise web.HTTPFound("/dashboard")
 
   async def _handle_logout(self, request: web.Request) -> web.Response:
     if request.method == "GET":
@@ -611,11 +630,18 @@ class DashboardAPI:
     return web.json_response({"ok": True, "deleted": deleted})
 
   async def _handle_dashboard(self, request: web.Request) -> web.Response:
-    auth_redirect = self._require_dashboard_auth(request)
-    if auth_redirect is not None:
-      return auth_redirect
-    self._touch_session(request)
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    if not self._public_dashboard_enabled:
+      auth_redirect = self._require_dashboard_auth(request)
+      if auth_redirect is not None:
+        return auth_redirect
+    is_authenticated = self._is_session_authenticated(request)
+    if is_authenticated:
+      self._touch_session(request)
+    admin_href = "/admin" if is_authenticated else "/login?next=/admin"
+    admin_label = "Open Admin" if is_authenticated else "Admin Login"
+    html = DASHBOARD_HTML.replace("__ADMIN_HREF__", admin_href)
+    html = html.replace("__ADMIN_LABEL__", admin_label)
+    return web.Response(text=html, content_type="text/html")
 
   async def _handle_dashboard_v2(self, request: web.Request) -> web.Response:
     auth_redirect = self._require_dashboard_auth(request)
@@ -653,12 +679,14 @@ input{width:100%;background:#0b1526;border:1px solid var(--b);color:var(--txt);b
 input:focus{border-color:var(--blue);box-shadow:0 0 0 4px #4f8cff20}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
 button{appearance:none;border:0;background:linear-gradient(135deg,var(--blue),#355bf2);color:white;padding:13px 16px;border-radius:12px;font-size:.95rem;font-weight:800;cursor:pointer;min-width:150px}
+a.button-link{display:inline-flex;align-items:center;justify-content:center;background:#0b1526;border:1px solid var(--b);color:var(--txt);padding:13px 16px;border-radius:12px;font-size:.92rem;font-weight:700;text-decoration:none;min-width:180px}
 button[disabled]{opacity:.65;cursor:wait}
 .hint{font-size:.78rem;color:var(--muted)}
 .msg{margin-top:14px;padding:12px 14px;border-radius:12px;font-size:.85rem;display:none}
 .msg.err{display:block;background:#32131a;color:#ffb3bc;border:1px solid #6a2432}
 .msg.ok{display:block;background:#0d2e26;color:#8ef0c7;border:1px solid #175343}
 .foot{margin-top:14px;font-size:.76rem;color:var(--muted)}
+.secondary-actions{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -682,6 +710,9 @@ button[disabled]{opacity:.65;cursor:wait}
       </div>
       <div id="message" class="msg"></div>
     </form>
+    <div class="secondary-actions">
+      <a class="button-link" href="/dashboard">View Dashboard Without Login</a>
+    </div>
     <div class="foot">Default username: <span id="defaultUser"></span></div>
   </div>
 </div>
@@ -794,6 +825,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 .bdg{display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:20px;font-size:.75rem;font-weight:600;letter-spacing:.03em}
 .bdg-live{background:var(--grn-d);color:var(--grn);animation:pls 2s infinite}
 .bdg-sim{background:var(--warn-d);color:var(--warn)}
+.admin-link{display:inline-flex;align-items:center;justify-content:center;padding:.65rem 1rem;border-radius:999px;border:1px solid #334155;background:#111827;color:var(--txt);text-decoration:none;font-size:.82rem;font-weight:800;transition:border-color .2s ease,transform .2s ease}
+.admin-link:hover{border-color:var(--accent);transform:translateY(-1px)}
 @keyframes pls{0%,100%{opacity:1}50%{opacity:.6}}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:4px}
 
@@ -910,6 +943,7 @@ footer a:hover{text-decoration:underline}
     <div class="meta">
       <span class="bdg bdg-live" id="sb"><span class="dot"></span>LIVE</span>
       <span style="font-size:.8rem;color:var(--dim)" id="ut">--:--:--</span>
+      <a class="admin-link" href="__ADMIN_HREF__">__ADMIN_LABEL__</a>
     </div>
   </header>
 

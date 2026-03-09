@@ -83,6 +83,8 @@ dashboard:
   enabled: false
   host: "127.0.0.1"          # Bind address (use 0.0.0.0 for external access)
   port: 7680
+  homepage: "dashboard"      # Landing page for / : dashboard, login, or admin
+  public_dashboard: true      # Allow the overview dashboard without login; /admin still requires login
   api_key: ""                # Optional Bearer token for API auth and fallback login password
   username: "admin"          # Dashboard login username
   password: ""               # Preferred password for browser login
