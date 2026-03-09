@@ -497,8 +497,6 @@ PY
         log "Starting WardenIPS service..."
         systemctl restart wardenips
     else
-
-These wrapper commands use `sudo` automatically when protected files, service control, or the install directory require elevated access.
         warn "Autostart is disabled by default for safety. Set WARDENIPS_AUTOSTART=1 to start immediately."
     fi
 }
