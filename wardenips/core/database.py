@@ -33,7 +33,7 @@ import aiosqlite
 
 from wardenips.core.exceptions import WardenDatabaseError
 from wardenips.core.ip_hasher import IPHasher
-from wardenips.core.modeels import ConnectionEvent, ConnectionType, ThreatLevel
+from wardenips.core.models import ConnectionEvent, ConnectionType, ThreatLevel
 from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)

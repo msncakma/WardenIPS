@@ -18,7 +18,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from wardenips.core.modeels import ConnectionEvent, ConnectionType, ThreatLevel
+from wardenips.core.models import ConnectionEvent, ConnectionType, ThreatLevel
 from wardenips.plugins.base_plugin import BasePlugin
 
 

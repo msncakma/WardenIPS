@@ -27,7 +27,7 @@ from wardenips.core.database import DatabaseManager
 from wardenips.core.firewall import FirewallManager
 from wardenips.core.abuseipdb import AbuseIPDBReporter
 from wardenips.core.log_tailer import LogTailer
-from wardenips.core.modeels import ConnectionEvent, ThreatLevel
+from wardenips.core.models import ConnectionEvent, ThreatLevel
 from wardenips.core.updater import UpdateChecker
 from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin

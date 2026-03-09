@@ -24,7 +24,7 @@ import abc
 from typing import TYPE_CHECKING, List, Optional
 
 from wardenips.core.logger import get_logger
-from wardenips.core.modeels import ConnectionEvent
+from wardenips.core.models import ConnectionEvent
 
 if TYPE_CHECKING:
     from wardenips.core.config import ConfigManager

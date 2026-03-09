@@ -1,0 +1,76 @@
+# WardenIPS Configuration File
+
+general:
+  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  log_file: "/var/log/wardenips/warden.log"
+  analysis_interval: 5        # Analyze the last N minutes of connection events
+
+whitelist:
+  # IPv4/IPv6 addresses that will NEVER be blocked. Add your IP here!
+  ips:
+    - "127.0.0.1"
+    - "::1"
+    - "192.168.1.100"         # MUST CHANGE: Your server or home IP
+  # CIDR ranges that will NEVER be blocked
+  cidr_ranges:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+
+geofencing:
+  enabled: false              # If true, IPs not matching criteria get an immediate high risk score
+  mode: "allow"               # "allow" (only these countries) or "deny" (block these countries)
+  countries:
+    - "TR"                    # ISO 3166-1 alpha-2 country codes
+
+database:
+  sqlite:
+    path: "/var/lib/wardenips/warden.db" 
+  ip_hashing:
+    enabled: true
+    # IMPORTANT: Change this salt to a secure random string for GDPR compliance!
+    salt: "YOUR-RANDOM-SECURE-SALT-STRING-HERE"
+    algorithm: "sha256"
+
+maxmind:
+  # Requires free MaxMind GeoLite2 databases to function.
+  asn_db_path: "/var/lib/wardenips/GeoLite2-ASN.mmdb"
+  country_db_path: "/var/lib/wardenips/GeoLite2-Country.mmdb"
+  # Common datacenter ASNs (Hosting, Cloud providers). Traffic from these is considered riskier.
+  datacenter_asns:
+    - 16509  # Amazon AWS
+    - 14618  # Amazon AWS
+    - 8075   # Microsoft Azure
+    - 15169  # Google Cloud
+    - 396982 # Google Cloud
+    - 14061  # DigitalOcean
+    - 20473  # Vultr
+    - 24940  # Hetzner
+    - 213230 # Hetzner
+    - 16276  # OVH
+    - 24961  # OVH
+    - 51167  # Contabo
+
+firewall:
+  # Action to take when an IP reaches this risk score
+  ban_threshold: 70
+  ipset:
+    set_name: "warden_blacklist"
+    default_ban_duration: 3600  # Seconds (1 hour). Use 0 for permanent bans.
+
+abuseipdb:
+  # Automatically reports banned IPs to AbuseIPDB
+  enabled: false
+  api_key: ""
+  rate_limit_per_minute: 10
+
+plugins:
+  ssh:
+    enabled: true
+    log_path: "/var/log/auth.log"
+    max_failed_attempts: 5    # Attempts within analysis_interval before triggering a high score
+    
+  minecraft:
+    enabled: false
+    log_path: "/opt/minecraft/logs/latest.log"
+    rapid_connection_threshold: 10  # Connections within analysis_interval signaling a botnet
