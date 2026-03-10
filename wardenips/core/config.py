@@ -9,6 +9,7 @@ providing a single configuration object globally (Singleton).
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -182,12 +183,30 @@ class ConfigManager:
                     await config_file.write(serialized)
                 os.replace(temp_path, self._config_path)
             except OSError as exc:
-                self._data = previous
                 if temp_path and temp_path.exists():
                     temp_path.unlink(missing_ok=True)
-                raise WardenConfigError(
-                    f"Configuration file could not be written: {self._config_path} — {exc}"
-                ) from exc
+                # Fall back to in-place overwrite when the parent directory is not writable
+                # but the config file itself is writable to the service account.
+                if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                    try:
+                        async with aiofiles.open(
+                            str(self._config_path),
+                            mode="w",
+                            encoding="utf-8",
+                        ) as config_file:
+                            await config_file.write(serialized)
+                    except OSError as direct_exc:
+                        self._data = previous
+                        raise WardenConfigError(
+                            "Configuration file could not be written: "
+                            f"{self._config_path} — {direct_exc}. "
+                            "The service may still be blocked by a read-only mount or systemd sandbox."
+                        ) from direct_exc
+                else:
+                    self._data = previous
+                    raise WardenConfigError(
+                        f"Configuration file could not be written: {self._config_path} — {exc}"
+                    ) from exc
             except Exception:
                 self._data = previous
                 if temp_path and temp_path.exists():

@@ -2,12 +2,16 @@
 WardenIPS - Auto-Updater
 ==========================
 
-Checks for new releases on GitHub and warns the user in the logs.
-Displays release notes and version information.
+Checks for new releases on GitHub and exposes structured release metadata
+for logs, dashboards, and installer/update flows.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import aiohttp
-from typing import Optional
+
 from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,43 +27,74 @@ class UpdateChecker:
         self._repo = repo_url
         self._api_url = f"https://api.github.com/repos/{self._repo}/releases/latest"
 
+    async def get_status(self) -> dict[str, Any]:
+        """Return structured update metadata for the current runtime."""
+        logger.debug("Fetching WardenIPS release metadata...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self._api_url, timeout=5) as response:
+                    if response.status != 200:
+                        return {
+                            "checked": False,
+                            "current_version": self._current_version,
+                            "update_available": False,
+                            "error": f"GitHub API returned HTTP {response.status}.",
+                        }
+
+                    data = await response.json()
+                    tag_name = str(data.get("tag_name", "")).lstrip("v")
+                    release_notes = str(data.get("body", "") or "").strip()
+                    preview = self._summarize_notes(release_notes)
+
+                    if not tag_name:
+                        return {
+                            "checked": False,
+                            "current_version": self._current_version,
+                            "update_available": False,
+                            "error": "GitHub release metadata did not contain a version tag.",
+                        }
+
+                    return {
+                        "checked": True,
+                        "current_version": self._current_version,
+                        "latest_version": tag_name,
+                        "update_available": self._is_newer(self._current_version, tag_name),
+                        "release_notes": release_notes,
+                        "release_notes_preview": preview,
+                        "release_url": data.get("html_url", f"https://github.com/{self._repo}/releases"),
+                        "published_at": data.get("published_at"),
+                        "release_name": data.get("name") or f"v{tag_name}",
+                    }
+        except Exception as exc:
+            logger.debug(f"Failed to fetch release metadata: {exc}")
+            return {
+                "checked": False,
+                "current_version": self._current_version,
+                "update_available": False,
+                "error": str(exc),
+            }
+
     async def check_for_updates(self) -> None:
         """
         Fetches the latest release from the GitHub repository API.
         """
         logger.debug("Checking for WardenIPS updates...")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self._api_url, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        tag_name = data.get("tag_name", "").lstrip("v")
-                        
-                        if not tag_name:
-                            return
-
-                        if self._is_newer(self._current_version, tag_name):
-                            notes = data.get("body", "No release notes provided.")
-                            # Clean up notes for single line logging or short multi-lines
-                            notes_short = notes.split('\n')[0] if notes else ""
-                            
-                            logger.warning("")
-                            logger.warning("=" * 60)
-                            logger.warning("  🚀 NEW UPDATE AVAILABLE! 🚀")
-                            logger.warning("=" * 60)
-                            logger.warning(f"  Current Version : v{self._current_version}")
-                            logger.warning(f"  Latest Version  : v{tag_name}")
-                            logger.warning(f"  Update Notes    : {notes_short}")
-                            logger.warning("")
-                            logger.warning("  Please update WardenIPS via 'git pull' or download the new release.")
-                            logger.warning("  Report any issues on GitHub and consider supporting the project!")
-                            logger.warning("  Ko-fi: https://ko-fi.com/msncakma")
-                            logger.warning("=" * 60)
-                            logger.warning("")
-                    else:
-                        logger.debug(f"GitHub API update check failed. HTTP {response.status}")
-        except Exception as exc:
-            logger.debug(f"Failed to check for updates: {exc}")
+        status = await self.get_status()
+        if not status.get("checked"):
+            logger.debug("Update check skipped: %s", status.get("error", "unknown error"))
+            return
+        if status.get("update_available"):
+            notes_preview = status.get("release_notes_preview") or []
+            notes_short = notes_preview[0] if notes_preview else "No release notes provided."
+            logger.warning("")
+            logger.warning("=" * 60)
+            logger.warning("  NEW UPDATE AVAILABLE")
+            logger.warning("=" * 60)
+            logger.warning(f"  Current Version : v{status['current_version']}")
+            logger.warning(f"  Latest Version  : v{status['latest_version']}")
+            logger.warning(f"  Update Notes    : {notes_short}")
+            logger.warning("  Release URL     : %s", status.get("release_url", "https://github.com/msncakma/WardenIPS/releases"))
+            logger.warning("=" * 60)
 
     def _is_newer(self, current: str, latest: str) -> bool:
         """Simple semantic version comparison."""
@@ -81,3 +116,21 @@ class UpdateChecker:
         except ValueError:
             # Fallback to simple string comparison if arbitrary tags are used
             return current != latest
+
+    def _summarize_notes(self, notes: str, limit: int = 4) -> list[str]:
+        """Extract short dashboard-friendly highlights from release notes."""
+        lines: list[str] = []
+        for raw_line in notes.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                line = line.lstrip("#").strip()
+            if line.startswith(("- ", "* ")):
+                line = line[2:].strip()
+            if len(line) > 220:
+                line = line[:217].rstrip() + "..."
+            lines.append(line)
+            if len(lines) >= limit:
+                break
+        return lines

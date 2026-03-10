@@ -47,6 +47,7 @@ import yaml
 from wardenips import __author__, __version__
 from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.logger import get_logger
+from wardenips.core.updater import UpdateChecker
 
 logger = get_logger(__name__)
 
@@ -303,6 +304,7 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
     self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
     self._app.router.add_post("/api/admin/test-notification", self._handle_admin_test_notification)
+    self._app.router.add_get("/api/admin/update-status", self._handle_admin_update_status)
     self._app.router.add_get("/api/admin/config", self._handle_admin_get_config)
     self._app.router.add_post("/api/admin/config", self._handle_admin_save_config)
     self._app.router.add_post("/api/admin/config/patch", self._handle_admin_patch_config)
@@ -709,6 +711,13 @@ class DashboardAPI:
       return web.json_response({"error": "notification_unavailable", "message": str(exc)}, status=503)
     summary = ", ".join(f"{name}: {status}" for name, status in result["results"].items())
     return web.json_response({"ok": True, "message": f"Test notification dispatched ({summary}).", **result})
+
+  async def _handle_admin_update_status(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    checker = UpdateChecker(current_version=__version__)
+    return web.json_response(await checker.get_status())
 
   def _set_nested_config_value(self, payload: dict, dotted_path: str, value) -> None:
     current = payload
@@ -1486,7 +1495,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
 .layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--b);font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:color-mix(in srgb,var(--red) 20%,transparent);color:#ffd3d7}.t-green{background:color-mix(in srgb,var(--green) 18%,transparent);color:#b8ffe0}.t-yellow{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:#ffe1a7}.t-blue{background:color-mix(in srgb,var(--blue) 18%,transparent);color:#c9deff}
-.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:13px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:color-mix(in srgb,var(--green) 14%,var(--surface))}.status.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:color-mix(in srgb,var(--red) 14%,var(--surface))}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.linkbar a{color:var(--blue);text-decoration:none;font-size:.82rem}.linkbar a:hover{text-decoration:underline}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:var(--blue);text-decoration:none}.notification-grid{margin-top:4px}.theme-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);font-size:.76rem;color:var(--muted)}.config-editor{width:100%;min-height:280px;resize:vertical;font-family:Cascadia Code,Fira Code,monospace;line-height:1.55}.field-switch{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.field-switch strong{display:block;font-size:.84rem;margin-bottom:4px}.field-switch span{display:block}.field-switch input{width:18px;height:18px;accent-color:var(--accent)}.toolbar-note{margin-bottom:12px;color:var(--muted);font-size:.8rem}.config-actions{margin-top:12px}.utility-note{display:flex;align-items:center;justify-content:space-between;gap:14px}.utility-note .sub{max-width:58ch}.modal-backdrop{position:fixed;inset:0;background:#09060f88;backdrop-filter:blur(8px);display:grid;place-items:center;padding:22px;z-index:30}.modal-backdrop[hidden]{display:none}.modal-card{width:min(100%,1080px);max-height:min(88vh,920px);overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:20px;box-shadow:var(--shadow)}.modal-header{align-items:center;justify-content:space-between;margin-bottom:12px}.modal-header p{margin:0;color:var(--muted);font-size:.84rem;line-height:1.5}.modal-body{display:grid;gap:14px}.config-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.config-section{padding:16px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.config-section h3{font-size:.92rem;margin-bottom:6px}.config-section p{color:var(--muted);font-size:.78rem;line-height:1.5;margin-bottom:12px}.config-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}.config-field{display:grid;gap:6px}.config-field label{font-size:.76rem;color:var(--muted);font-weight:700}.config-field.full,.config-toggle.full{grid-column:1/-1}.config-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--b);border-radius:14px;background:var(--surface2)}.config-toggle span{font-size:.8rem}.advanced-wrap{border-top:1px solid var(--b);padding-top:14px}.advanced-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.advanced-body[hidden]{display:none}.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,var(--surface2),var(--surface));border:1px solid var(--b);color:var(--txt);text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}.kofi-fab .heart{font-size:.9rem;line-height:1;color:#fb7185}.kofi-fab .sub{font-size:.68rem;color:var(--muted);font-weight:600}.kofi-fab:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 14px 34px #00000070;text-decoration:none}
+.list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:13px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:color-mix(in srgb,var(--green) 14%,var(--surface))}.status.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:color-mix(in srgb,var(--red) 14%,var(--surface))}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.linkbar a{color:var(--blue);text-decoration:none;font-size:.82rem}.linkbar a:hover{text-decoration:underline}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:var(--blue);text-decoration:none}.notification-grid{margin-top:4px}.theme-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);font-size:.76rem;color:var(--muted)}.update-banner{margin-bottom:16px;padding:16px 18px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--panel),var(--surface));box-shadow:var(--shadow)}.update-banner[hidden]{display:none}.update-banner.warn{border-color:color-mix(in srgb,var(--accent) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 16%,var(--panel)),var(--surface))}.update-banner.info{border-color:color-mix(in srgb,var(--cyan) 45%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--cyan) 10%,var(--panel)),var(--surface))}.update-banner-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}.update-banner-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.update-banner-list{display:grid;gap:6px;margin-top:10px;padding-left:18px;color:var(--txt)}.config-editor{width:100%;min-height:280px;resize:vertical;font-family:Cascadia Code,Fira Code,monospace;line-height:1.55}.field-switch{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.field-switch strong{display:block;font-size:.84rem;margin-bottom:4px}.field-switch span{display:block}.field-switch input{width:18px;height:18px;accent-color:var(--accent)}.toolbar-note{margin-bottom:12px;color:var(--muted);font-size:.8rem}.config-actions{margin-top:12px}.utility-note{display:flex;align-items:center;justify-content:space-between;gap:14px}.utility-note .sub{max-width:58ch}.modal-backdrop{position:fixed;inset:0;background:#09060f88;backdrop-filter:blur(8px);display:grid;place-items:center;padding:22px;z-index:30}.modal-backdrop[hidden]{display:none}.modal-card{width:min(100%,1080px);max-height:min(88vh,920px);overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:20px;box-shadow:var(--shadow)}.modal-header{align-items:center;justify-content:space-between;margin-bottom:12px}.modal-header p{margin:0;color:var(--muted);font-size:.84rem;line-height:1.5}.modal-body{display:grid;gap:14px}.config-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.config-section{padding:16px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.config-section h3{font-size:.92rem;margin-bottom:6px}.config-section p{color:var(--muted);font-size:.78rem;line-height:1.5;margin-bottom:12px}.config-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}.config-field{display:grid;gap:6px}.config-field label{font-size:.76rem;color:var(--muted);font-weight:700}.config-field.full,.config-toggle.full{grid-column:1/-1}.config-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--b);border-radius:14px;background:var(--surface2)}.config-toggle span{font-size:.8rem}.advanced-wrap{border-top:1px solid var(--b);padding-top:14px}.advanced-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.advanced-body[hidden]{display:none}.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,var(--surface2),var(--surface));border:1px solid var(--b);color:var(--txt);text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}.kofi-fab .heart{font-size:.9rem;line-height:1;color:#fb7185}.kofi-fab .sub{font-size:.68rem;color:var(--muted);font-weight:600}.kofi-fab:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 14px 34px #00000070;text-decoration:none}
 @media(max-width:1100px){.top,.utility-strip,.hero,.layout,.split,.toolbar-grid{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.utility-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.actions{justify-content:flex-start}}
 @media(max-width:900px){.config-sections,.config-grid{grid-template-columns:1fr}}
 @media(max-width:680px){.app{padding:14px}.hero-meta,.utility-metrics{grid-template-columns:1fr}.actions,.toolbar,.action-grid,.notification-grid,.config-actions,.quick-toggle-grid,.modal-header{width:100%}.ctrl,.btn,.config-input,.config-select{width:100%}}
@@ -1524,7 +1533,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <div class="utility-note">
         <div>
           <strong>Operations Overview</strong>
-          <p class="sub">Everything sensitive stays here: firewall actions, cleanup tools, notification tests, and live configuration control.</p>
+          <p class="sub">Everything sensitive stays here: firewall actions, cleanup tools, and live configuration control.</p>
         </div>
         <div class="theme-chip" id="themeChip">Theme: Dark</div>
       </div>
@@ -1536,6 +1545,20 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div><span>Route</span>/admin</div>
         <div><span>Config</span>Editable</div>
       </div>
+    </div>
+  </div>
+
+  <div id="updateNotice" class="update-banner" hidden>
+    <div class="update-banner-head">
+      <div>
+        <strong id="updateNoticeTitle">Update Notice</strong>
+        <div class="sub" id="updateNoticeBody">Checking release metadata...</div>
+      </div>
+      <button id="dismissUpdateNoticeBtn" class="btn ghost">Dismiss</button>
+    </div>
+    <ul id="updateNoticeList" class="update-banner-list"></ul>
+    <div class="update-banner-actions">
+      <a id="updateNoticeLink" class="btn ghost" href="https://github.com/msncakma/WardenIPS/releases" target="_blank" rel="noopener">Open Release</a>
     </div>
   </div>
 
@@ -1572,11 +1595,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
           <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
           <button id="clearBanHistoryBtn" class="btn danger">Clear Ban History</button>
-        </div>
-        <div class="notification-grid">
-          <button id="testAllNotificationsBtn" class="btn primary">Send All Test Messages</button>
-          <button id="testTelegramBtn" class="btn cyan">Test Telegram</button>
-          <button id="testDiscordBtn" class="btn ghost">Test Discord</button>
         </div>
         <div id="actionStatus" class="panel-box status"><strong>Action status</strong><div class="sub">Interactive admin actions will report results here.</div></div>
       </div>
@@ -1709,6 +1727,14 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <label for="cfgDiscordWebhook">Discord Webhook URL</label>
               <input id="cfgDiscordWebhook" class="config-input" type="text" spellcheck="false">
             </div>
+            <div class="config-field full">
+              <label>Delivery Tests</label>
+              <div class="notification-grid">
+                <button id="testAllNotificationsBtn" class="btn primary" type="button">Send All Test Messages</button>
+                <button id="testTelegramBtn" class="btn cyan" type="button">Test Telegram</button>
+                <button id="testDiscordBtn" class="btn ghost" type="button">Test Discord</button>
+              </div>
+            </div>
           </div>
         </section>
         <section class="config-section">
@@ -1764,7 +1790,7 @@ var inputTimers = {};
 var activityPingTimer = null;
 var idleTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false};
+var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -1775,11 +1801,42 @@ function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[ke
 function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
 function setStatus(kind, title, message){ var box=$('#actionStatus'); box.className='panel-box status '+(kind||''); box.innerHTML='<strong>'+E(title)+'</strong><div class="sub">'+E(message)+'</div>'; }
 function getConfigValue(path, fallback){ var value=state.config||{}; String(path).split('.').forEach(function(part){ value = value && typeof value==='object' ? value[part] : undefined; }); return value===undefined ? fallback : value; }
+function getDismissKey(info){ return info&&info.update_available&&info.latest_version ? 'wardenips_update_dismissed_'+info.latest_version : info&&info.current_version ? 'wardenips_whatsnew_seen_'+info.current_version : ''; }
 function applyTheme(theme){ state.theme = theme==='light' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', state.theme); try{ localStorage.setItem('wardenips_admin_theme', state.theme); }catch(error){} $('#themeToggle').textContent = state.theme==='light' ? 'Dark Mode' : 'Light Mode'; $('#themeChip').textContent = 'Theme: ' + (state.theme==='light' ? 'Light' : 'Dark'); }
 function initTheme(){ var saved='dark'; try{ saved = localStorage.getItem('wardenips_admin_theme') || 'dark'; }catch(error){} applyTheme(saved); }
 function openConfigModal(){ $('#configModal').hidden=false; document.body.style.overflow='hidden'; }
 function closeConfigModal(){ $('#configModal').hidden=true; document.body.style.overflow=''; }
 function syncAdvancedYaml(){ $('#advancedYamlBody').hidden=!state.advancedYamlOpen; $('#toggleAdvancedYamlBtn').textContent=state.advancedYamlOpen?'Hide YAML':'Show YAML'; }
+function renderUpdateNotice(){
+  var box=$('#updateNotice');
+  var info=state.updateInfo;
+  if(!info || !info.checked){ box.hidden=true; return; }
+  var dismissKey=getDismissKey(info);
+  try{ if(dismissKey && localStorage.getItem(dismissKey)==='1'){ box.hidden=true; return; } }catch(error){}
+  var notes=Array.isArray(info.release_notes_preview)?info.release_notes_preview.filter(Boolean):[];
+  var link=info.release_url||'https://github.com/msncakma/WardenIPS/releases';
+  $('#updateNoticeLink').href=link;
+  if(info.update_available){
+    box.className='update-banner warn';
+    $('#updateNoticeTitle').textContent='Update available: v'+(info.latest_version||'?');
+    $('#updateNoticeBody').textContent='This node runs v'+(info.current_version||'?')+'. A newer release is available with operator-facing improvements.';
+  }else if(notes.length){
+    box.className='update-banner info';
+    $('#updateNoticeTitle').textContent='What\'s new in v'+(info.current_version||'?');
+    $('#updateNoticeBody').textContent='This panel detected a newer installed version and is surfacing the latest release highlights once.';
+  }else{
+    box.hidden=true;
+    return;
+  }
+  $('#updateNoticeList').innerHTML=notes.length?notes.map(function(note){ return '<li>'+E(note)+'</li>'; }).join(''):'<li>Release metadata is available on GitHub.</li>';
+  box.hidden=false;
+}
+async function loadUpdateStatus(){
+  var payload=await api('/api/admin/update-status');
+  if(!payload){ return; }
+  state.updateInfo=payload;
+  renderUpdateNotice();
+}
 async function api(path, options){
   try{
     var response = await fetch(path, options || {});
@@ -1945,6 +2002,7 @@ function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart
 function bind(){
   ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
+  $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
   $('#closeConfigBtn').addEventListener('click', function(){ closeConfigModal(); });
   $('#configModal').addEventListener('click', function(ev){ if(ev.target===this){ closeConfigModal(); } });
@@ -1969,7 +2027,7 @@ function bind(){
   $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
 }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
-initTheme(); bind(); bindActivity(); loadConfig(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+initTheme(); bind(); bindActivity(); loadConfig(); loadUpdateStatus(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 })();
 </script>
 </body>

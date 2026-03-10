@@ -18,6 +18,11 @@ SERVICE_USER="${WARDENIPS_USER:-wardenips}"
 SERVICE_GROUP="${WARDENIPS_GROUP:-wardenips}"
 APP_VERSION="unknown"
 APP_AUTHOR="msncakma"
+INSTALLED_VERSION=""
+INSTALLED_AUTHOR=""
+INSTALL_MODE="install"
+PREVIOUS_SERVICE_ACTIVE="0"
+PREVIOUS_SERVICE_ENABLED="0"
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -105,6 +110,48 @@ detect_source_dir() {
     log "Fetching WardenIPS from ${REPO_URL} (${REPO_BRANCH})..."
     if ! git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$SOURCE_DIR"; then
         error "Failed to download repository from ${REPO_URL}"
+    fi
+}
+
+detect_existing_install() {
+    if [ -f "$INSTALL_DIR/wardenips/__init__.py" ]; then
+        INSTALL_MODE="update"
+        EXISTING_METADATA="$(python3 - "$INSTALL_DIR/wardenips/__init__.py" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+version_match = re.search(r'''^__version__\s*=\s*["']([^"']+)["']''', text, re.MULTILINE)
+author_match = re.search(r'''^__author__\s*=\s*["']([^"']+)["']''', text, re.MULTILINE)
+print((version_match.group(1) if version_match else "unknown") + "\n" + (author_match.group(1) if author_match else "unknown"))
+PY
+)"
+        INSTALLED_VERSION="$(printf '%s\n' "$EXISTING_METADATA" | sed -n '1p')"
+        INSTALLED_AUTHOR="$(printf '%s\n' "$EXISTING_METADATA" | sed -n '2p')"
+        log "Existing WardenIPS installation detected: v$INSTALLED_VERSION ($INSTALLED_AUTHOR)"
+    else
+        log "No existing WardenIPS installation detected. Proceeding with a fresh install."
+    fi
+
+    if systemctl list-unit-files wardenips.service >/dev/null 2>&1; then
+        if systemctl is-enabled wardenips >/dev/null 2>&1; then
+            PREVIOUS_SERVICE_ENABLED="1"
+        fi
+        if systemctl is-active wardenips >/dev/null 2>&1; then
+            PREVIOUS_SERVICE_ACTIVE="1"
+        fi
+    fi
+}
+
+prepare_update() {
+    if [ "$INSTALL_MODE" != "update" ]; then
+        return
+    fi
+
+    if [ "$PREVIOUS_SERVICE_ACTIVE" = "1" ]; then
+        log "Stopping active WardenIPS service before update..."
+        systemctl stop wardenips
     fi
 }
 
@@ -347,12 +394,15 @@ configure_permissions() {
     chmod -R g=rX,o= "$INSTALL_DIR"
     find "$INSTALL_DIR" -type d -exec chmod 750 {} +
     if [ -f "$INSTALL_DIR/config.yaml" ]; then
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/config.yaml"
         chmod 660 "$INSTALL_DIR/config.yaml"
     fi
     if [ -f "$INSTALL_DIR/config_backup.yaml" ]; then
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/config_backup.yaml"
         chmod 660 "$INSTALL_DIR/config_backup.yaml"
     fi
     if [ -f "$INSTALL_DIR/config.yaml.backup" ]; then
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/config.yaml.backup"
         chmod 660 "$INSTALL_DIR/config.yaml.backup"
     fi
 
@@ -539,7 +589,7 @@ PY
     systemctl daemon-reload
     run_quiet systemctl enable wardenips
 
-    if [ "$AUTOSTART" = "1" ]; then
+    if [ "$AUTOSTART" = "1" ] || [ "$PREVIOUS_SERVICE_ACTIVE" = "1" ]; then
         log "Starting WardenIPS service..."
         systemctl restart wardenips
     else
@@ -549,6 +599,8 @@ PY
 
 install_dependencies
 detect_source_dir
+detect_existing_install
+prepare_update
 deploy_files "$SOURCE_DIR"
 load_app_metadata
 ensure_service_user
@@ -566,7 +618,7 @@ else
     DASHBOARD_SUMMARY="disabled"
 fi
 
-if [ "$AUTOSTART" = "1" ]; then
+if [ "$AUTOSTART" = "1" ] || [ "$PREVIOUS_SERVICE_ACTIVE" = "1" ]; then
     SERVICE_STATE_SUMMARY="enabled and started"
 else
     SERVICE_STATE_SUMMARY="enabled, not started"
@@ -578,6 +630,10 @@ printf "%b\n" "${GREEN}   WardenIPS Installation Complete${NC}"
 printf "%b\n" "${GREEN}============================================${NC}"
 printf "\n"
 printf "%b\n" "  ${GREEN}Deployment Summary${NC}"
+printf "%b\n" "    Mode           : ${CYAN}$INSTALL_MODE${NC}"
+if [ "$INSTALL_MODE" = "update" ]; then
+    printf "%b\n" "    Previous Ver.  : ${CYAN}v$INSTALLED_VERSION${NC}"
+fi
 printf "%b\n" "    Version        : ${CYAN}v$APP_VERSION${NC}"
 printf "%b\n" "    Maintainer     : ${CYAN}$APP_AUTHOR${NC}"
 printf "%b\n" "    Install Path   : ${CYAN}$INSTALL_DIR${NC}"
@@ -587,12 +643,15 @@ printf "%b\n" "    Dashboard      : ${CYAN}$DASHBOARD_SUMMARY${NC}"
 printf "%b\n" "    Service Unit   : ${CYAN}wardenips.service${NC}"
 printf "%b\n" "    Service User   : ${CYAN}$SERVICE_USER${NC}"
 printf "%b\n" "    Service State  : ${CYAN}$SERVICE_STATE_SUMMARY${NC}"
+if [ "$INSTALL_MODE" = "update" ]; then
+    printf "%b\n" "    Config Merge   : ${CYAN}Existing config preserved, missing template keys merged automatically${NC}"
+fi
 printf "\n"
 printf "%b\n" "  ${YELLOW}Recommended Next Steps${NC}"
 printf "%b\n" "    1. Review ${CYAN}$INSTALL_DIR/config.yaml${NC}"
 printf "%b\n" "    2. Update whitelist.ips with your trusted addresses"
 printf "%b\n" "    3. Verify plugin log paths and notification credentials"
-printf "%b\n" "    4. Start the service manually if you kept autostart disabled"
+printf "%b\n" "    4. Open /admin and review release notices after login"
 printf "\n"
 printf "%b\n" "  ${GREEN}Operational Commands${NC}"
 printf "%b\n" "    sudo systemctl start wardenips"
