@@ -15,6 +15,7 @@ Detected patterns:
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -76,6 +77,19 @@ class MinecraftPlugin(BasePlugin):
         self._enabled = plugin_conf.get("enabled", True)
         self._rapid_threshold = plugin_conf.get("rapid_connection_threshold", 10)
         self._time_window = plugin_conf.get("time_window", 60)
+        self._global_burst_threshold = max(
+            int(plugin_conf.get("global_connection_burst_threshold", 12)),
+            2,
+        )
+        self._global_burst_window_seconds = max(
+            int(plugin_conf.get("global_connection_burst_window_seconds", 15)),
+            1,
+        )
+        self._global_burst_min_unique_ips = max(
+            int(plugin_conf.get("global_connection_burst_min_unique_ips", 8)),
+            1,
+        )
+        self._recent_connection_window: list[tuple[float, str]] = []
 
     @property
     def name(self) -> str:
@@ -173,6 +187,22 @@ class MinecraftPlugin(BasePlugin):
         event_type = event.details.get("event_type", "")
         event_count = context.get("event_count", 0)
         is_datacenter = context.get("is_datacenter", False)
+        global_burst_count = 0
+        global_burst_unique_ips = 0
+
+        if event_type in {"login", "failed_packet"}:
+            now_mono = time.monotonic()
+            self._recent_connection_window.append((now_mono, event.source_ip))
+            cutoff = now_mono - self._global_burst_window_seconds
+            self._recent_connection_window = [
+                (seen_at, source_ip)
+                for seen_at, source_ip in self._recent_connection_window
+                if seen_at >= cutoff
+            ]
+            global_burst_count = len(self._recent_connection_window)
+            global_burst_unique_ips = len(
+                {source_ip for _, source_ip in self._recent_connection_window}
+            )
 
         # Event type based base score
         if event_type == "failed_packet":
@@ -186,6 +216,16 @@ class MinecraftPlugin(BasePlugin):
         # Each connection adds 10 points, so a large number of connections in a short time raises the score
         if event_count > 0:
             score += min(event_count * 10, 60)
+
+        if (
+            global_burst_count >= self._global_burst_threshold
+            and global_burst_unique_ips >= self._global_burst_min_unique_ips
+        ):
+            score += 45
+            if event_type == "failed_packet":
+                score += 10
+        elif global_burst_unique_ips >= self._global_burst_min_unique_ips:
+            score += 25
 
         # Datacenter IP
         if is_datacenter:

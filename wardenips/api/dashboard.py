@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import os
 import secrets
+import sys
 import time
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote, urlencode
@@ -204,6 +206,29 @@ class DashboardAPI:
       .replace("__APP_AUTHOR__", __author__)
     )
 
+  def _format_duration(self, total_seconds: Optional[int]) -> str:
+    if total_seconds is None or total_seconds < 0:
+      return "--"
+    days, remainder = divmod(int(total_seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+      return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+  def _get_system_uptime_seconds(self) -> Optional[int]:
+    try:
+      if os.path.exists("/proc/uptime"):
+        with open("/proc/uptime", encoding="utf-8") as uptime_file:
+          return int(float(uptime_file.read().split()[0]))
+      if sys.platform.startswith("win"):
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetTickCount64() / 1000)
+    except Exception:
+      return None
+    return None
+
   def _json_auth_error(self) -> web.Response:
     if not self._dashboard_auth_configured():
       return web.json_response(
@@ -290,13 +315,14 @@ class DashboardAPI:
 
   async def _handle_health(self, request: web.Request) -> web.Response:
     uptime = int(time.monotonic() - self._start_time)
-    minutes, seconds = divmod(uptime, 60)
-    hours, minutes = divmod(minutes, 60)
+    system_uptime_seconds = self._get_system_uptime_seconds()
     return web.json_response(
       {
         "status": "ok",
-        "uptime": f"{hours:02d}:{minutes:02d}:{seconds:02d}",
+        "uptime": self._format_duration(uptime),
         "uptime_seconds": uptime,
+        "system_uptime": self._format_duration(system_uptime_seconds),
+        "system_uptime_seconds": system_uptime_seconds,
       }
     )
 
@@ -875,7 +901,7 @@ $('#loginForm').addEventListener('submit', async function(ev){
 </html>"""
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -883,46 +909,59 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg:#0a0e17;--card:#111827;--card-h:#1a2332;
-  --bdr:#1e293b;--bdr-g:#3b82f620;
-  --txt:#e2e8f0;--dim:#64748b;--dim2:#475569;
-  --accent:#3b82f6;--accent-g:#3b82f640;
-  --red:#ef4444;--red-d:#dc262620;
-  --warn:#f59e0b;--warn-d:#f59e0b20;
-  --grn:#10b981;--grn-d:#10b98120;
-  --pur:#8b5cf6;--pur-d:#8b5cf620;
-  --cyan:#06b6d4;--cyan-d:#06b6d420;
-  --r:12px;--rs:8px;
+  --bg:#110f18;--bg2:#1d1730;--card:#1d1a29;--card-h:#261f36;
+  --bdr:#3b3150;--bdr-g:#5ea1ff20;
+  --txt:#f5f1ea;--dim:#b8accc;--dim2:#8e82a6;
+  --accent:#ff875f;--accent-g:#ff875f40;
+  --red:#ff6f7e;--red-d:#ff6f7e20;
+  --warn:#ffbe5c;--warn-d:#ffbe5c20;
+  --grn:#4fd18f;--grn-d:#4fd18f20;
+  --pur:#7e7bff;--pur-d:#7e7bff20;
+  --cyan:#39d0c6;--cyan-d:#39d0c620;
+  --r:18px;--rs:12px;--shadow:0 30px 80px #00000045;
+}
+:root[data-theme="light"]{
+  --bg:#f4eee4;--bg2:#e9ddcf;--card:#fffdf8;--card-h:#f3eadf;
+  --bdr:#dac8b2;--bdr-g:#2f6fe420;
+  --txt:#221d17;--dim:#74685b;--dim2:#8a7868;
+  --accent:#c95c2b;--accent-g:#c95c2b22;
+  --red:#c84e58;--red-d:#c84e5820;
+  --warn:#c98410;--warn-d:#c9841020;
+  --grn:#1f8b57;--grn-d:#1f8b5720;
+  --pur:#5f58d6;--pur-d:#5f58d620;
+  --cyan:#0f8f92;--cyan-d:#0f8f9220;
+  --shadow:0 22px 48px rgba(73,49,19,.12);
 }
 html{font-size:15px;scroll-behavior:smooth}
-body{font-family:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20% 50%,#3b82f608 0%,transparent 50%),radial-gradient(ellipse at 80% 20%,#8b5cf608 0%,transparent 50%),radial-gradient(ellipse at 50% 80%,#06b6d405 0%,transparent 50%);pointer-events:none;z-index:0}
+body{font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,color-mix(in srgb,var(--bg) 92%,#000 8%) 100%);color:var(--txt);min-height:100vh;overflow-x:hidden;transition:background .25s ease,color .25s ease}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 82% 14%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 14%,transparent) 0%,transparent 28%);pointer-events:none;z-index:0}
 .sh{max-width:1440px;margin:0 auto;padding:1.5rem;position:relative;z-index:1}
 header{display:flex;align-items:center;justify-content:space-between;padding:1rem 0 2rem;flex-wrap:wrap;gap:1rem}
 .logo{display:flex;align-items:center;gap:.75rem}
-.logo svg{width:36px;height:36px;filter:drop-shadow(0 0 8px var(--accent-g))}
-.logo h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo svg{width:36px;height:36px;filter:drop-shadow(0 0 10px var(--accent-g))}
+.logo h1{font-size:1.7rem;font-weight:800;letter-spacing:-.03em;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .logo-copy{display:grid;gap:.3rem}
-.hero-note{font-size:.9rem;color:#a8bbd6;max-width:48ch}
+.hero-note{font-size:.92rem;color:var(--dim);max-width:48ch;line-height:1.5}
 .meta{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
 .bdg{display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:20px;font-size:.75rem;font-weight:600;letter-spacing:.03em}
 .bdg-live{background:var(--grn-d);color:var(--grn);animation:pls 2s infinite}
 .bdg-sim{background:var(--warn-d);color:var(--warn)}
-.admin-link{display:inline-flex;align-items:center;justify-content:center;padding:.65rem 1rem;border-radius:999px;border:1px solid #334155;background:#111827;color:var(--txt);text-decoration:none;font-size:.82rem;font-weight:800;transition:border-color .2s ease,transform .2s ease}
-.admin-link:hover{border-color:var(--accent);transform:translateY(-1px)}
+.admin-link{display:inline-flex;align-items:center;justify-content:center;padding:.7rem 1rem;border-radius:999px;border:1px solid var(--bdr);background:color-mix(in srgb,var(--card) 85%,transparent);color:var(--txt);text-decoration:none;font-size:.82rem;font-weight:800;transition:border-color .2s ease,transform .2s ease,background .2s ease;box-shadow:var(--shadow)}
+button.admin-link{font:inherit;cursor:pointer}
+.admin-link:hover{border-color:var(--accent);transform:translateY(-1px);background:var(--card-h)}
 .hero-band{display:grid;grid-template-columns:1.35fr .9fr;gap:1rem;margin-bottom:1.5rem}
-.hero-panel,.signal-panel{background:linear-gradient(180deg,#0f172a,#0c1322);border:1px solid var(--bdr);border-radius:18px;padding:1.1rem 1.2rem;box-shadow:0 20px 45px #00000026}
+.hero-panel,.signal-panel{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 90%,#000 10%));border:1px solid var(--bdr);border-radius:20px;padding:1.1rem 1.2rem;box-shadow:var(--shadow)}
 .hero-panel strong,.signal-panel strong{display:block;font-size:.88rem;margin-bottom:.4rem}
 .hero-panel p,.signal-panel p{font-size:.82rem;line-height:1.6;color:var(--dim);margin:0}
 .signal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:.8rem}
-.signal-grid div{padding:.75rem;border-radius:12px;background:#09111f;border:1px solid #1b2940}
+.signal-grid div{padding:.75rem;border-radius:14px;background:color-mix(in srgb,var(--card-h) 88%,transparent);border:1px solid var(--bdr)}
 .signal-grid span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.3rem}
 @keyframes pls{0%,100%{opacity:1}50%{opacity:.6}}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:4px}
 
 /* Stats */
 .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1rem;margin-bottom:2rem}
-.sc{background:var(--card);border:1px solid var(--bdr);border-radius:var(--r);padding:1.25rem 1.5rem;transition:all .25s ease;position:relative;overflow:hidden}
+.sc{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 92%,#000 8%));border:1px solid var(--bdr);border-radius:var(--r);padding:1.25rem 1.5rem;transition:all .25s ease;position:relative;overflow:hidden;box-shadow:var(--shadow)}
 .sc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--accent);border-radius:var(--r) var(--r) 0 0;opacity:.6;transition:opacity .3s}
 .sc:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 8px 32px var(--accent-g)}
 .sc:hover::before{opacity:1}
@@ -936,7 +975,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 /* Panels */
 .pn{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2rem}
 @media(max-width:900px){.pn{grid-template-columns:1fr}}
-.pl{background:var(--card);border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;transition:all .25s ease}
+.pl{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 92%,#000 8%));border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;transition:all .25s ease;box-shadow:var(--shadow)}
 .pl:hover{border-color:var(--bdr-g)}
 .ph{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid var(--bdr)}
 .ph h2{font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:.5rem}
@@ -985,21 +1024,21 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 .em{padding:2rem;text-align:center;color:var(--dim2);font-size:.85rem}
 .em svg{width:40px;height:40px;margin-bottom:.75rem;opacity:.3}
 .mesh-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem;margin-bottom:1rem}
-.mesh-stat{padding:.9rem;border:1px solid var(--bdr);border-radius:10px;background:#0f172a}
+.mesh-stat{padding:.9rem;border:1px solid var(--bdr);border-radius:12px;background:var(--card-h)}
 .mesh-stat .k{font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:.35rem}
 .mesh-stat .v{font-size:1.1rem;font-weight:700}
-.mesh-topology{display:grid;place-items:center;min-height:220px;margin:1rem 0 1.2rem;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at center,#13233d 0%,#0f172a 42%,#0b1220 100%);overflow:hidden;position:relative}
-.mesh-topology::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at center,#3b82f61c 0%,transparent 52%);pointer-events:none}
+.mesh-topology{display:grid;place-items:center;min-height:220px;margin:1rem 0 1.2rem;border:1px solid var(--bdr);border-radius:16px;background:radial-gradient(circle at center,color-mix(in srgb,var(--accent) 12%,var(--card-h)) 0%,var(--card-h) 42%,color-mix(in srgb,var(--card) 90%,#000 10%) 100%);overflow:hidden;position:relative}
+.mesh-topology::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at center,color-mix(in srgb,var(--accent) 12%,transparent) 0%,transparent 52%);pointer-events:none}
 .mesh-canvas{position:relative;width:min(100%,520px);height:200px}
 .mesh-node{position:absolute;display:flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid var(--bdr);font-size:.72rem;font-weight:700;letter-spacing:.01em;box-shadow:0 10px 28px #00000035}
 .mesh-node.local{left:50%;top:50%;transform:translate(-50%,-50%);width:112px;height:112px;background:linear-gradient(135deg,#2563eb,#0f766e);color:#eff6ff;border-color:#60a5fa}
-.mesh-node.peer{width:78px;height:78px;background:#111827;color:var(--txt)}
+.mesh-node.peer{width:78px;height:78px;background:var(--card);color:var(--txt)}
 .mesh-node.peer.ok{border-color:#34d399;background:linear-gradient(135deg,#0f172a,#0b2b22)}
 .mesh-node.peer.bad{border-color:#f87171;background:linear-gradient(135deg,#0f172a,#311313)}
 .mesh-line{position:absolute;height:2px;transform-origin:left center;background:linear-gradient(90deg,#60a5fa55,#22d3ee20)}
 .mesh-node small{display:block;font-size:.62rem;color:#cbd5e1;font-weight:600;opacity:.85}
 .peer-list{display:grid;gap:.65rem}
-.peer-card{padding:.85rem 1rem;border:1px solid var(--bdr);border-radius:10px;background:#0f172a}
+.peer-card{padding:.85rem 1rem;border:1px solid var(--bdr);border-radius:12px;background:var(--card-h)}
 .peer-head{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-bottom:.45rem}
 .peer-url{font-size:.8rem;font-weight:700;color:var(--txt);word-break:break-all}
 .peer-meta{font-size:.72rem;color:var(--dim);display:flex;gap:.85rem;flex-wrap:wrap}
@@ -1010,10 +1049,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1re
 footer{text-align:center;padding:2rem 0 1rem;color:var(--dim2);font-size:.75rem}
 footer a{color:var(--accent);text-decoration:none}
 footer a:hover{text-decoration:underline}
-.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,#1f2937,#111827);border:1px solid #334155;color:#e2e8f0;text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}
+.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,var(--card-h),var(--card));border:1px solid var(--bdr);color:var(--txt);text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}
 .kofi-fab .heart{font-size:.9rem;line-height:1;color:#fb7185}
 .kofi-fab .sub{font-size:.68rem;color:var(--dim);font-weight:600}
-.kofi-fab:hover{transform:translateY(-2px);border-color:#38bdf8;box-shadow:0 14px 34px #00000070;text-decoration:none}
+.kofi-fab:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 14px 34px #00000070;text-decoration:none}
 @keyframes kofiPulse{0%,100%{box-shadow:0 10px 30px #00000055}50%{box-shadow:0 12px 34px #0ea5e93a}}
 .kofi-fab{animation:kofiPulse 3.4s ease-in-out infinite}
 @keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
@@ -1035,7 +1074,8 @@ footer a:hover{text-decoration:underline}
     </div>
     <div class="meta">
       <span class="bdg bdg-live" id="sb"><span class="dot"></span>LIVE</span>
-      <span style="font-size:.8rem;color:var(--dim)" id="ut">--:--:--</span>
+      <span style="font-size:.8rem;color:var(--dim)" id="ut">Service: --:--:-- • System: --</span>
+      <button class="admin-link" id="themeToggle" type="button">Light Mode</button>
       <a class="admin-link" href="__ADMIN_HREF__">__ADMIN_LABEL__</a>
     </div>
   </header>
@@ -1056,11 +1096,12 @@ footer a:hover{text-decoration:underline}
   </div>
 
   <div class="sg">
-    <div class="sc ai d1"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Uptime</div><div class="vl bl" id="su">--:--:--</div></div>
-    <div class="sc ai d2"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Total Events</div><div class="vl bl" id="se">0</div></div>
-    <div class="sc dng ai d3"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>Total Bans</div><div class="vl rd" id="stb">0</div></div>
-    <div class="sc wrn ai d4"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Active Bans</div><div class="vl yl" id="sab">0</div></div>
-    <div class="sc suc ai d5"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Firewall</div><div class="vl gn" id="sfw">0</div></div>
+    <div class="sc ai d1"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Service Uptime</div><div class="vl bl" id="su">--:--:--</div></div>
+    <div class="sc ai d2"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18"/><path d="M12 3v18"/><circle cx="12" cy="12" r="9"/></svg>System Uptime</div><div class="vl bl" id="ssu">--</div></div>
+    <div class="sc ai d3"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Total Events</div><div class="vl bl" id="se">0</div></div>
+    <div class="sc dng ai d4"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>Total Bans</div><div class="vl rd" id="stb">0</div></div>
+    <div class="sc wrn ai d5"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Active Bans</div><div class="vl yl" id="sab">0</div></div>
+    <div class="sc suc ai d6"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Firewall</div><div class="vl gn" id="sfw">0</div></div>
     <div class="sc prp ai d6"><div class="lb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Mode</div><div class="vl pp" id="sm">--</div></div>
   </div>
 
@@ -1151,6 +1192,18 @@ function CF(c){
   return String.fromCodePoint(...[...c.toUpperCase()].map(x=>x.charCodeAt(0)+127397));
 }
 var CC=['c0','c1','c2','c3','c4','c5'];
+function applyTheme(theme){
+  var next=theme==='light'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',next);
+  try{localStorage.setItem('wardenips_public_theme',next)}catch(e){}
+  var btn=$('#themeToggle');
+  if(btn)btn.textContent=next==='light'?'Dark Mode':'Light Mode';
+}
+function initTheme(){
+  var saved='dark';
+  try{saved=localStorage.getItem('wardenips_public_theme')||'dark'}catch(e){}
+  applyTheme(saved);
+}
 async function A(p){try{var r=await fetch(p);if(!r.ok)return null;return await r.json()}catch(e){return null}}
 
 function bars(id,items,lk,vk,ci){
@@ -1225,7 +1278,13 @@ async function refresh(){
   var ti=await A('/api/threat-intel');
 
   // Health
-  if(h){$('#su').textContent=h.uptime||'--:--:--';$('#ut').textContent='Uptime: '+(h.uptime||'--:--:--')}
+  if(h){
+    var serviceUptime=h.uptime||'--:--:--';
+    var systemUptime=h.system_uptime||'--';
+    $('#su').textContent=serviceUptime;
+    $('#ssu').textContent=systemUptime;
+    $('#ut').textContent='Service: '+serviceUptime+' • System: '+systemUptime;
+  }
 
   // Stats
   if(s){
@@ -1304,6 +1363,10 @@ async function refresh(){
   renderThreatIntel(ti);
 }
 
+initTheme();
+$('#themeToggle').addEventListener('click',function(){
+  applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
+});
 refresh();
 setInterval(refresh,R);
 })();
@@ -1530,7 +1593,7 @@ function renderSummary(){
   $('#mFwBans').textContent = N(state.firewall.length);
   $('#mPeers').textContent = N(state.mesh&&state.mesh.peers ? state.mesh.peers.length : 0);
   $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
-  $('#runtimeUptime').textContent = 'Uptime: '+((state.health&&state.health.uptime)||'--');
+  $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
 }
 function renderEvents(){

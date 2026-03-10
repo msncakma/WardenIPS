@@ -114,6 +114,9 @@ plugins:
     enabled: false
     log_path: "/opt/minecraft/logs/latest.log"
     rapid_connection_threshold: 10  # Connections within analysis_interval signaling a botnet
+    global_connection_burst_threshold: 12  # Treat 12+ near-simultaneous Minecraft connects as a potential flood
+    global_connection_burst_window_seconds: 15
+    global_connection_burst_min_unique_ips: 8  # Require multiple source IPs to reduce false positives
     
   nginx:
     enabled: false
