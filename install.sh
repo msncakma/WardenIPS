@@ -346,6 +346,15 @@ configure_permissions() {
     chown -R root:"$SERVICE_GROUP" "$INSTALL_DIR"
     chmod -R g=rX,o= "$INSTALL_DIR"
     find "$INSTALL_DIR" -type d -exec chmod 750 {} +
+    if [ -f "$INSTALL_DIR/config.yaml" ]; then
+        chmod 660 "$INSTALL_DIR/config.yaml"
+    fi
+    if [ -f "$INSTALL_DIR/config_backup.yaml" ]; then
+        chmod 660 "$INSTALL_DIR/config_backup.yaml"
+    fi
+    if [ -f "$INSTALL_DIR/config.yaml.backup" ]; then
+        chmod 660 "$INSTALL_DIR/config.yaml.backup"
+    fi
 
     chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
     find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +

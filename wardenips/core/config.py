@@ -9,6 +9,7 @@ providing a single configuration object globally (Singleton).
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -164,6 +165,7 @@ class ConfigManager:
         async with self._lock:
             previous = self._data
             self._data = data
+            temp_path = None
             try:
                 self._validate()
                 serialized = yaml.safe_dump(
@@ -171,14 +173,25 @@ class ConfigManager:
                     sort_keys=False,
                     allow_unicode=True,
                 )
+                temp_path = self._config_path.with_suffix(self._config_path.suffix + ".tmp")
                 async with aiofiles.open(
-                    str(self._config_path),
+                    str(temp_path),
                     mode="w",
                     encoding="utf-8",
                 ) as config_file:
                     await config_file.write(serialized)
+                os.replace(temp_path, self._config_path)
+            except OSError as exc:
+                self._data = previous
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                raise WardenConfigError(
+                    f"Configuration file could not be written: {self._config_path} — {exc}"
+                ) from exc
             except Exception:
                 self._data = previous
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
                 raise
             logger.info("Configuration saved successfully: %s", self._config_path)
 
