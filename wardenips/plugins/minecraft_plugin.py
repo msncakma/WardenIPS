@@ -74,9 +74,12 @@ class MinecraftPlugin(BasePlugin):
     def __init__(self, config) -> None:
         super().__init__(config)
         plugin_conf = config.get_section("plugins").get("minecraft", {})
+        success_conf = config.get_section("successful_logins") if config.get("successful_logins", None) else {}
         self._enabled = plugin_conf.get("enabled", True)
         self._rapid_threshold = plugin_conf.get("rapid_connection_threshold", 10)
         self._time_window = plugin_conf.get("time_window", 60)
+        self._successful_login_enabled = bool(success_conf.get("enabled", True))
+        self._reset_risk_on_success = bool(success_conf.get("reset_risk_score", True))
         self._global_burst_threshold = max(
             int(plugin_conf.get("global_connection_burst_threshold", 12)),
             2,
@@ -109,7 +112,7 @@ class MinecraftPlugin(BasePlugin):
 
         # 1. Player login
         match = _RE_LOGIN.search(line)
-        if match:
+        if match and self._successful_login_enabled:
             player, ip = match.group(1), match.group(2)
             return ConnectionEvent(
                 timestamp=timestamp,
@@ -119,12 +122,15 @@ class MinecraftPlugin(BasePlugin):
                 threat_level=ThreatLevel.NONE,
                 risk_score=0,
                 raw_log_line=line,
-                details={"event_type": "login"},
+                details={
+                    "event_type": "login",
+                    "reset_risk": self._reset_risk_on_success,
+                },
             )
 
         # 2. GameProfile connection (some server versions)
         match = _RE_GAMEPROFILE_LOGIN.search(line)
-        if match:
+        if match and self._successful_login_enabled:
             player, ip = match.group(1), match.group(2)
             return ConnectionEvent(
                 timestamp=timestamp,
@@ -134,7 +140,10 @@ class MinecraftPlugin(BasePlugin):
                 threat_level=ThreatLevel.NONE,
                 risk_score=0,
                 raw_log_line=line,
-                details={"event_type": "login"},
+                details={
+                    "event_type": "login",
+                    "reset_risk": self._reset_risk_on_success,
+                },
             )
 
         # 3. IP connection loss (without nickname)
@@ -210,6 +219,8 @@ class MinecraftPlugin(BasePlugin):
         elif event_type == "ip_disconnect":
             score += 15  # Fast connect/disconnect = bot
         elif event_type == "login":
+            if self._reset_risk_on_success:
+                return 0
             score += 5   # Normal login = low risk
 
         # Fast connection attempts (botnet pattern)

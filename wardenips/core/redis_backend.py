@@ -178,14 +178,53 @@ class RedisDatabaseManager:
     # ── Queries ──
 
     async def get_event_count_by_ip(
-        self, ip_hash: str, minutes: int = 5
+        self,
+        ip_hash: str,
+        minutes: int = 5,
+        connection_type: str | None = None,
+        reset_on_success: bool = False,
+        success_event_types: list[str] | None = None,
     ) -> int:
         """Returns count of events for a hashed IP in the last N minutes."""
         cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).timestamp()
         now = datetime.utcnow().timestamp()
-        return await self._redis.zcount(
+        if not reset_on_success or not success_event_types:
+            return await self._redis.zcount(
+                self._key("ip_events", ip_hash), cutoff, now
+            )
+
+        event_ids = await self._redis.zrangebyscore(
             self._key("ip_events", ip_hash), cutoff, now
         )
+        filtered_events = []
+        for event_id in event_ids:
+            data = await self._redis.hgetall(self._key("event", str(event_id)))
+            if not data:
+                continue
+            if connection_type and data.get("connection_type") != connection_type:
+                continue
+            filtered_events.append(data)
+
+        reset_index = -1
+        for index, item in enumerate(filtered_events):
+            try:
+                details = json.loads(item.get("details") or "{}")
+            except Exception:
+                details = {}
+            if details.get("event_type") in success_event_types:
+                reset_index = index
+
+        start_index = reset_index + 1 if reset_index >= 0 else 0
+        count = 0
+        for item in filtered_events[start_index:]:
+            try:
+                details = json.loads(item.get("details") or "{}")
+            except Exception:
+                details = {}
+            if details.get("event_type") in success_event_types:
+                continue
+            count += 1
+        return count
 
     async def get_recent_events_by_ip(
         self, ip_hash: str, minutes: int = 5

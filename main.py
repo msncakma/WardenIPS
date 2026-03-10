@@ -274,13 +274,36 @@ class WardenIPS:
             # 3. Hash IP
             ip_hash = self._hasher.hash_ip(event.source_ip)
 
+            success_logging_enabled = bool(
+                self._config.get("successful_logins.enabled", True)
+            )
+            reset_risk_on_success = bool(
+                self._config.get("successful_logins.reset_risk_score", True)
+            )
+            success_event_type_map = {
+                "ssh": ["accepted_login"],
+                "minecraft": ["login"],
+            }
+            success_event_types = success_event_type_map.get(
+                event.connection_type.value,
+                [],
+            )
+            is_success_event = event.details.get("event_type") in success_event_types
+
+            if is_success_event and not success_logging_enabled:
+                return
+
             # 4. ASN lookup
             asn_result = self._asn_engine.lookup(event.source_ip)
 
             # 5. Query recent events count
             time_window = self._config.get("general.analysis_interval", 5)
             event_count = await self._db.get_event_count_by_ip(
-                ip_hash, minutes=time_window
+                ip_hash,
+                minutes=time_window,
+                connection_type=event.connection_type.value,
+                reset_on_success=reset_risk_on_success,
+                success_event_types=success_event_types,
             )
 
             # 6. Calculate risk score
@@ -291,8 +314,13 @@ class WardenIPS:
             }
             risk_score = await plugin.calculate_risk(event, context)
 
+            if is_success_event and reset_risk_on_success:
+                risk_score = 0
+
             # 7. Determine threat level
-            if risk_score >= 70:
+            if is_success_event and reset_risk_on_success:
+                threat = ThreatLevel.NONE
+            elif risk_score >= 70:
                 threat = ThreatLevel.HIGH
             elif risk_score >= 40:
                 threat = ThreatLevel.MEDIUM
@@ -317,6 +345,15 @@ class WardenIPS:
                 details=event.details,
             )
             await self._db.log_event(updated_event, ip_hash)
+
+            if is_success_event:
+                self._logger.info(
+                    "Successful login recorded: Plugin=%s User=%s IP=%s",
+                    plugin.name,
+                    event.player_name or "unknown",
+                    event.source_ip,
+                )
+                return
 
             # 9. Geofencing check
             if not await self._whitelist.is_country_allowed(

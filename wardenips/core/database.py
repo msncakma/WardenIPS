@@ -376,6 +376,9 @@ class DatabaseManager:
         self,
         ip_hash: str,
         minutes: int = 5,
+        connection_type: Optional[str] = None,
+        reset_on_success: bool = False,
+        success_event_types: Optional[List[str]] = None,
     ) -> int:
         """
         Returns the count of events for a given hashed IP in the last N minutes.
@@ -392,13 +395,41 @@ class DatabaseManager:
         ).isoformat()
 
         try:
-            async with self._db.execute(
+            effective_cutoff = cutoff
+            success_patterns = [
+                f'%"event_type": "{event_type}"%'
+                for event_type in (success_event_types or [])
+            ]
+
+            if reset_on_success and success_patterns:
+                latest_query = """
+                    SELECT MAX(timestamp) FROM connection_events
+                    WHERE ip_hash = ? AND timestamp >= ?
                 """
+                latest_params: list[Any] = [ip_hash, cutoff]
+                if connection_type:
+                    latest_query += " AND connection_type = ?"
+                    latest_params.append(connection_type)
+                latest_query += " AND (" + " OR ".join(["details LIKE ?"] * len(success_patterns)) + ")"
+                latest_params.extend(success_patterns)
+                async with self._db.execute(latest_query, latest_params) as latest_cursor:
+                    latest_row = await latest_cursor.fetchone()
+                    if latest_row and latest_row[0]:
+                        effective_cutoff = latest_row[0]
+
+            count_query = """
                 SELECT COUNT(*) FROM connection_events
                 WHERE ip_hash = ? AND timestamp >= ?
-                """,
-                (ip_hash, cutoff),
-            ) as cursor:
+            """
+            count_params: list[Any] = [ip_hash, effective_cutoff]
+            if connection_type:
+                count_query += " AND connection_type = ?"
+                count_params.append(connection_type)
+            if success_patterns:
+                count_query += " AND NOT (" + " OR ".join(["details LIKE ?"] * len(success_patterns)) + ")"
+                count_params.extend(success_patterns)
+
+            async with self._db.execute(count_query, count_params) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
         except Exception as exc:

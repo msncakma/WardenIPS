@@ -149,6 +149,39 @@ class ConfigManager:
         """Dictionary of raw configuration data."""
         return self._data.copy()
 
+    @property
+    def config_path(self) -> Optional[Path]:
+        """Path of the loaded configuration file."""
+        return self._config_path
+
+    async def save(self, data: Dict[str, Any]) -> None:
+        """Validate and persist configuration data."""
+        if not isinstance(data, dict):
+            raise WardenConfigError("Configuration payload must be a dictionary.")
+        if self._config_path is None:
+            raise WardenConfigError("Configuration path is not initialized.")
+
+        async with self._lock:
+            previous = self._data
+            self._data = data
+            try:
+                self._validate()
+                serialized = yaml.safe_dump(
+                    data,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+                async with aiofiles.open(
+                    str(self._config_path),
+                    mode="w",
+                    encoding="utf-8",
+                ) as config_file:
+                    await config_file.write(serialized)
+            except Exception:
+                self._data = previous
+                raise
+            logger.info("Configuration saved successfully: %s", self._config_path)
+
     # ── Internal Methods ──
 
     async def _read_config(self, path: Path) -> None:

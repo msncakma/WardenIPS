@@ -64,6 +64,10 @@ abuseipdb:
   api_key: ""
   rate_limit_per_minute: 10
 
+successful_logins:
+  enabled: true              # Log successful SSH and Minecraft sign-ins as normal events
+  reset_risk_score: true     # Reset recent risk buildup for an IP after a successful login
+
 dashboard:
   enabled: false
   host: "127.0.0.1"

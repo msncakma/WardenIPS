@@ -70,9 +70,12 @@ class SSHPlugin(BasePlugin):
     def __init__(self, config) -> None:
         super().__init__(config)
         plugin_conf = config.get_section("plugins").get("ssh", {})
+        success_conf = config.get_section("successful_logins") if config.get("successful_logins", None) else {}
         self._enabled = plugin_conf.get("enabled", True)
         self._max_failed = plugin_conf.get("max_failed_attempts", 5)
         self._time_window = plugin_conf.get("time_window", 300)
+        self._successful_login_enabled = bool(success_conf.get("enabled", True))
+        self._reset_risk_on_success = bool(success_conf.get("reset_risk_score", True))
 
     @property
     def name(self) -> str:
@@ -150,6 +153,25 @@ class SSHPlugin(BasePlugin):
                 details={"event_type": "connection_closed"},
             )
 
+        # 5. Successful authentication
+        if self._successful_login_enabled:
+            match = _RE_ACCEPTED_PASSWORD.search(line)
+            if match:
+                username, ip = match.group(1), match.group(2)
+                return ConnectionEvent(
+                    timestamp=timestamp,
+                    source_ip=ip,
+                    connection_type=ConnectionType.SSH,
+                    player_name=username,
+                    threat_level=ThreatLevel.NONE,
+                    risk_score=0,
+                    raw_log_line=line,
+                    details={
+                        "event_type": "accepted_login",
+                        "reset_risk": self._reset_risk_on_success,
+                    },
+                )
+
         # Bu satir SSH ile ilgili degil
         return None
 
@@ -177,6 +199,8 @@ class SSHPlugin(BasePlugin):
             score += 15
         elif event_type == "connection_closed":
             score += 5
+        elif event_type == "accepted_login":
+            return 0
 
         # Tekrar eden denemeler (esik ustu)
         # Her deneme 10 puan ekler, ancak sirf deneme sayisindan max 60 puan alinabilir.
