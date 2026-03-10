@@ -23,6 +23,9 @@ INSTALLED_AUTHOR=""
 INSTALL_MODE="install"
 PREVIOUS_SERVICE_ACTIVE="0"
 PREVIOUS_SERVICE_ENABLED="0"
+BOOTSTRAP_TOKEN=""
+BOOTSTRAP_TOKEN_HASH=""
+BOOTSTRAP_EXPIRES_AT=""
 
 TMP_DIR=""
 SOURCE_DIR=""
@@ -153,6 +156,31 @@ prepare_update() {
         log "Stopping active WardenIPS service before update..."
         systemctl stop wardenips
     fi
+}
+
+prepare_bootstrap_token() {
+    if [ "$INSTALL_MODE" = "update" ]; then
+        return
+    fi
+
+    BOOTSTRAP_TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
+
+    BOOTSTRAP_METADATA="$(python3 - "$BOOTSTRAP_TOKEN" <<'PY'
+from datetime import datetime, timedelta, timezone
+import hashlib
+import sys
+
+token = sys.argv[1]
+print(hashlib.sha256(token.encode("utf-8")).hexdigest())
+print((datetime.now(timezone.utc) + timedelta(hours=24)).replace(microsecond=0).isoformat().replace('+00:00', 'Z'))
+PY
+)"
+    BOOTSTRAP_TOKEN_HASH="$(printf '%s\n' "$BOOTSTRAP_METADATA" | sed -n '1p')"
+    BOOTSTRAP_EXPIRES_AT="$(printf '%s\n' "$BOOTSTRAP_METADATA" | sed -n '2p')"
 }
 
 deploy_files() {
@@ -382,6 +410,30 @@ path.write_text(text, encoding='utf-8')
 PY
         log "Enabled dashboard by default on 127.0.0.1:7680."
     fi
+
+    if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN_HASH" ]; then
+        python3 - "$INSTALL_DIR/config.yaml" "$BOOTSTRAP_TOKEN_HASH" "$BOOTSTRAP_EXPIRES_AT" <<'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+
+path = Path(sys.argv[1])
+token_hash = sys.argv[2]
+expires_at = sys.argv[3]
+data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+dashboard = data.setdefault('dashboard', {})
+bootstrap = dashboard.setdefault('bootstrap', {})
+bootstrap['setup_required'] = True
+bootstrap['token_hash'] = token_hash
+bootstrap['token_expires_at'] = expires_at
+dashboard['username'] = ''
+dashboard['password'] = ''
+path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding='utf-8')
+PY
+        log "Prepared first-boot bootstrap token for admin enrollment."
+    fi
 }
 
 configure_permissions() {
@@ -601,6 +653,7 @@ install_dependencies
 detect_source_dir
 detect_existing_install
 prepare_update
+prepare_bootstrap_token
 deploy_files "$SOURCE_DIR"
 load_app_metadata
 ensure_service_user
@@ -645,8 +698,17 @@ printf "%b\n" "    Service User   : ${CYAN}$SERVICE_USER${NC}"
 printf "%b\n" "    Service State  : ${CYAN}$SERVICE_STATE_SUMMARY${NC}"
 if [ "$INSTALL_MODE" = "update" ]; then
     printf "%b\n" "    Config Merge   : ${CYAN}Existing config preserved, missing template keys merged automatically${NC}"
+else
+    printf "%b\n" "    Bootstrap Flow : ${CYAN}First-boot setup required before /admin can be used${NC}"
 fi
 printf "\n"
+if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN" ]; then
+    printf "%b\n" "  ${YELLOW}First-Boot Bootstrap${NC}"
+    printf "%b\n" "    Setup URL      : ${CYAN}http://127.0.0.1:7680/setup${NC}"
+    printf "%b\n" "    Bootstrap Token: ${CYAN}$BOOTSTRAP_TOKEN${NC}"
+    printf "%b\n" "    Expires At     : ${CYAN}$BOOTSTRAP_EXPIRES_AT${NC}"
+    printf "\n"
+fi
 printf "%b\n" "  ${YELLOW}Recommended Next Steps${NC}"
 printf "%b\n" "    1. Review ${CYAN}$INSTALL_DIR/config.yaml${NC}"
 printf "%b\n" "    2. Update whitelist.ips with your trusted addresses"

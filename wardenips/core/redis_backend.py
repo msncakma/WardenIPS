@@ -269,6 +269,74 @@ class RedisDatabaseManager:
             "db_path": "redis",
         }
 
+    async def has_admin_users(self) -> bool:
+        return int(await self._redis.scard(self._key("admin_users"))) > 0
+
+    async def get_admin_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        data = await self._redis.hgetall(self._key("admin_user", username))
+        if not data or data.get("is_active") != "1":
+            return None
+        data["id"] = int(data.get("id", 0) or 0)
+        data["totp_enabled"] = int(data.get("totp_enabled", 0) or 0)
+        data["is_active"] = int(data.get("is_active", 0) or 0)
+        return data
+
+    async def create_admin_user(
+        self,
+        username: str,
+        password_hash: str,
+        totp_secret: str,
+        totp_enabled: bool = True,
+    ) -> int:
+        user_id = await self._redis.incr(self._key("admin_user_id_seq"))
+        now = datetime.utcnow().isoformat()
+        payload = {
+            "id": user_id,
+            "username": username,
+            "password_hash": password_hash,
+            "totp_secret": totp_secret,
+            "totp_enabled": 1 if totp_enabled else 0,
+            "is_active": 1,
+            "created_at": now,
+            "updated_at": now,
+            "last_login_at": "",
+            "last_login_ip": "",
+        }
+        pipe = self._redis.pipeline()
+        pipe.hset(self._key("admin_user", username), mapping=payload)
+        pipe.sadd(self._key("admin_users"), username)
+        await pipe.execute()
+        return int(user_id)
+
+    async def record_admin_login(self, username: str, client_ip: str) -> None:
+        now = datetime.utcnow().isoformat()
+        await self._redis.hset(
+            self._key("admin_user", username),
+            mapping={"last_login_at": now, "last_login_ip": client_ip, "updated_at": now},
+        )
+
+    async def log_audit_event(
+        self,
+        action: str,
+        actor_username: Optional[str] = None,
+        target: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        audit_id = await self._redis.incr(self._key("audit_id_seq"))
+        payload = {
+            "id": audit_id,
+            "actor_username": actor_username or "",
+            "action": action,
+            "target": target or "",
+            "ip_address": ip_address or "",
+            "details_json": json.dumps(details or {}, ensure_ascii=False),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        await self._redis.hset(self._key("audit", str(audit_id)), mapping=payload)
+        await self._redis.zadd(self._key("audit_log"), {str(audit_id): time.time()})
+        return int(audit_id)
+
     async def close(self) -> None:
         """Close the Redis connection."""
         if self._redis:

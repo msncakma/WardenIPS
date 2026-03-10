@@ -36,7 +36,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -87,6 +87,37 @@ CREATE INDEX IF NOT EXISTS idx_bans_ip_hash
 
 CREATE INDEX IF NOT EXISTS idx_bans_active
     ON ban_history(is_active);
+
+-- Admin users table
+CREATE TABLE IF NOT EXISTS admin_users (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    username        TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL,
+    totp_secret     TEXT,
+    totp_enabled    INTEGER NOT NULL DEFAULT 0,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_login_at   TEXT,
+    last_login_ip   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_users_active
+    ON admin_users(is_active);
+
+-- Audit log for operator actions
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_username  TEXT,
+    action          TEXT NOT NULL,
+    target          TEXT,
+    ip_address      TEXT,
+    details_json    TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created_at
+    ON audit_log(created_at);
 
 -- Schema version table (for migrations)
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -207,6 +238,10 @@ class DatabaseManager:
                             "Mevcut: %d, Beklenen: %d. "
                             "Migration gerekebilir.",
                             current, _SCHEMA_VERSION,
+                        )
+                        await self._db.execute(
+                            "UPDATE schema_version SET version = ?",
+                            (_SCHEMA_VERSION,),
                         )
 
     # ── Olay Kaydi ──
@@ -582,6 +617,86 @@ class DatabaseManager:
                 raise WardenDatabaseError(
                     f"Failed to deactivate ban record: {exc}"
                 ) from exc
+
+    # ── Admin Auth and Audit ──
+
+    async def has_admin_users(self) -> bool:
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM admin_users WHERE is_active = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return bool(row and row[0] > 0)
+
+    async def get_admin_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        async with self._db.execute(
+            """
+            SELECT id, username, password_hash, totp_secret, totp_enabled,
+                   is_active, created_at, updated_at, last_login_at, last_login_ip
+            FROM admin_users
+            WHERE username = ? AND is_active = 1
+            LIMIT 1
+            """,
+            (username,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    async def create_admin_user(
+        self,
+        username: str,
+        password_hash: str,
+        totp_secret: str,
+        totp_enabled: bool = True,
+    ) -> int:
+        async with self._lock:
+            async with self._db.execute(
+                """
+                INSERT INTO admin_users
+                    (username, password_hash, totp_secret, totp_enabled, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+                """,
+                (username, password_hash, totp_secret, 1 if totp_enabled else 0),
+            ) as cursor:
+                await self._db.commit()
+                return cursor.lastrowid
+
+    async def record_admin_login(self, username: str, client_ip: str) -> None:
+        async with self._lock:
+            await self._db.execute(
+                """
+                UPDATE admin_users
+                SET last_login_at = datetime('now'),
+                    last_login_ip = ?,
+                    updated_at = datetime('now')
+                WHERE username = ?
+                """,
+                (client_ip, username),
+            )
+            await self._db.commit()
+
+    async def log_audit_event(
+        self,
+        action: str,
+        actor_username: Optional[str] = None,
+        target: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        async with self._lock:
+            details_json = json.dumps(details, ensure_ascii=False) if details else None
+            async with self._db.execute(
+                """
+                INSERT INTO audit_log
+                    (actor_username, action, target, ip_address, details_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (actor_username, action, target, ip_address, details_json),
+            ) as cursor:
+                await self._db.commit()
+                return cursor.lastrowid
 
     # ── Resource Management ──
 

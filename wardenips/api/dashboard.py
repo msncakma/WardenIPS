@@ -38,6 +38,7 @@ import os
 import secrets
 import sys
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote, urlencode
 
@@ -45,6 +46,16 @@ from aiohttp import web
 import yaml
 
 from wardenips import __author__, __version__
+from wardenips.core.auth import (
+  build_totp_qr_data_url,
+  build_totp_uri,
+  check_password_policy,
+  generate_totp_secret,
+  hash_password,
+  verify_bootstrap_token,
+  verify_password,
+  verify_totp_code,
+)
 from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.logger import get_logger
 from wardenips.core.updater import UpdateChecker
@@ -86,9 +97,15 @@ class DashboardAPI:
     self._homepage: str = "dashboard"
     self._session_cookie_name: str = "wardenips_dashboard_session"
     self._sessions: dict[str, float] = {}
+    self._session_users: dict[str, str] = {}
+    self._pending_logins: dict[str, dict[str, object]] = {}
+    self._pending_setups: dict[str, dict[str, object]] = {}
     self._login_attempts: dict[str, list[float]] = {}
     self._activity_touches: dict[str, list[float]] = {}
     self._activity_touch_interval_seconds: int = 15
+    self._bootstrap_setup_required: bool = False
+    self._bootstrap_token_hash: str = ""
+    self._bootstrap_token_expires_at: str = ""
     self._ip_hasher = IPHasher.from_config(config)
     self._initialize_config()
 
@@ -110,6 +127,10 @@ class DashboardAPI:
     self._public_dashboard_enabled = bool(dash.get("public_dashboard", True))
     homepage = str(dash.get("homepage", "dashboard")).strip().lower()
     self._homepage = homepage if homepage in {"dashboard", "login", "admin"} else "dashboard"
+    bootstrap = dash.get("bootstrap", {}) if isinstance(dash.get("bootstrap", {}), dict) else {}
+    self._bootstrap_setup_required = bool(bootstrap.get("setup_required", False))
+    self._bootstrap_token_hash = str(bootstrap.get("token_hash", "") or "").strip()
+    self._bootstrap_token_expires_at = str(bootstrap.get("token_expires_at", "") or "").strip()
 
   @property
   def enabled(self) -> bool:
@@ -121,6 +142,31 @@ class DashboardAPI:
   def _dashboard_auth_configured(self) -> bool:
     return bool(self._get_dashboard_secrets())
 
+  def _bootstrap_token_is_valid(self) -> bool:
+    if not self._bootstrap_setup_required or not self._bootstrap_token_hash:
+      return False
+    if not self._bootstrap_token_expires_at:
+      return True
+    try:
+      expires_at = datetime.fromisoformat(self._bootstrap_token_expires_at.replace("Z", "+00:00"))
+      return expires_at > datetime.now(timezone.utc)
+    except Exception:
+      return False
+
+  async def _admin_auth_available(self) -> bool:
+    try:
+      if await self._db.has_admin_users():
+        return True
+    except Exception:
+      pass
+    return self._dashboard_auth_configured()
+
+  async def _use_database_auth(self) -> bool:
+    try:
+      return await self._db.has_admin_users()
+    except Exception:
+      return False
+
   def _get_session_token(self, request: web.Request) -> str:
     return request.cookies.get(self._session_cookie_name, "")
 
@@ -129,6 +175,15 @@ class DashboardAPI:
     expired = [token for token, expires_at in self._sessions.items() if expires_at <= now]
     for token in expired:
       self._sessions.pop(token, None)
+      self._session_users.pop(token, None)
+
+    expired_pending_login = [token for token, payload in self._pending_logins.items() if float(payload.get("expires_at", 0)) <= now]
+    for token in expired_pending_login:
+      self._pending_logins.pop(token, None)
+
+    expired_pending_setup = [token for token, payload in self._pending_setups.items() if float(payload.get("expires_at", 0)) <= now]
+    for token in expired_pending_setup:
+      self._pending_setups.pop(token, None)
 
   def _client_ip(self, request: web.Request) -> str:
     forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
@@ -173,6 +228,10 @@ class DashboardAPI:
       return False
     self._sessions[token] = time.time() + self._session_ttl
     return True
+
+  def _get_session_actor(self, request: web.Request) -> Optional[str]:
+    token = self._get_session_token(request)
+    return self._session_users.get(token)
 
   def _password_matches(self, candidate: str) -> bool:
     return any(
@@ -233,17 +292,28 @@ class DashboardAPI:
     return None
 
   def _json_auth_error(self) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      return web.json_response(
+        {
+          "error": "setup_required",
+          "message": "Initial admin setup is required before /admin can be used.",
+          "redirect_to": "/setup",
+        },
+        status=403,
+      )
     if not self._dashboard_auth_configured():
       return web.json_response(
         {
           "error": "auth_not_configured",
-          "message": "Configure dashboard.password or dashboard.api_key before using the dashboard.",
+          "message": "No admin user exists yet. Complete the first-boot setup or configure a legacy fallback secret.",
         },
         status=503,
       )
     return web.json_response({"error": "unauthorized"}, status=401)
 
   def _require_dashboard_auth(self, request: web.Request) -> Optional[web.Response]:
+    if self._bootstrap_token_is_valid():
+      raise web.HTTPFound("/setup")
     if self._is_session_authenticated(request):
       return None
     next_path = quote(
@@ -252,9 +322,11 @@ class DashboardAPI:
     )
     raise web.HTTPFound(f"/login?next={next_path}")
 
-  def _issue_session(self, response: web.StreamResponse, request: web.Request) -> None:
+  def _issue_session(self, response: web.StreamResponse, request: web.Request, username: Optional[str] = None) -> None:
     token = secrets.token_urlsafe(32)
     self._sessions[token] = time.time() + self._session_ttl
+    if username:
+      self._session_users[token] = username
     response.set_cookie(
       self._session_cookie_name,
       token,
@@ -269,7 +341,37 @@ class DashboardAPI:
     token = self._get_session_token(request)
     if token:
       self._sessions.pop(token, None)
+      self._session_users.pop(token, None)
     response.del_cookie(self._session_cookie_name, path="/")
+
+  async def _clear_bootstrap_config(self) -> None:
+    config_data = copy.deepcopy(self._config.raw)
+    dashboard = config_data.setdefault("dashboard", {})
+    bootstrap = dashboard.setdefault("bootstrap", {})
+    bootstrap["setup_required"] = False
+    bootstrap["token_hash"] = ""
+    bootstrap["token_expires_at"] = ""
+    await self._config.save(config_data)
+    self._initialize_config()
+
+  async def _log_audit(
+    self,
+    request: web.Request,
+    action: str,
+    actor_username: Optional[str] = None,
+    target: Optional[str] = None,
+    details: Optional[dict] = None,
+  ) -> None:
+    try:
+      await self._db.log_audit_event(
+        action=action,
+        actor_username=actor_username or self._get_session_actor(request),
+        target=target,
+        ip_address=self._client_ip(request),
+        details=details,
+      )
+    except Exception as exc:
+      logger.debug("Audit logging failed for %s: %s", action, exc)
 
   async def start(self) -> None:
     if not self.enabled:
@@ -281,7 +383,11 @@ class DashboardAPI:
     self._app.router.add_get("/admin", self._handle_dashboard_v2)
     self._app.router.add_get("/v2", self._handle_dashboard_v2)
     self._app.router.add_get("/login", self._handle_login_page)
+    self._app.router.add_get("/setup", self._handle_setup_page)
     self._app.router.add_post("/api/login", self._handle_login)
+    self._app.router.add_post("/api/login/totp", self._handle_login_totp)
+    self._app.router.add_post("/api/setup/begin", self._handle_setup_begin)
+    self._app.router.add_post("/api/setup/complete", self._handle_setup_complete)
     self._app.router.add_post("/api/logout", self._handle_logout)
     self._app.router.add_post("/api/session/activity", self._handle_session_activity)
     self._app.router.add_get("/logout", self._handle_logout)
@@ -537,15 +643,20 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_login_page(self, request: web.Request) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      raise web.HTTPFound("/setup")
     next_path = self._normalize_next_path(
       request.query.get("next", "/dashboard"),
       "/dashboard",
     )
     if self._is_session_authenticated(request):
       raise web.HTTPFound(next_path)
+    auth_ready = await self._admin_auth_available()
+    using_database_auth = await self._use_database_auth()
     html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
     html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
-    html = html.replace("__AUTH_READY__", "true" if self._dashboard_auth_configured() else "false")
+    html = html.replace("__AUTH_READY__", "true" if auth_ready else "false")
+    html = html.replace("__DB_AUTH__", "true" if using_database_auth else "false")
     html = html.replace(
       "__PUBLIC_DASHBOARD_ENABLED__",
       "true" if self._public_dashboard_enabled else "false",
@@ -553,13 +664,25 @@ class DashboardAPI:
     html = html.replace(
       "__SETUP_MESSAGE__",
       json.dumps(
-        "Configure dashboard.password or dashboard.api_key in config.yaml and restart WardenIPS before using /admin."
+        "No admin user exists yet. Complete the first-boot setup or configure a legacy fallback secret."
       ),
     )
     html = self._render_ui_template(html)
     return web.Response(text=html, content_type="text/html")
 
+  async def _handle_setup_page(self, request: web.Request) -> web.Response:
+    if not self._bootstrap_token_is_valid():
+      raise web.HTTPFound("/login")
+    html = SETUP_HTML.replace("__SETUP_EXPIRY__", json.dumps(self._bootstrap_token_expires_at or "24 hours"))
+    html = self._render_ui_template(html)
+    return web.Response(text=html, content_type="text/html")
+
   async def _handle_login(self, request: web.Request) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      return web.json_response(
+        {"error": "setup_required", "message": "Initial setup must be completed before login.", "redirect_to": "/setup"},
+        status=403,
+      )
     client_ip = self._client_ip(request)
     if self._consume_rate_limit(
       self._login_attempts,
@@ -583,19 +706,146 @@ class DashboardAPI:
       str(payload.get("next", "/dashboard")).strip() or "/dashboard",
       "/dashboard",
     )
-    if not self._dashboard_auth_configured():
+    use_database_auth = await self._use_database_auth()
+    if not await self._admin_auth_available():
       return self._json_auth_error()
+    if use_database_auth:
+      user = await self._db.get_admin_user_by_username(username)
+      if not user or not verify_password(str(user.get("password_hash", "")), password):
+        await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "invalid_credentials"})
+        return web.json_response(
+          {"error": "invalid_credentials", "message": "Invalid username or password."},
+          status=401,
+        )
+      if int(user.get("totp_enabled", 0)):
+        pending_token = secrets.token_urlsafe(24)
+        self._pending_logins[pending_token] = {
+          "username": user["username"],
+          "next_path": next_path,
+          "expires_at": time.time() + 300,
+        }
+        return web.json_response({"ok": True, "requires_totp": True, "pending_token": pending_token})
+
+      response = web.json_response({"ok": True, "redirect_to": next_path})
+      self._issue_session(response, request, username=user["username"])
+      await self._db.record_admin_login(user["username"], client_ip)
+      await self._log_audit(request, "auth.login_success", actor_username=user["username"], details={"method": "password_only"})
+      return response
+
     if username != self._dashboard_username or not self._password_matches(password):
+      await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "legacy_invalid_credentials"})
       return web.json_response(
         {"error": "invalid_credentials", "message": "Invalid username or password."},
         status=401,
       )
 
     response = web.json_response({"ok": True, "redirect_to": next_path})
-    self._issue_session(response, request)
+    self._issue_session(response, request, username=username or self._dashboard_username)
+    await self._log_audit(request, "auth.login_success", actor_username=username or self._dashboard_username, details={"method": "legacy_fallback"})
+    return response
+
+  async def _handle_login_totp(self, request: web.Request) -> web.Response:
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    pending_token = str(payload.get("pending_token", "")).strip()
+    code = str(payload.get("totp_code", "")).strip()
+    pending = self._pending_logins.get(pending_token)
+    if not pending or float(pending.get("expires_at", 0)) <= time.time():
+      self._pending_logins.pop(pending_token, None)
+      return web.json_response({"error": "pending_auth_expired", "message": "The login challenge expired. Start again."}, status=401)
+    username = str(pending.get("username", ""))
+    user = await self._db.get_admin_user_by_username(username)
+    if not user or not verify_totp_code(str(user.get("totp_secret", "")), code):
+      await self._log_audit(request, "auth.totp_failed", actor_username=username, details={"reason": "invalid_totp"})
+      return web.json_response({"error": "invalid_totp", "message": "Invalid TOTP code."}, status=401)
+
+    self._pending_logins.pop(pending_token, None)
+    response = web.json_response({"ok": True, "redirect_to": pending.get("next_path") or "/admin"})
+    self._issue_session(response, request, username=username)
+    await self._db.record_admin_login(username, self._client_ip(request))
+    await self._log_audit(request, "auth.login_success", actor_username=username, details={"method": "password_totp"})
+    return response
+
+  async def _handle_setup_begin(self, request: web.Request) -> web.Response:
+    if not self._bootstrap_token_is_valid():
+      return web.json_response({"error": "setup_unavailable", "message": "First-boot setup is not available anymore."}, status=403)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    bootstrap_token = str(payload.get("bootstrap_token", "")).strip()
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    password_confirm = str(payload.get("password_confirm", ""))
+    if not verify_bootstrap_token(self._bootstrap_token_hash, bootstrap_token):
+      await self._log_audit(request, "setup.begin_failed", actor_username=username or None, details={"reason": "invalid_bootstrap"})
+      return web.json_response({"error": "invalid_bootstrap", "message": "Invalid bootstrap token."}, status=401)
+    if not username or username.lower() == "admin":
+      return web.json_response({"error": "invalid_username", "message": "Choose a non-default admin username."}, status=400)
+    if password != password_confirm:
+      return web.json_response({"error": "password_mismatch", "message": "Passwords do not match."}, status=400)
+    is_valid, policy_message = check_password_policy(password)
+    if not is_valid:
+      return web.json_response({"error": "weak_password", "message": policy_message}, status=400)
+    if await self._db.has_admin_users():
+      return web.json_response({"error": "setup_completed", "message": "An admin user already exists."}, status=409)
+
+    pending_token = secrets.token_urlsafe(24)
+    totp_secret = generate_totp_secret()
+    totp_uri = build_totp_uri(username, totp_secret)
+    self._pending_setups[pending_token] = {
+      "username": username,
+      "password_hash": hash_password(password),
+      "totp_secret": totp_secret,
+      "expires_at": time.time() + 900,
+    }
+    await self._log_audit(request, "setup.begin_success", actor_username=username, details={"totp": True})
+    return web.json_response({
+      "ok": True,
+      "pending_setup_token": pending_token,
+      "totp_secret": totp_secret,
+      "totp_uri": totp_uri,
+      "totp_qr_data_url": build_totp_qr_data_url(totp_uri),
+    })
+
+  async def _handle_setup_complete(self, request: web.Request) -> web.Response:
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    pending_token = str(payload.get("pending_setup_token", "")).strip()
+    totp_code = str(payload.get("totp_code", "")).strip()
+    pending = self._pending_setups.get(pending_token)
+    if not pending or float(pending.get("expires_at", 0)) <= time.time():
+      self._pending_setups.pop(pending_token, None)
+      return web.json_response({"error": "setup_expired", "message": "Setup session expired. Start again."}, status=401)
+    if not verify_totp_code(str(pending.get("totp_secret", "")), totp_code):
+      await self._log_audit(request, "setup.complete_failed", actor_username=str(pending.get("username", "")), details={"reason": "invalid_totp"})
+      return web.json_response({"error": "invalid_totp", "message": "Invalid TOTP code."}, status=401)
+    if await self._db.has_admin_users():
+      self._pending_setups.pop(pending_token, None)
+      return web.json_response({"error": "setup_completed", "message": "An admin user already exists."}, status=409)
+
+    username = str(pending.get("username", ""))
+    await self._db.create_admin_user(
+      username=username,
+      password_hash=str(pending.get("password_hash", "")),
+      totp_secret=str(pending.get("totp_secret", "")),
+      totp_enabled=True,
+    )
+    self._pending_setups.pop(pending_token, None)
+    await self._clear_bootstrap_config()
+    response = web.json_response({"ok": True, "redirect_to": "/admin", "message": "Initial admin setup completed."})
+    self._issue_session(response, request, username=username)
+    await self._db.record_admin_login(username, self._client_ip(request))
+    await self._log_audit(request, "setup.complete_success", actor_username=username, details={"totp": True})
     return response
 
   async def _handle_root(self, request: web.Request) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      raise web.HTTPFound("/setup")
     if self._homepage == "login":
       raise web.HTTPFound("/login")
     if self._homepage == "admin":
@@ -632,12 +882,14 @@ class DashboardAPI:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     payload = await request.json()
     ip_value = str(payload.get("ip", "")).strip()
     if not ip_value:
       return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
     firewall_result = await self._firewall.unban_ip(ip_value)
     deactivated = await self._db.deactivate_ban_by_hash(self._ip_hasher.hash_ip(ip_value))
+    await self._log_audit(request, "admin.unban_ip", actor_username=actor, details={"ip": ip_value, "firewall_result": firewall_result, "deactivated_records": deactivated})
     return web.json_response(
       {
         "ok": firewall_result,
@@ -650,6 +902,7 @@ class DashboardAPI:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     payload = await request.json()
     ip_hash = str(payload.get("ip_hash", "")).strip()
     if not ip_hash:
@@ -658,41 +911,51 @@ class DashboardAPI:
         status=400,
       )
     updated = await self._db.deactivate_ban_by_hash(ip_hash)
+    await self._log_audit(request, "admin.deactivate_ban", actor_username=actor, details={"ip_hash": ip_hash, "updated": updated})
     return web.json_response({"ok": True, "updated": updated})
 
   async def _handle_admin_deactivate_all_bans(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     updated = await self._db.deactivate_all_bans()
+    await self._log_audit(request, "admin.deactivate_all_bans", actor_username=actor, details={"updated": updated})
     return web.json_response({"ok": True, "updated": updated})
 
   async def _handle_admin_flush_firewall(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     flushed = await self._firewall.flush()
     updated = await self._db.deactivate_all_bans()
+    await self._log_audit(request, "admin.flush_firewall", actor_username=actor, details={"flushed": flushed, "deactivated_records": updated})
     return web.json_response({"ok": flushed, "deactivated_records": updated})
 
   async def _handle_admin_clear_events(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     deleted = await self._db.clear_events()
+    await self._log_audit(request, "admin.clear_events", actor_username=actor, details={"deleted": deleted})
     return web.json_response({"ok": True, "deleted": deleted})
 
   async def _handle_admin_clear_ban_history(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     deleted = await self._db.clear_ban_history()
+    await self._log_audit(request, "admin.clear_ban_history", actor_username=actor, details={"deleted": deleted})
     return web.json_response({"ok": True, "deleted": deleted})
 
   async def _handle_admin_test_notification(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     if not self._notifier:
       return web.json_response(
         {"error": "notifications_unavailable", "message": "Notification manager is not available."},
@@ -710,6 +973,7 @@ class DashboardAPI:
     except RuntimeError as exc:
       return web.json_response({"error": "notification_unavailable", "message": str(exc)}, status=503)
     summary = ", ".join(f"{name}: {status}" for name, status in result["results"].items())
+    await self._log_audit(request, "admin.test_notification", actor_username=actor, details={"channel": channel, "results": result.get("results", {})})
     return web.json_response({"ok": True, "message": f"Test notification dispatched ({summary}).", **result})
 
   async def _handle_admin_update_status(self, request: web.Request) -> web.Response:
@@ -747,6 +1011,7 @@ class DashboardAPI:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     try:
       payload = await request.json()
     except Exception:
@@ -766,6 +1031,7 @@ class DashboardAPI:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()
     self._ip_hasher = IPHasher.from_config(self._config)
+    await self._log_audit(request, "admin.save_config", actor_username=actor, details={"mode": "yaml", "bytes": len(yaml_text)})
     return web.json_response(
       {
         "ok": True,
@@ -779,6 +1045,7 @@ class DashboardAPI:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    actor = self._get_session_actor(request)
     try:
       payload = await request.json()
     except Exception:
@@ -795,6 +1062,7 @@ class DashboardAPI:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()
     self._ip_hasher = IPHasher.from_config(self._config)
+    await self._log_audit(request, "admin.patch_config", actor_username=actor, details={"changes": sorted(str(key) for key in changes.keys())})
     return web.json_response(
       {
         "ok": True,
@@ -846,7 +1114,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 :root{--bg:#110f18;--bg2:#1d1730;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--yellow:#ffbe5c;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
 body{min-height:100vh;display:grid;place-items:center;font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);padding:20px;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 85% 12%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 16%,transparent) 0%,transparent 28%);pointer-events:none}
-.shell{width:min(100%,1100px);display:grid;grid-template-columns:1.15fr .85fr;gap:20px;align-items:stretch}
+.shell{width:min(100%,1120px);display:grid;grid-template-columns:1.1fr .9fr;gap:20px;align-items:stretch}
 .info-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:24px;padding:28px;box-shadow:var(--shadow);position:relative;overflow:hidden}
 .eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);color:var(--blue);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
 h1{font-size:2rem;letter-spacing:-.04em;margin-bottom:8px}
@@ -864,6 +1132,7 @@ input{width:100%;background:var(--surface2);border:1px solid var(--b);color:var(
 input:focus{border-color:var(--blue);box-shadow:0 0 0 4px color-mix(in srgb,var(--blue) 18%,transparent)}
 .row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
 button{appearance:none;border:0;background:linear-gradient(135deg,var(--accent),#ff6f61);color:white;padding:13px 16px;border-radius:14px;font-size:.95rem;font-weight:800;cursor:pointer;min-width:150px}
+button.secondary{background:var(--surface2);border:1px solid var(--b);color:var(--txt)}
 a.button-link{display:inline-flex;align-items:center;justify-content:center;background:var(--surface2);border:1px solid var(--b);color:var(--txt);padding:13px 16px;border-radius:14px;font-size:.92rem;font-weight:700;text-decoration:none;min-width:180px}
 button[disabled]{opacity:.65;cursor:wait}
 .hint{font-size:.78rem;color:var(--muted)}
@@ -876,24 +1145,29 @@ button[disabled]{opacity:.65;cursor:wait}
 .aux-links{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
 .aux-links a{color:var(--blue);text-decoration:none;font-size:.82rem}
 .aux-links a:hover{text-decoration:underline}
+.panel{display:none}
+.panel.active{display:block}
+.stack{display:grid;gap:12px}
+.code-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}
+.code-grid input{text-align:center;font-size:1.05rem;font-weight:800;padding:12px 0}
 @media(max-width:900px){.shell{grid-template-columns:1fr}.info-card{order:2}.card{order:1}}
-@media(max-width:640px){.row,.secondary-actions{flex-direction:column;align-items:stretch}button,a.button-link{width:100%}.foot{flex-direction:column}}
+@media(max-width:640px){.row,.secondary-actions{flex-direction:column;align-items:stretch}button,a.button-link{width:100%}.foot{flex-direction:column}.code-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 </style>
 </head>
 <body>
 <div class="shell">
   <div class="info-card">
     <div class="eyebrow">Admin Access</div>
-    <h1>Operational access without dashboard noise.</h1>
-    <p class="lead">Sign in only when you need mutating actions. The public dashboard stays readable, while admin stays focused on control, cleanup, and verification.</p>
+    <h1>Operational access with a tighter boundary.</h1>
+    <p class="lead">Admin sessions are separated from the public dashboard and can require a second factor when database-backed accounts are enabled.</p>
     <div class="feature-list">
       <div class="feature"><strong>Scoped operations</strong><span>Firewall changes, ban maintenance, notification tests, and configuration editing stay behind the session boundary.</span></div>
-      <div class="feature"><strong>Timed session model</strong><span>Idle admin sessions expire automatically so the panel is not left open indefinitely.</span></div>
-      <div class="feature"><strong>Same visual language</strong><span>The login page uses the same restrained layout and palette as the admin console.</span></div>
+      <div class="feature"><strong>Two-stage login</strong><span>Password verification can hand off to a TOTP challenge without exposing privileged routes.</span></div>
+      <div class="feature"><strong>Legacy fallback</strong><span>Existing installs can continue using config-based credentials until they migrate to managed admin users.</span></div>
     </div>
     <div class="quick-meta">
       <span>Route: /admin</span>
-      <span>Fallback: API key compatible</span>
+      <span>Auth mode: password + optional TOTP</span>
       <span>Session: 10m idle timeout</span>
     </div>
     <div class="aux-links">
@@ -903,28 +1177,45 @@ button[disabled]{opacity:.65;cursor:wait}
     </div>
   </div>
   <div class="card">
-    <div class="eyebrow">Sign In</div>
-    <h1>Sign in to WardenIPS</h1>
-    <p id="intro">Use the configured dashboard username and password. If no dedicated password is set, the API key still works as a compatibility fallback.</p>
-    <form id="loginForm">
-      <div class="field">
-        <label for="username">Username</label>
-        <input id="username" name="username" type="text" autocomplete="username" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password">
-      </div>
-      <div class="row">
-        <div class="hint" id="hint">Input changes are throttled and login attempts are rate-limited.</div>
-        <button id="submitBtn" type="submit">Sign In</button>
-      </div>
-      <div id="message" class="msg"></div>
-    </form>
+    <div id="passwordPanel" class="panel active">
+      <div class="eyebrow">Sign In</div>
+      <h1>Sign in to WardenIPS</h1>
+      <p id="intro">Use your admin username and password. Managed admin users can require TOTP after the password step.</p>
+      <form id="loginForm">
+        <div class="field">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" autocomplete="username" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password">
+        </div>
+        <div class="row">
+          <div class="hint" id="hint">Input changes are throttled and login attempts are rate-limited.</div>
+          <button id="submitBtn" type="submit">Continue</button>
+        </div>
+      </form>
+    </div>
+    <div id="totpPanel" class="panel">
+      <div class="eyebrow">Second Factor</div>
+      <h1>Enter your authenticator code</h1>
+      <p>Use the 6-digit code from your TOTP app to complete the login.</p>
+      <form id="totpForm" class="stack">
+        <div class="field">
+          <label for="totpCode">Authenticator Code</label>
+          <input id="totpCode" name="totpCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456">
+        </div>
+        <div class="row">
+          <button id="totpSubmitBtn" type="submit">Verify</button>
+          <button id="backBtn" class="secondary" type="button">Back</button>
+        </div>
+      </form>
+    </div>
+    <div id="message" class="msg"></div>
     <div id="guestActions" class="secondary-actions">
       <a class="button-link" href="/dashboard">View Dashboard Without Login</a>
     </div>
-    <div class="foot"><span>Default username: <span id="defaultUser"></span></span><span>WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__</span></div>
+    <div class="foot"><span>Default username: <span id="defaultUser"></span></span><span id="modeHint">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__</span></div>
   </div>
 </div>
 <script>
@@ -933,17 +1224,21 @@ button[disabled]{opacity:.65;cursor:wait}
 var nextPath = __NEXT_PATH__;
 var defaultUser = __USERNAME__;
 var authReady = __AUTH_READY__;
+var usingDbAuth = __DB_AUTH__;
 var publicDashboardEnabled = __PUBLIC_DASHBOARD_ENABLED__;
 var setupMessage = __SETUP_MESSAGE__;
 var typingTimer = null;
 var submitLocked = false;
+var pendingToken = '';
 function $(s){return document.querySelector(s)}
 function showMessage(kind, text){ var box = $('#message'); box.className = 'msg ' + kind; box.textContent = text; }
 function clearMessage(){ var box = $('#message'); box.className = 'msg'; box.textContent = ''; }
 function rateLimitedInput(handler, wait){ return function(ev){ clearTimeout(typingTimer); typingTimer = setTimeout(function(){ handler(ev); }, wait); }; }
+function setPanel(name){ ['passwordPanel','totpPanel'].forEach(function(id){ $('#'+id).classList.toggle('active', id === name); }); }
 
 $('#defaultUser').textContent = defaultUser || 'admin';
 $('#username').value = defaultUser || 'admin';
+$('#modeHint').textContent = usingDbAuth ? 'Managed admin users are enabled.' : 'Legacy config credential fallback is active.';
 if(!publicDashboardEnabled){ $('#guestActions').hidden = true; }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message');
 if(flashMessage){
@@ -958,8 +1253,10 @@ if(!authReady){
   $('#intro').textContent = setupMessage;
   showMessage('err', setupMessage);
 }
-['username','password'].forEach(function(id){
-  $('#'+id).addEventListener('input', rateLimitedInput(function(){
+['username','password','totpCode'].forEach(function(id){
+  var field = $('#'+id);
+  if(!field){ return; }
+  field.addEventListener('input', rateLimitedInput(function(){
     $('#hint').textContent = 'Ready to submit';
     clearMessage();
   }, 250));
@@ -967,11 +1264,10 @@ if(!authReady){
 
 $('#loginForm').addEventListener('submit', async function(ev){
   ev.preventDefault();
-  if(!authReady){ return; }
-  if(submitLocked){ return; }
+  if(!authReady || submitLocked){ return; }
   submitLocked = true;
   $('#submitBtn').disabled = true;
-  $('#hint').textContent = 'Submitting login request';
+  $('#hint').textContent = 'Submitting password verification';
   clearMessage();
 
   try {
@@ -986,7 +1282,16 @@ $('#loginForm').addEventListener('submit', async function(ev){
     });
     var payload = await response.json();
     if(!response.ok){
+      if(payload.redirect_to === '/setup'){ window.location.href = '/setup'; return; }
       showMessage('err', payload.message || 'Login failed.');
+      return;
+    }
+    if(payload.requires_totp){
+      pendingToken = payload.pending_token || '';
+      setPanel('totpPanel');
+      $('#totpCode').focus();
+      $('#hint').textContent = 'Password accepted. Waiting for TOTP verification.';
+      showMessage('ok', 'Password accepted. Enter your authenticator code.');
       return;
     }
     showMessage('ok', 'Login accepted, redirecting...');
@@ -1000,6 +1305,225 @@ $('#loginForm').addEventListener('submit', async function(ev){
       $('#hint').textContent = 'Input changes are throttled and login attempts are rate-limited.';
     }, 900);
   }
+});
+
+$('#totpForm').addEventListener('submit', async function(ev){
+  ev.preventDefault();
+  if(submitLocked || !pendingToken){ return; }
+  submitLocked = true;
+  $('#totpSubmitBtn').disabled = true;
+  clearMessage();
+  try {
+    var response = await fetch('/api/login/totp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pending_token: pendingToken, totp_code: $('#totpCode').value.trim() })
+    });
+    var payload = await response.json();
+    if(!response.ok){
+      showMessage('err', payload.message || 'TOTP verification failed.');
+      return;
+    }
+    showMessage('ok', 'TOTP accepted, redirecting...');
+    window.location.href = payload.redirect_to || nextPath || '/admin';
+  } catch (error) {
+    showMessage('err', 'TOTP verification request failed.');
+  } finally {
+    setTimeout(function(){
+      submitLocked = false;
+      $('#totpSubmitBtn').disabled = false;
+    }, 900);
+  }
+});
+
+$('#backBtn').addEventListener('click', function(){
+  pendingToken = '';
+  $('#totpCode').value = '';
+  setPanel('passwordPanel');
+  clearMessage();
+});
+})();
+</script>
+</body>
+</html>"""
+
+SETUP_HTML = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WardenIPS Initial Setup</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#120f18;--bg2:#211934;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
+body{min-height:100vh;display:grid;place-items:center;font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);padding:20px}
+.shell{width:min(100%,1160px);display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:24px;padding:28px;box-shadow:var(--shadow)}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);color:var(--blue);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+h1{font-size:2rem;letter-spacing:-.04em;margin-bottom:10px}
+p{color:var(--muted);line-height:1.6;margin-bottom:16px}
+.meta{display:grid;gap:10px;margin-top:18px}
+.meta div{padding:12px 14px;border-radius:14px;border:1px solid var(--b);background:linear-gradient(180deg,var(--surface),var(--surface2));font-size:.85rem;color:var(--muted)}
+.field{display:grid;gap:7px;margin-bottom:14px}
+label{font-size:.8rem;font-weight:700;color:var(--txt)}
+input{width:100%;background:var(--surface2);border:1px solid var(--b);color:var(--txt);border-radius:14px;padding:13px 14px;font-size:.95rem;outline:none}
+input:focus{border-color:var(--blue);box-shadow:0 0 0 4px color-mix(in srgb,var(--blue) 18%,transparent)}
+button{appearance:none;border:0;background:linear-gradient(135deg,var(--accent),#ff6f61);color:white;padding:13px 16px;border-radius:14px;font-size:.95rem;font-weight:800;cursor:pointer;min-width:150px}
+button.secondary{background:var(--surface2);border:1px solid var(--b);color:var(--txt)}
+button[disabled]{opacity:.65;cursor:wait}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
+.msg{margin-top:14px;padding:12px 14px;border-radius:12px;font-size:.85rem;display:none}
+.msg.err{display:block;background:#32131a;color:#ffb3bc;border:1px solid #6a2432}
+.msg.ok{display:block;background:#0d2e26;color:#8ef0c7;border:1px solid #175343}
+.panel{display:none}
+.panel.active{display:block}
+.qr-wrap{display:grid;gap:14px;justify-items:start}
+.qr-wrap img{width:min(100%,240px);border-radius:18px;border:1px solid var(--b);background:white;padding:12px}
+.secret{font-family:'Cascadia Code','Fira Code',monospace;font-size:.86rem;padding:12px 14px;border-radius:14px;border:1px solid var(--b);background:var(--surface2);word-break:break-all}
+@media(max-width:900px){.shell{grid-template-columns:1fr}}
+@media(max-width:640px){.row{flex-direction:column;align-items:stretch}button{width:100%}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="eyebrow">First-Boot Setup</div>
+    <h1>Create the first admin account.</h1>
+    <p>Fresh installs no longer ship with a durable default admin secret. Use the bootstrap token from the installer output, create a named admin account, and bind it to a TOTP authenticator.</p>
+    <div class="meta">
+      <div>Bootstrap window: <strong>__SETUP_EXPIRY__</strong></div>
+      <div>Requirements: non-default username, strong password, working authenticator app.</div>
+      <div>Result: bootstrap token is invalidated and the first admin account is stored in the configured backend.</div>
+    </div>
+  </div>
+  <div class="card">
+    <div id="setupBeginPanel" class="panel active">
+      <div class="eyebrow">Step 1</div>
+      <h1>Bootstrap credentials</h1>
+      <form id="setupBeginForm">
+        <div class="field">
+          <label for="bootstrapToken">Bootstrap Token</label>
+          <input id="bootstrapToken" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="setupUsername">Admin Username</label>
+          <input id="setupUsername" type="text" autocomplete="username" spellcheck="false" placeholder="ops-admin">
+        </div>
+        <div class="field">
+          <label for="setupPassword">Password</label>
+          <input id="setupPassword" type="password" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="setupPasswordConfirm">Confirm Password</label>
+          <input id="setupPasswordConfirm" type="password" autocomplete="new-password">
+        </div>
+        <div class="row">
+          <p style="margin:0;font-size:.78rem">Password policy: at least 12 chars, uppercase, lowercase, number, and symbol.</p>
+          <button id="setupBeginBtn" type="submit">Generate TOTP</button>
+        </div>
+      </form>
+    </div>
+    <div id="setupVerifyPanel" class="panel">
+      <div class="eyebrow">Step 2</div>
+      <h1>Verify your authenticator</h1>
+      <div class="qr-wrap">
+        <img id="totpQr" alt="TOTP QR Code">
+        <div class="secret" id="totpSecret"></div>
+      </div>
+      <form id="setupCompleteForm" style="margin-top:16px">
+        <div class="field">
+          <label for="setupTotpCode">Authenticator Code</label>
+          <input id="setupTotpCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456">
+        </div>
+        <div class="row">
+          <button id="setupCompleteBtn" type="submit">Finish Setup</button>
+          <button id="setupBackBtn" class="secondary" type="button">Back</button>
+        </div>
+      </form>
+    </div>
+    <div id="setupMessage" class="msg"></div>
+  </div>
+</div>
+<script>
+(function(){
+'use strict';
+var pendingSetupToken = '';
+var busy = false;
+function $(s){return document.querySelector(s)}
+function setPanel(name){ ['setupBeginPanel','setupVerifyPanel'].forEach(function(id){ $('#'+id).classList.toggle('active', id === name); }); }
+function showMessage(kind, text){ var box = $('#setupMessage'); box.className = 'msg ' + kind; box.textContent = text; }
+function clearMessage(){ var box = $('#setupMessage'); box.className = 'msg'; box.textContent = ''; }
+
+$('#setupBeginForm').addEventListener('submit', async function(ev){
+  ev.preventDefault();
+  if(busy){ return; }
+  busy = true;
+  $('#setupBeginBtn').disabled = true;
+  clearMessage();
+  try {
+    var response = await fetch('/api/setup/begin', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        bootstrap_token: $('#bootstrapToken').value.trim(),
+        username: $('#setupUsername').value.trim(),
+        password: $('#setupPassword').value,
+        password_confirm: $('#setupPasswordConfirm').value
+      })
+    });
+    var payload = await response.json();
+    if(!response.ok){
+      showMessage('err', payload.message || 'Setup could not start.');
+      return;
+    }
+    pendingSetupToken = payload.pending_setup_token || '';
+    $('#totpQr').src = payload.totp_qr_data_url || '';
+    $('#totpSecret').textContent = payload.totp_secret || '';
+    setPanel('setupVerifyPanel');
+    showMessage('ok', 'Scan the QR code or copy the secret, then enter a TOTP code to finish setup.');
+  } catch (error) {
+    showMessage('err', 'Setup request failed.');
+  } finally {
+    busy = false;
+    $('#setupBeginBtn').disabled = false;
+  }
+});
+
+$('#setupCompleteForm').addEventListener('submit', async function(ev){
+  ev.preventDefault();
+  if(busy || !pendingSetupToken){ return; }
+  busy = true;
+  $('#setupCompleteBtn').disabled = true;
+  clearMessage();
+  try {
+    var response = await fetch('/api/setup/complete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        pending_setup_token: pendingSetupToken,
+        totp_code: $('#setupTotpCode').value.trim()
+      })
+    });
+    var payload = await response.json();
+    if(!response.ok){
+      showMessage('err', payload.message || 'Setup completion failed.');
+      return;
+    }
+    showMessage('ok', payload.message || 'Setup completed. Redirecting...');
+    window.location.href = payload.redirect_to || '/admin';
+  } catch (error) {
+    showMessage('err', 'Setup completion request failed.');
+  } finally {
+    busy = false;
+    $('#setupCompleteBtn').disabled = false;
+  }
+});
+
+$('#setupBackBtn').addEventListener('click', function(){
+  pendingSetupToken = '';
+  $('#setupTotpCode').value = '';
+  setPanel('setupBeginPanel');
+  clearMessage();
 });
 })();
 </script>

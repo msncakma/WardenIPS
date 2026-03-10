@@ -79,6 +79,10 @@ dashboard:
   password: ""
   session_ttl: 600
   login_rate_limit_per_minute: 10
+  bootstrap:
+    setup_required: false
+    token_hash: ""
+    token_expires_at: ""
 
 plugins:
   ssh:

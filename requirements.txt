@@ -16,5 +16,10 @@ aiosqlite>=0.19.0
 # Asenkron HTTP İstemci (AbuseIPDB - Faz 3)
 aiohttp>=3.9.0
 
+# Admin authentication and first-boot security
+argon2-cffi>=23.1.0
+pyotp>=2.9.0
+qrcode[pil]>=7.4.2
+
 # Terminal Renklendirme
 colorama>=0.4.6
