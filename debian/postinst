@@ -41,7 +41,7 @@ case "$1" in
         fi
         
         # Update CLI wrapper with correct paths
-        sed -i 's|__INSTALL_DIR__|/opt/wardenips|g' /usr/local/bin/wardenips
+        sed -i 's|__INSTALL_DIR__|/opt/wardenips|g' /usr/bin/wardenips
         
         # Create log file
         touch /var/log/wardenips/warden.log

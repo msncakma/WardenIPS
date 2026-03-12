@@ -23,8 +23,8 @@ override_dh_auto_install:
 	install -m 644 $(CURDIR)/wardenips.service $(CURDIR)/debian/wardenips/lib/systemd/system/
 	
 	# Install CLI wrapper
-	install -d $(CURDIR)/debian/wardenips/usr/local/bin
-	install -m 755 $(CURDIR)/debian/wardenips-wrapper $(CURDIR)/debian/wardenips/usr/local/bin/wardenips
+	install -d $(CURDIR)/debian/wardenips/usr/bin
+	install -m 755 $(CURDIR)/debian/wardenips-wrapper $(CURDIR)/debian/wardenips/usr/bin/wardenips
 	
 	# Create directories
 	install -d $(CURDIR)/debian/wardenips/var/lib/wardenips
