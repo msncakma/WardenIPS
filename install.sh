@@ -412,7 +412,7 @@ PY
     fi
 
     if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN_HASH" ]; then
-        python3 - "$INSTALL_DIR/config.yaml" "$BOOTSTRAP_TOKEN_HASH" "$BOOTSTRAP_EXPIRES_AT" <<'PY'
+        "$INSTALL_DIR/venv/bin/python" - "$INSTALL_DIR/config.yaml" "$BOOTSTRAP_TOKEN_HASH" "$BOOTSTRAP_EXPIRES_AT" <<'PY'
 from pathlib import Path
 import sys
 
