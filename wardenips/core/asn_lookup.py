@@ -193,6 +193,9 @@ class ASNLookupEngine:
         Girdi: ["AS16509", "14061", "AS20473"]
         Çıktı: {16509, 14061, 20473}
         """
+        if raw_list is None:
+            return set()
+        
         parsed = set()
         for item in raw_list:
             try:
