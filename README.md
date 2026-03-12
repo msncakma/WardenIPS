@@ -26,9 +26,9 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 
 ## Transparency
 
-WardenIPS v0.2.0-beta is feature-complete for its intended scope, but it is not pretending to be more mature than it is.
+WardenIPS v0.2.2 is feature-complete for its intended scope, but it is not pretending to be more mature than it is.
 
-- Current state: **v0.2.0-beta** — active development with all major subsystems implemented.
+- Current state: **v0.2.2** — active development with all major subsystems implemented.
 - Testing state: core flows are implemented and functional, broad production validation is ongoing.
 - Deployment advice: use in labs, staging, or controlled production pilots first.
 - Operational reality: misconfigured whitelists or aggressive thresholds can still block legitimate traffic.
@@ -254,11 +254,11 @@ WardenIPS uses a staged maturity model:
 - BETA: feature complete with active stabilization.
 - RELEASE: production-oriented stable milestone.
 
-Current version: **v0.2.0-beta**
+Current version: **v0.2.2**
 
 Until a formal RELEASE tag exists for a given build, treat that build as non-final.
 
-### What changed in v0.2.0-beta
+### What changed in v0.2.2
 
 - **Blocklist Protection**: Replaced the experimental P2P threat mesh with a streamlined blocklist system powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). Two-phase protection: first-setup bulk load + daily active refresh.
 - **Timezone-aware scheduling**: Blocklist fetch runs at a configurable local time instead of a fixed UTC offset.
