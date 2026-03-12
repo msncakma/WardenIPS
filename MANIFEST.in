@@ -2,7 +2,6 @@ include README.md
 include LICENSE
 include requirements.txt
 include config_backup.yaml
-include whitelist.ips
 include main.py
 include wardenips.service
 include install.sh

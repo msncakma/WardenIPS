@@ -84,7 +84,7 @@ case "$1" in
         echo ""
         echo "Next steps:"
         echo "  1. Edit configuration: nano /opt/wardenips/config.yaml"
-        echo "  2. Add trusted IPs to: /opt/wardenips/whitelist.ips"
+        echo "  2. Update whitelist/ips section in config.yaml"
         echo "  3. Start service: systemctl start wardenips"
         echo "  4. View logs: wardenips logs"
         echo "  5. Dashboard: http://127.0.0.1:7680/"

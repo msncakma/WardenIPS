@@ -113,7 +113,6 @@ parts:
       cp -r wardenips $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
       cp main.py $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
       cp config_backup.yaml $CRAFTCTL_INSTALL/etc/wardenips/
-      cp whitelist.ips $CRAFTCTL_INSTALL/etc/wardenips/
       
       # Create systemd service file for snap
       cat > $CRAFTCTL_INSTALL/systemd/wardenips.service << 'EOF'

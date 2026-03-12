@@ -17,7 +17,6 @@ override_dh_auto_install:
 	cp $(CURDIR)/main.py $(CURDIR)/debian/wardenips/opt/wardenips/
 	cp $(CURDIR)/requirements.txt $(CURDIR)/debian/wardenips/opt/wardenips/
 	cp $(CURDIR)/config_backup.yaml $(CURDIR)/debian/wardenips/opt/wardenips/
-	cp $(CURDIR)/whitelist.ips $(CURDIR)/debian/wardenips/opt/wardenips/
 	
 	# Install systemd service
 	install -d $(CURDIR)/debian/wardenips/lib/systemd/system
