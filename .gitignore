@@ -23,8 +23,56 @@ data/
 Thumbs.db
 
 
-# Customs
-WARDEN_ARCHITECTURE.md
-walkthrough.md
-VM_TEST_GUIDE.md
+# Local reports
 IMPLEMENTATION_REPORT.md
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Debian packaging artifacts
+.pybuild/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper
+debian/*.substvars
+debian/wardenips/
+*.deb
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# Environment and local overrides
+.env
+.env.*
+*.local
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.temp
+*.orig
+*~
+
+# Build and install metadata
+pip-wheel-metadata/
+site/
+
+# Windows generated files
+Desktop.ini
+

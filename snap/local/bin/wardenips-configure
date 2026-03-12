@@ -41,9 +41,18 @@ else
     echo "📝 Configuration already exists: $CONFIG_FILE"
 fi
 
+# Copy whitelist if not exists
+if [ ! -f "$WHITELIST_FILE" ]; then
+    echo "🛡️  Creating default whitelist..."
+    cp "$TEMPLATE_WHITELIST" "$WHITELIST_FILE"
+    echo "✓ Whitelist created: $WHITELIST_FILE"
+else
+    echo "🛡️  Whitelist already exists: $WHITELIST_FILE"
+fi
+
 # Set permissions
-chown root:root "$CONFIG_FILE" 2>/dev/null || true
-chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+chown root:root "$CONFIG_FILE" "$WHITELIST_FILE" 2>/dev/null || true
+chmod 600 "$CONFIG_FILE" "$WHITELIST_FILE" 2>/dev/null || true
 
 # Create log file
 touch "$SNAP_COMMON/log/warden.log"
