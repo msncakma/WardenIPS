@@ -345,13 +345,13 @@ class DashboardAPI:
     response.del_cookie(self._session_cookie_name, path="/")
 
   async def _clear_bootstrap_config(self) -> None:
-    config_data = copy.deepcopy(self._config.raw)
-    dashboard = config_data.setdefault("dashboard", {})
-    bootstrap = dashboard.setdefault("bootstrap", {})
-    bootstrap["setup_required"] = False
-    bootstrap["token_hash"] = ""
-    bootstrap["token_expires_at"] = ""
-    await self._config.save(config_data)
+    await self._config.patch_values(
+      {
+        "dashboard.bootstrap.setup_required": False,
+        "dashboard.bootstrap.token_hash": "",
+        "dashboard.bootstrap.token_expires_at": "",
+      }
+    )
     self._initialize_config()
 
   async def _log_audit(
@@ -1048,11 +1048,9 @@ class DashboardAPI:
     changes = payload.get("changes") or {}
     if not isinstance(changes, dict) or not changes:
       return web.json_response({"error": "invalid_changes", "message": "At least one config change is required."}, status=400)
-    config_data = copy.deepcopy(self._config.raw)
-    for dotted_path, value in changes.items():
-      self._set_nested_config_value(config_data, str(dotted_path), value)
     try:
-      await self._config.save(config_data)
+      normalized_changes = {str(key): value for key, value in changes.items()}
+      await self._config.patch_values(normalized_changes)
     except Exception as exc:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()

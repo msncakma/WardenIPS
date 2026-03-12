@@ -462,43 +462,44 @@ PY
 
     "$INSTALL_DIR/venv/bin/python" - "$INSTALL_DIR/config.yaml" "$FIRST_SETUP_MODE" <<'PY'
 from pathlib import Path
+import re
 import sys
-
-import yaml
 
 
 path = Path(sys.argv[1])
 mode = sys.argv[2]
 if mode not in {"7d", "14d"}:
     mode = "7d"
-data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-blocklist = data.setdefault('blocklist', {})
-first_setup = blocklist.setdefault('first_setup', {})
-first_setup['mode'] = mode
-path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding='utf-8')
+text = path.read_text(encoding='utf-8')
+text, count = re.subn(
+    r'(^[ \t]*mode:\s*)["\']?(?:7d|14d)["\']?(\s*(?:#.*)?)$',
+    rf'\1"{mode}"\2',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if count:
+    path.write_text(text, encoding='utf-8')
 PY
     log "Configured first-setup blocklist mode: $FIRST_SETUP_MODE"
 
     if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN_HASH" ]; then
         "$INSTALL_DIR/venv/bin/python" - "$INSTALL_DIR/config.yaml" "$BOOTSTRAP_TOKEN_HASH" "$BOOTSTRAP_EXPIRES_AT" <<'PY'
 from pathlib import Path
+import re
 import sys
-
-import yaml
 
 
 path = Path(sys.argv[1])
 token_hash = sys.argv[2]
 expires_at = sys.argv[3]
-data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-dashboard = data.setdefault('dashboard', {})
-bootstrap = dashboard.setdefault('bootstrap', {})
-bootstrap['setup_required'] = True
-bootstrap['token_hash'] = token_hash
-bootstrap['token_expires_at'] = expires_at
-dashboard['username'] = ''
-dashboard['password'] = ''
-path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding='utf-8')
+text = path.read_text(encoding='utf-8')
+text = re.sub(r'(^[ \t]*setup_required:\s*)false(\s*(?:#.*)?)$', r'\1true\2', text, count=1, flags=re.MULTILINE)
+text = re.sub(r'(^[ \t]*token_hash:\s*).*(\s*(?:#.*)?)$', rf'\1"{token_hash}"\2', text, count=1, flags=re.MULTILINE)
+text = re.sub(r'(^[ \t]*token_expires_at:\s*).*(\s*(?:#.*)?)$', rf'\1"{expires_at}"\2', text, count=1, flags=re.MULTILINE)
+text = re.sub(r'(^[ \t]*username:\s*).*(\s*(?:#.*)?)$', r'\1""\2', text, count=1, flags=re.MULTILINE)
+text = re.sub(r'(^[ \t]*password:\s*).*(\s*(?:#.*)?)$', r'\1""\2', text, count=1, flags=re.MULTILINE)
+path.write_text(text, encoding='utf-8')
 PY
         log "Prepared first-boot bootstrap token for admin enrollment."
     fi

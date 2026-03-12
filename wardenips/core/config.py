@@ -10,12 +10,23 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiofiles
 import yaml
+
+try:
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    _RUAMEL_AVAILABLE = True
+except ImportError:
+    YAML = None  # type: ignore[assignment]
+    CommentedMap = dict  # type: ignore[assignment,misc]
+    _RUAMEL_AVAILABLE = False
 
 from wardenips.core.exceptions import WardenConfigError
 from wardenips.core.logger import get_logger
@@ -288,6 +299,108 @@ class ConfigManager:
                 raise
 
             logger.info("Configuration saved successfully from raw YAML: %s", self._config_path)
+
+    async def patch_values(self, changes: Dict[str, Any]) -> None:
+        """Patch dotted-path config values while preserving YAML comments and style when possible."""
+        if not isinstance(changes, dict) or not changes:
+            raise WardenConfigError("At least one config change is required.")
+        if self._config_path is None:
+            raise WardenConfigError("Configuration path is not initialized.")
+
+        # Fallback path when ruamel is unavailable.
+        if not _RUAMEL_AVAILABLE:
+            data = self.raw
+            for dotted_path, value in changes.items():
+                self._set_nested_dict_value(data, str(dotted_path), value)
+            await self.save(data)
+            return
+
+        async with self._lock:
+            previous = self._data
+            temp_path = None
+            try:
+                async with aiofiles.open(
+                    str(self._config_path),
+                    mode="r",
+                    encoding="utf-8",
+                ) as config_file:
+                    original_yaml = await config_file.read()
+
+                rt_yaml = YAML()
+                rt_yaml.preserve_quotes = True
+                rt_yaml.allow_unicode = True
+                node = rt_yaml.load(original_yaml) if original_yaml.strip() else CommentedMap()
+                if node is None:
+                    node = CommentedMap()
+                if not isinstance(node, dict):
+                    raise WardenConfigError("Top-level YAML must be a mapping/dictionary.")
+
+                for dotted_path, value in changes.items():
+                    self._set_nested_dict_value(node, str(dotted_path), value)
+
+                stream = io.StringIO()
+                rt_yaml.dump(node, stream)
+                updated_yaml = stream.getvalue()
+
+                parsed = yaml.safe_load(updated_yaml)
+                if not isinstance(parsed, dict):
+                    raise WardenConfigError("Top-level YAML must be a mapping/dictionary.")
+
+                self._data = parsed
+                self._validate()
+
+                temp_path = self._config_path.with_suffix(self._config_path.suffix + ".tmp")
+                async with aiofiles.open(
+                    str(temp_path),
+                    mode="w",
+                    encoding="utf-8",
+                ) as config_file:
+                    await config_file.write(updated_yaml)
+                os.replace(temp_path, self._config_path)
+            except OSError as exc:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                    try:
+                        async with aiofiles.open(
+                            str(self._config_path),
+                            mode="w",
+                            encoding="utf-8",
+                        ) as config_file:
+                            await config_file.write(updated_yaml)
+                    except Exception as direct_exc:
+                        self._data = previous
+                        raise WardenConfigError(
+                            "Configuration file could not be written: "
+                            f"{self._config_path} — {direct_exc}. "
+                            "The service may still be blocked by a read-only mount or systemd sandbox."
+                        ) from direct_exc
+                else:
+                    self._data = previous
+                    raise WardenConfigError(
+                        f"Configuration file could not be written: {self._config_path} — {exc}"
+                    ) from exc
+            except Exception:
+                self._data = previous
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                raise
+
+            logger.info("Configuration patched successfully: %s", self._config_path)
+
+    @staticmethod
+    def _set_nested_dict_value(payload: Dict[str, Any], dotted_path: str, value: Any) -> None:
+        """Set a nested dictionary key using dot notation."""
+        current = payload
+        segments = [segment for segment in str(dotted_path).split(".") if segment]
+        for segment in segments[:-1]:
+            next_value = current.get(segment)
+            if not isinstance(next_value, dict):
+                next_value = CommentedMap() if _RUAMEL_AVAILABLE else {}
+                current[segment] = next_value
+            current = next_value
+        if segments:
+            current[segments[-1]] = value
 
     # ── Internal Methods ──
 

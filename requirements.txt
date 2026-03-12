@@ -3,6 +3,7 @@
 
 # Yapılandırma
 pyyaml>=6.0.1
+ruamel.yaml>=0.18.6
 
 # Asenkron Dosya I/O
 aiofiles>=23.2.1

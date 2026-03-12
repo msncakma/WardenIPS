@@ -590,11 +590,9 @@ class BlocklistManager:
     async def _persist_installed_at(self, dt: datetime) -> None:
         """Write installed_at timestamp to config.yaml."""
         try:
-            raw = self._config.raw
-            blocklist = raw.setdefault("blocklist", {})
-            first_setup = blocklist.setdefault("first_setup", {})
-            first_setup["installed_at"] = dt.isoformat()
-            await self._config.save(raw)
+            await self._config.patch_values(
+                {"blocklist.first_setup.installed_at": dt.isoformat()}
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist installed_at to config: %s", exc
@@ -604,11 +602,9 @@ class BlocklistManager:
         """Mark first_setup as completed in config.yaml."""
         self._first_setup_completed = True
         try:
-            raw = self._config.raw
-            blocklist = raw.setdefault("blocklist", {})
-            first_setup = blocklist.setdefault("first_setup", {})
-            first_setup["completed"] = True
-            await self._config.save(raw)
+            await self._config.patch_values(
+                {"blocklist.first_setup.completed": True}
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist first_setup.completed to config: %s",
