@@ -997,11 +997,12 @@ class DashboardAPI:
       return self._json_auth_error()
     self._touch_session(request)
     config_data = self._config.raw
+    yaml_text = await self._config.get_yaml_text()
     return web.json_response(
       {
         "ok": True,
         "config": config_data,
-        "yaml": yaml.safe_dump(config_data, sort_keys=False, allow_unicode=True),
+        "yaml": yaml_text,
         "message": "Some runtime changes apply immediately in the dashboard, while service-level changes may require a restart.",
       }
     )
@@ -1019,24 +1020,19 @@ class DashboardAPI:
     if not yaml_text:
       return web.json_response({"error": "invalid_config", "message": "YAML content is required."}, status=400)
     try:
-      config_data = yaml.safe_load(yaml_text)
-    except yaml.YAMLError as exc:
-      return web.json_response({"error": "invalid_yaml", "message": str(exc)}, status=400)
-    if not isinstance(config_data, dict):
-      return web.json_response({"error": "invalid_config", "message": "Top-level YAML must be a mapping."}, status=400)
-    try:
-      await self._config.save(config_data)
+      await self._config.save_yaml_text(yaml_text)
     except Exception as exc:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()
     self._ip_hasher = IPHasher.from_config(self._config)
     await self._log_audit(request, "admin.save_config", actor_username=actor, details={"mode": "yaml", "bytes": len(yaml_text)})
+    current_yaml = await self._config.get_yaml_text()
     return web.json_response(
       {
         "ok": True,
         "message": "Configuration saved. Restart WardenIPS if you changed firewall, plugin, or notification wiring.",
         "config": self._config.raw,
-        "yaml": yaml.safe_dump(self._config.raw, sort_keys=False, allow_unicode=True),
+        "yaml": current_yaml,
       }
     )
 
@@ -1062,12 +1058,13 @@ class DashboardAPI:
     self._initialize_config()
     self._ip_hasher = IPHasher.from_config(self._config)
     await self._log_audit(request, "admin.patch_config", actor_username=actor, details={"changes": sorted(str(key) for key in changes.keys())})
+    current_yaml = await self._config.get_yaml_text()
     return web.json_response(
       {
         "ok": True,
         "message": "Configuration updated.",
         "config": self._config.raw,
-        "yaml": yaml.safe_dump(self._config.raw, sort_keys=False, allow_unicode=True),
+        "yaml": current_yaml,
       }
     )
 

@@ -156,6 +156,23 @@ class ConfigManager:
         """Path of the loaded configuration file."""
         return self._config_path
 
+    async def get_yaml_text(self) -> str:
+        """Return the current config file content as raw YAML text."""
+        if self._config_path is None:
+            raise WardenConfigError("Configuration path is not initialized.")
+
+        try:
+            async with aiofiles.open(
+                str(self._config_path),
+                mode="r",
+                encoding="utf-8",
+            ) as config_file:
+                return await config_file.read()
+        except OSError as exc:
+            raise WardenConfigError(
+                f"Configuration file could not be read: {self._config_path} — {exc}"
+            ) from exc
+
     async def save(self, data: Dict[str, Any]) -> None:
         """Validate and persist configuration data."""
         if not isinstance(data, dict):
@@ -213,6 +230,64 @@ class ConfigManager:
                     temp_path.unlink(missing_ok=True)
                 raise
             logger.info("Configuration saved successfully: %s", self._config_path)
+
+    async def save_yaml_text(self, yaml_text: str) -> None:
+        """Validate and persist raw YAML text without reformatting it."""
+        if self._config_path is None:
+            raise WardenConfigError("Configuration path is not initialized.")
+
+        try:
+            parsed = yaml.safe_load(yaml_text)
+        except yaml.YAMLError as exc:
+            raise WardenConfigError(f"YAML parsing error: {exc}") from exc
+
+        if not isinstance(parsed, dict):
+            raise WardenConfigError("Top-level YAML must be a mapping/dictionary.")
+
+        async with self._lock:
+            previous = self._data
+            self._data = parsed
+            temp_path = None
+            try:
+                self._validate()
+                temp_path = self._config_path.with_suffix(self._config_path.suffix + ".tmp")
+                async with aiofiles.open(
+                    str(temp_path),
+                    mode="w",
+                    encoding="utf-8",
+                ) as config_file:
+                    await config_file.write(yaml_text)
+                os.replace(temp_path, self._config_path)
+            except OSError as exc:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                    try:
+                        async with aiofiles.open(
+                            str(self._config_path),
+                            mode="w",
+                            encoding="utf-8",
+                        ) as config_file:
+                            await config_file.write(yaml_text)
+                    except OSError as direct_exc:
+                        self._data = previous
+                        raise WardenConfigError(
+                            "Configuration file could not be written: "
+                            f"{self._config_path} — {direct_exc}. "
+                            "The service may still be blocked by a read-only mount or systemd sandbox."
+                        ) from direct_exc
+                else:
+                    self._data = previous
+                    raise WardenConfigError(
+                        f"Configuration file could not be written: {self._config_path} — {exc}"
+                    ) from exc
+            except Exception:
+                self._data = previous
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                raise
+
+            logger.info("Configuration saved successfully from raw YAML: %s", self._config_path)
 
     # ── Internal Methods ──
 
