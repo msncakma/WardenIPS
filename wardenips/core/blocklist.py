@@ -84,10 +84,8 @@ ACTIVE_SET_V6 = "wardenips_active_v6"
 # Maximum entries per ipset (must be large enough for big blocklists)
 _IPSET_MAXELEM = 1_000_000
 
-# Regex for a bare IP line (IPv4 or IPv6); ignores comments / blanks
-_IP_LINE_RE = re.compile(
-    r"^\s*([0-9a-fA-F.:]+)\s*(?:#.*)?$"
-)
+# Regex fallback for a bare IP line (IPv4 or IPv6)
+_IP_LINE_RE = re.compile(r"^\s*([0-9a-fA-F.:]+)\s*$")
 
 
 class BlocklistManager:
@@ -456,14 +454,11 @@ class BlocklistManager:
                 text = await resp.text()
                 ips = []
                 for line in text.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
+                    ip_str = self._extract_ip_from_line(line)
+                    if not ip_str:
                         continue
-                    match = _IP_LINE_RE.match(line)
-                    if match:
-                        ip_str = match.group(1)
-                        if self._is_valid_ip(ip_str):
-                            ips.append(ip_str)
+                    if self._is_valid_ip(ip_str):
+                        ips.append(ip_str)
                 return ips
 
         except asyncio.TimeoutError:
@@ -657,6 +652,31 @@ class BlocklistManager:
         return timezone.utc
 
     # ── Helpers ──
+
+    @staticmethod
+    def _extract_ip_from_line(line: str) -> Optional[str]:
+        """
+        Extract an IP candidate from AbuseIPDB blocklist lines.
+
+        Supports lines like:
+          1.2.3.4
+          1.2.3.4   # CC AS1234 Provider
+          # comment headers
+        """
+        if not line:
+            return None
+
+        # Strip inline metadata/comments first.
+        core = line.split("#", 1)[0].strip()
+        if not core:
+            return None
+
+        # First token is the candidate IP in borestad list format.
+        token = core.split()[0]
+        match = _IP_LINE_RE.match(token)
+        if not match:
+            return None
+        return match.group(1)
 
     @staticmethod
     def _is_valid_ip(ip_str: str) -> bool:
