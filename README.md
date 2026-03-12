@@ -8,6 +8,7 @@ Maintainer: `msncakma`
 
 If you want a cleaner product-style overview for sharing or presentation, see [docs/index.md](docs/index.md).
 
+[![Version](https://img.shields.io/badge/version-0.2.0--beta-blue.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -16,18 +17,19 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 
 - Real-time prevention, not just log collection.
 - Linux-native enforcement with ipset, iptables, and IPv6 support.
+- Built-in blocklist protection powered by AbuseIPDB curated threat data.
 - Live operational dashboard with continuously updating metrics and event visibility.
 - Privacy-aware design: sensitive IP data is stored as salted hashes.
 - Plugin-based detection model for SSH, Minecraft, and Nginx workloads.
 - Burst and flood detection for fast bot and scanner containment.
-- Optional Telegram, Discord, AbuseIPDB, Redis, Docker, and peer intelligence features.
+- Optional Telegram, Discord, AbuseIPDB, Redis, and Docker integrations.
 
 ## Transparency
 
-WardenIPS is promising, but it is not pretending to be more mature than it is.
+WardenIPS v0.2.0-beta is feature-complete for its intended scope, but it is not pretending to be more mature than it is.
 
-- Current state: active pre-release development.
-- Testing state: major flows are implemented, but broad production validation is still ongoing.
+- Current state: **v0.2.0-beta** — active development with all major subsystems implemented.
+- Testing state: core flows are implemented and functional, broad production validation is ongoing.
 - Deployment advice: use in labs, staging, or controlled production pilots first.
 - Operational reality: misconfigured whitelists or aggressive thresholds can still block legitimate traffic.
 - Recommendation: deploy carefully, observe behavior, then tighten policy.
@@ -43,18 +45,17 @@ WardenIPS ships with a built-in web dashboard for real-time visibility.
 - Live auto-refreshing UI.
 - Active bans, recent events, risk levels, countries, plugins, and attacker concentration.
 - Fast operational feedback without external observability tooling.
-- Advanced admin console available at `/admin` with live filters, raw active firewall IP view, operator advice, and threat mesh status.
+- Advanced admin console available at `/admin` with live filters, raw active firewall IP view, operator advice, and blocklist protection status.
 
-### Privacy-Preserving Threat Mesh
+### Blocklist Protection (New in v0.2.0)
 
-WardenIPS includes decentralized threat intelligence synchronization between nodes.
+WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). This replaces the previous experimental P2P threat mesh with a simpler, more reliable approach.
 
-- Nodes share ban indicators with peers over HTTP.
-- Shared data is hash-based, so plaintext IPs do not leave the node.
-- This currently works as correlation and awareness across nodes.
-- It is valuable for multi-server fleets, clusters, and distributed service edges.
-
-Transparent note: the current threat intel feed is hash-only, so it improves visibility and correlation but does not directly reconstruct remote IPs for firewall blocking.
+- **First Setup phase**: On first run, loads ~107K (7d) or ~132K (14d) known malicious IPs into a dedicated ipset. This set auto-expires after the chosen period to prevent stale false-positives.
+- **Daily Active refresh**: Every day at a configurable time, fetches ~80K IPs reported in the last 24 hours. These accumulate in a separate active ipset.
+- All lists are 100% confidence AbuseIPDB offenders, updated multiple times per day.
+- Timezone-aware scheduling — set your local timezone and preferred fetch time.
+- Zero configuration required — enabled by default with sensible defaults.
 
 ### Layered Detection
 
@@ -180,12 +181,12 @@ Before enabling autonomous enforcement in a real environment:
 
 - Async event pipeline built for low overhead.
 - IPv4 and IPv6 ban enforcement.
+- Blocklist protection with AbuseIPDB curated threat data.
 - Salted IP hashing for privacy-aware storage.
 - SQLite or Redis backend.
 - AbuseIPDB reporting.
 - Telegram and Discord notifications.
 - Dashboard API and web UI.
-- Threat-intel peer sync.
 - Docker and systemd support.
 
 ## Architecture
@@ -253,14 +254,23 @@ WardenIPS uses a staged maturity model:
 - BETA: feature complete with active stabilization.
 - RELEASE: production-oriented stable milestone.
 
+Current version: **v0.2.0-beta**
+
 Until a formal RELEASE tag exists for a given build, treat that build as non-final.
+
+### What changed in v0.2.0-beta
+
+- **Blocklist Protection**: Replaced the experimental P2P threat mesh with a streamlined blocklist system powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). Two-phase protection: first-setup bulk load + daily active refresh.
+- **Timezone-aware scheduling**: Blocklist fetch runs at a configurable local time instead of a fixed UTC offset.
+- **Dashboard updates**: Blocklist status, first-setup progress, and active IP counts are now visible in both the public and admin dashboards.
+- **Simplified architecture**: Removed P2P node synchronization, hash-based threat sharing, and mesh topology code. The codebase is leaner and easier to maintain.
 
 ## Security Notes
 
 - WardenIPS changes host firewall state.
 - Misconfiguration can block legitimate traffic.
 - Aggressive tuning should always be introduced gradually.
-- Threat intel is currently correlation-focused, not blind remote-ban automation.
+- Blocklist data is sourced from curated, high-confidence AbuseIPDB lists — not raw community feeds.
 
 ## Who This Is For
 
@@ -268,7 +278,6 @@ Until a formal RELEASE tag exists for a given build, treat that build as non-fin
 - Indie game server admins.
 - Small SaaS teams.
 - Self-hosters who want live protection without enterprise overhead.
-- Teams building early distributed defense workflows across multiple nodes.
 
 ## Contributing and Support
 

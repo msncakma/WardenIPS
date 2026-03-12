@@ -1,4 +1,4 @@
-# WardenIPS - Architecture & Developer Guide (Mapping)
+# WardenIPS - Architecture & Developer Guide (v0.2.0-beta)
 
 This document is the official technical map of the **WardenIPS** ecosystem. It is designed for developers who want to:
 1. **Understand** how the system works under the hood.
@@ -25,6 +25,10 @@ graph TD
     H -->|Save to SQLite| I[(DatabaseManager)]
     H -->|Trigger Ban| J[FirewallManager ipset/iptables]
     H -->|Report Threat| K[AbuseIPDBReporter]
+    
+    L[BlocklistManager] -->|First Setup bulk load| J
+    L -->|Daily active refresh| J
+    L -->|Fetch from GitHub| M[borestad/blocklist-abuseipdb]
 ```
 
 ---
@@ -41,6 +45,7 @@ If you want to edit the core, here is where everything lives inside `wardenips/c
 | **Firewall** | `firewall.py` | Manages `ipset`. Simulation mode on Windows. | *If you add Docker support, you will need to modify this file to interact with Docker's internal networking instead of just host `iptables`.* |
 | **Tailer** | `log_tailer.py`| Cross-platform asynchronous file reader. | *Uses polling instead of `inotify`. Safe for all OS. If logs rotate, it catches them gracefully.* |
 | **KVKK/GDPR**| `ip_hasher.py` | HMAC SHA256 IP anonymization. | *If `enabled: false`, it stores raw IPs. This makes building a geographic map for a dashboard much easier.* |
+| **Blocklist** | `blocklist.py` | AbuseIPDB curated IP blocklist manager. | *Manages two ipset sets: `wardenips_first_setup` (temporary bulk load) and `wardenips_active` (daily refresh). Uses `ipset restore` for high-performance bulk loading. Fetches from GitHub raw URLs.* |
 
 ---
 
@@ -120,12 +125,12 @@ class NginxPlugin(BasePlugin):
 
 ## 🔄 5. Future Implementation Suggestions
 
-If you are a contributor looking to improve this project, here are the most requested core changes:
+If you are a contributor looking to improve this project, here are the most impactful areas:
 
-1. **Decentralized Threat Intelligence (P2P Banning):**
-   - Create a `sync.py` manager.
-   - Use websockets or simple HTTP polling to a central server (or master node).
-   - If Node A bans an IP for SSH brute-force, it broadcasts `{"ip": "1.2.3.4", "reason": "ssh_brute"}`. Node B receives this and immediately adds it to `ipset`.
+1. **Blocklist Enhancements:**
+   - The current blocklist system fetches from [`borestad/blocklist-abuseipdb`](https://github.com/borestad/blocklist-abuseipdb). Additional curated sources could be integrated as optional feeds.
+   - Consider adding configurable confidence thresholds or category-based filtering.
+   - IPv6 blocklists could be supported when upstream sources provide them.
 2. **Redis Integration:**
    - Update `database.py`. SQLite is fine for single servers, but for a 50-server cluster, a centralized Redis instance is needed to track "failed attempts" across the entire network simultaneously.
 3. **Docker Support:**
