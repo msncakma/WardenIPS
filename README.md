@@ -8,7 +8,7 @@ Maintainer: `msncakma`
 
 If you want a cleaner product-style overview for sharing or presentation, see [docs/index.md](docs/index.md).
 
-[![Version](https://img.shields.io/badge/version-0.2.2--green.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-0.2.3--green.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -18,17 +18,18 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 - Real-time prevention, not just log collection.
 - Linux-native enforcement with ipset, iptables, and IPv6 support.
 - Built-in blocklist protection powered by AbuseIPDB curated threat data.
+- ASN-based threat detection with autonomous weekly GeoLite2 updates.
 - Live operational dashboard with continuously updating metrics and event visibility.
-- Privacy-aware design: sensitive IP data is stored as salted hashes.
+- Privacy-aware design: no sensitive IP hashing, direct ASN enrichment.
 - Plugin-based detection model for SSH, Minecraft, and Nginx workloads.
 - Burst and flood detection for fast bot and scanner containment.
 - Optional Telegram, Discord, AbuseIPDB, Redis, and Docker integrations.
 
 ## Transparency
 
-WardenIPS v0.2.2 is feature-complete for its intended scope, but it is not pretending to be more mature than it is.
+WardenIPS v0.2.3 is feature-complete for its intended scope, with professional CLI tooling and robust error handling.
 
-- Current state: **v0.2.2** — active development with all major subsystems implemented.
+- Current state: **v0.2.3** — active development with all major subsystems implemented and polished.
 - Testing state: core flows are implemented and functional, broad production validation is ongoing.
 - Deployment advice: use in labs, staging, or controlled production pilots first.
 - Operational reality: misconfigured whitelists or aggressive thresholds can still block legitimate traffic.
@@ -47,9 +48,9 @@ WardenIPS ships with a built-in web dashboard for real-time visibility.
 - Fast operational feedback without external observability tooling.
 - Advanced admin console available at `/admin` with live filters, raw active firewall IP view, operator advice, and blocklist protection status.
 
-### Blocklist Protection (New in v0.2.0)
+### Blocklist Protection (v0.2.0+)
 
-WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). This replaces the previous experimental P2P threat mesh with a simpler, more reliable approach.
+WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb).
 
 - **First Setup phase**: On first run, loads ~107K (7d) or ~132K (14d) known malicious IPs into a dedicated ipset. This set auto-expires after the chosen period to prevent stale false-positives.
 - **Daily Active refresh**: Every day at a configurable time, fetches ~80K IPs reported in the last 24 hours. These accumulate in a separate active ipset.
@@ -57,13 +58,23 @@ WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated
 - Timezone-aware scheduling — set your local timezone and preferred fetch time.
 - Zero configuration required — enabled by default with sensible defaults.
 
+### ASN-Based Threat Detection (New in v0.2.3)
+
+WardenIPS now includes autonomous ASN enrichment and configurable ASN-based blocking.
+
+- **Automatic GeoLite2 updates**: Downloads and refreshes [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) weekly (Thursday 03:00 UTC) at zero overhead.
+- **Suspicious ASN list**: Configure custom ASN numbers (e.g., datacenter providers) to automatically flag and optionally block traffic from those networks.
+- **Risk integration**: ASN-flagged connections receive a +20 point risk boost in scoring pipeline.
+- **No manual updates required**: Uses GitHub CDN for reliable, free, and transparent threat data.
+- **Dashboard badge**: Real-time display of suspicious ASN events with operator indicators.
+
 ### Layered Detection
 
 - SSH brute-force detection.
 - Minecraft rapid connection and bot-style behavior detection.
 - Nginx web threat detection for scanners, suspicious paths, traversal probes, and SQLi-style traffic.
-- ASN and country enrichment with MaxMind GeoLite2.
-- Geofencing and datacenter-aware risk escalation.
+- ASN enrichment with autonomous GeoLite2 updates (Loyalsoldier/geoip).
+- Configurable ASN blocking for datacenter and suspicious networks.
 
 ### Operator-Friendly Deployment
 
@@ -80,18 +91,20 @@ For Debian/Ubuntu-style systems:
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
 ```
 
-What the installer does:
+What the Installer Does:
 
-- Installs required system dependencies.
-- Fetches or updates the project files.
+- Installs required system dependencies (curl, git, ipset, iptables, etc.).
+- Fetches or updates the project files from the repository.
 - Creates and repairs the Python virtual environment if needed.
-- Installs Python dependencies.
-- Creates a dedicated `wardenips` service user by default and prepares runtime ownership automatically.
-- Preserves the previous `config.yaml`, then merges any newly added template keys from `config_backup.yaml` into the active config.
-- Grants the service account read access to the SSH log path and adds it to `adm` on Debian/Ubuntu-style systems.
+- Installs Python dependencies from `requirements.txt`.
+- Creates a dedicated `wardenips` service user and prepares runtime ownership automatically.
+- Preserves the previous `config.yaml`, then merges any newly added template keys automatically.
+- Downloads initial GeoLite2-ASN.mmdb from Loyalsoldier/geoip for ASN lookups.
+- Grants the service account read access to system logs (SSH, Nginx, etc.).
 - Enables the dashboard by default on `127.0.0.1:7680`.
 - Installs and enables the systemd service.
-- Installs a `wardenips` command wrapper so common checks do not require changing into the install directory.
+- Installs a professional, colorized `wardenips` CLI command wrapper with integrated help.
+- Traps errors with line numbers for easier troubleshooting.
 
 Dashboard auth notes:
 
@@ -113,13 +126,15 @@ What it deliberately does not do automatically:
 - It does not assume your whitelist is correct.
 - It does not force an immediate production start unless you explicitly choose to.
 
-Bootstrap installer flags:
+Bootstrap Installer Flags:
 
 - `WARDENIPS_AUTOSTART=1` starts the service automatically after install.
 - `WARDENIPS_ENABLE_DASHBOARD=0` keeps the dashboard disabled during bootstrap.
 - `WARDENIPS_REPO_BRANCH=branch-name` installs from a different branch.
 - `WARDENIPS_USER=username` overrides the default service user.
 - `WARDENIPS_GROUP=groupname` overrides the default service group.
+- `WARDENIPS_VERBOSE=1` shows detailed installation output.
+- `WARDENIPS_DEBUG=1` enables debug tracing (set -x).
 
 Verbose and debug install commands:
 
@@ -128,17 +143,37 @@ sudo env WARDENIPS_VERBOSE=1 sh -c "$(curl -fsSL https://raw.githubusercontent.c
 sudo env WARDENIPS_DEBUG=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
 ```
 
-Direct terminal commands after install:
+CLI Wrapper Commands (v0.2.3+):
 
+**Core Operations:**
 ```sh
-wardenips version
-wardenips status
-wardenips service-status
-wardenips logs
-wardenips shell
+wardenips console        # Run in console mode with colored banner and live logs
+wardenips start          # Start the WardenIPS service
+wardenips stop           # Stop the WardenIPS service  
+wardenips restart        # Restart the WardenIPS service
 ```
 
-These wrapper commands use `sudo` automatically when protected files, service control, or the install directory require elevated access.
+**Monitoring & Status:**
+```sh
+wardenips status         # Show systemd service status
+wardenips logs           # Stream live service logs (journalctl -f)
+wardenips summary        # Display database statistics and event counts
+```
+
+**Configuration:**
+```sh
+wardenips config         # Print configuration file path
+wardenips path           # Print installation directory
+wardenips edit           # Edit configuration with default editor (sudo)
+```
+
+**Utilities:**
+```sh
+wardenips version        # Show WardenIPS version
+wardenips help           # Show help with colored command categories
+```
+
+All commands use `sudo` automatically when elevated access is required. The CLI wrapper includes a professional ANSI-colored banner with command categories and error trapping for better diagnostics.
 
 ## Quick Start
 
