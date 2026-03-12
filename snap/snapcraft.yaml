@@ -1,0 +1,147 @@
+name: wardenips
+version: '0.2.3'
+summary: Autonomous Intrusion Prevention System for Linux
+description: |
+  WardenIPS is a Linux-native, asynchronous intrusion prevention platform 
+  that watches real service logs, scores suspicious behavior, and blocks 
+  attackers at the firewall layer before they become a bigger problem.
+
+  Key Features:
+  • Real-time prevention with ipset/iptables enforcement
+  • Built-in blocklist protection (AbuseIPDB curated lists)  
+  • ASN-based threat detection with weekly GeoLite2 updates
+  • Live operational dashboard with admin console
+  • Plugin-based detection (SSH, Minecraft, Nginx)
+  • Professional CLI wrapper with colored output
+  • Systemd service integration
+
+  After installation:
+  sudo wardenips.configure  # Initial setup
+  sudo wardenips.start      # Start service
+  wardenips.logs           # View colored logs
+  # Dashboard: http://127.0.0.1:7680/
+
+confinement: classic  # Required for firewall/system access
+grade: stable
+base: core22
+license: MIT
+architectures: [amd64, arm64]
+
+# Custom installation paths
+layout:
+  /opt/wardenips:
+    bind: $SNAP_DATA
+  /var/lib/wardenips:
+    bind: $SNAP_COMMON/lib
+  /var/log/wardenips:
+    bind: $SNAP_COMMON/log
+  /etc/systemd/system/wardenips.service:
+    bind-file: $SNAP_DATA/systemd/wardenips.service
+
+apps:
+  # Main CLI (wrappers)
+  wardenips:
+    command: bin/wardenips-wrapper
+    environment:
+      INSTALL_DIR: $SNAP_DATA
+      PYTHONPATH: $SNAP/lib/python3.10/site-packages
+    
+  # Direct console mode
+  console:
+    command: bin/wardenips-console
+    environment:
+      INSTALL_DIR: $SNAP_DATA
+      PYTHONPATH: $SNAP/lib/python3.10/site-packages
+      
+  # Configuration helper  
+  configure:
+    command: bin/wardenips-configure
+    environment:
+      INSTALL_DIR: $SNAP_DATA
+      
+  # Service management
+  start:
+    command: bin/wardenips-start
+  stop:
+    command: bin/wardenips-stop
+  restart:
+    command: bin/wardenips-restart
+  status:
+    command: bin/wardenips-status
+  logs:
+    command: bin/wardenips-logs
+
+  # Daemon mode (for systemd service)
+  daemon:
+    command: bin/wardenips-daemon
+    daemon: simple
+    restart-condition: on-failure
+    restart-delay: 5s
+    environment:
+      INSTALL_DIR: $SNAP_DATA
+      PYTHONPATH: $SNAP/lib/python3.10/site-packages
+
+parts:
+  wardenips:
+    plugin: python
+    source: .
+    requirements:
+      - requirements.txt
+    build-packages:
+      - python3-dev
+      - build-essential
+      - curl
+      - git
+    stage-packages:
+      - python3-venv
+      - ipset
+      - iptables
+      - curl
+      - git
+      - rsync
+      - acl
+      - iproute2
+    override-build: |
+      craftctl default
+      
+      # Create directories
+      mkdir -p $CRAFTCTL_INSTALL/bin
+      mkdir -p $CRAFTCTL_INSTALL/etc/wardenips
+      mkdir -p $CRAFTCTL_INSTALL/systemd
+      
+      # Copy application files
+      cp -r wardenips $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
+      cp main.py $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
+      cp config_backup.yaml $CRAFTCTL_INSTALL/etc/wardenips/
+      cp whitelist.ips $CRAFTCTL_INSTALL/etc/wardenips/
+      
+      # Create systemd service file for snap
+      cat > $CRAFTCTL_INSTALL/systemd/wardenips.service << 'EOF'
+      [Unit]
+      Description=WardenIPS - Autonomous Intrusion Prevention System (Snap)
+      After=network-online.target
+      Wants=network-online.target
+      
+      [Service]
+      Type=simple
+      ExecStart=/snap/bin/wardenips.daemon
+      Restart=on-failure
+      RestartSec=5
+      User=root
+      Group=root
+      
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      
+  snap-wrappers:
+    plugin: dump
+    source: snap/local/
+    stage:
+      - bin/
+
+slots:
+  wardenips-service:
+    interface: system-files
+    write: 
+      - /etc/systemd/system/wardenips.service

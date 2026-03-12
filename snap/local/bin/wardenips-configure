@@ -1,0 +1,91 @@
+#!/bin/bash
+set -e
+
+# WardenIPS Configuration Helper for Snap
+# Sets up initial configuration and directories
+
+INSTALL_DIR="${SNAP_DATA}"
+CONFIG_FILE="${SNAP_DATA}/config.yaml" 
+TEMPLATE_CONFIG="${SNAP}/etc/wardenips/config_backup.yaml"
+WHITELIST_FILE="${SNAP_DATA}/whitelist.ips"
+TEMPLATE_WHITELIST="${SNAP}/etc/wardenips/whitelist.ips"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This command requires root privileges."
+    echo "Please run: sudo wardenips.configure"
+    exit 1
+fi
+
+echo "============================================"
+echo "   WardenIPS Snap Configuration"
+echo "============================================"
+echo ""
+
+# Create directories
+mkdir -p "$SNAP_COMMON/lib"
+mkdir -p "$SNAP_COMMON/log" 
+mkdir -p "$INSTALL_DIR/assets"
+
+# Copy default configuration if not exists
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "📝 Creating default configuration..."
+    cp "$TEMPLATE_CONFIG" "$CONFIG_FILE"
+    echo "✓ Configuration created: $CONFIG_FILE"
+else
+    echo "📝 Configuration already exists: $CONFIG_FILE"
+fi
+
+# Copy whitelist if not exists
+if [ ! -f "$WHITELIST_FILE" ]; then
+    echo "🛡️  Creating default whitelist..."
+    cp "$TEMPLATE_WHITELIST" "$WHITELIST_FILE"
+    echo "✓ Whitelist created: $WHITELIST_FILE"
+else
+    echo "🛡️  Whitelist already exists: $WHITELIST_FILE"
+fi
+
+# Set permissions
+chown root:root "$CONFIG_FILE" "$WHITELIST_FILE" 2>/dev/null || true
+chmod 600 "$CONFIG_FILE" "$WHITELIST_FILE" 2>/dev/null || true
+
+# Create log file
+touch "$SNAP_COMMON/log/warden.log"
+chmod 644 "$SNAP_COMMON/log/warden.log" 2>/dev/null || true
+
+# Download GeoLite2 database
+echo "🌍 Downloading GeoLite2-ASN database..."
+GEOIP_URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
+GEOIP_FILE="$INSTALL_DIR/assets/GeoLite2-ASN.mmdb"
+
+if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL -o "$GEOIP_FILE" "$GEOIP_URL"; then
+        echo "✓ GeoLite2-ASN database downloaded"
+    else
+        echo "⚠ Warning: Failed to download GeoLite2 database"
+    fi
+elif command -v wget >/dev/null 2>&1; then
+    if wget -q -O "$GEOIP_FILE" "$GEOIP_URL"; then
+        echo "✓ GeoLite2-ASN database downloaded"
+    else
+        echo "⚠ Warning: Failed to download GeoLite2 database"
+    fi
+else
+    echo "⚠ Warning: Neither curl nor wget found, skipping GeoLite2 download"
+fi
+
+echo ""
+echo "✅ WardenIPS configuration completed!"
+echo ""
+echo "Next steps:"
+echo "  1. Edit configuration: sudo wardenips edit"
+echo "  2. Add trusted IPs to whitelist"
+echo "  3. Start service: sudo wardenips start"
+echo "  4. View logs: wardenips logs"
+echo "  5. Access dashboard: http://127.0.0.1:7680/"
+echo ""

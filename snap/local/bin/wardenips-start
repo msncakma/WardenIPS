@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+# Service management wrapper for WardenIPS Snap
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}✗ Service management requires root privileges.${NC}"
+    echo "Please run: sudo wardenips.start"
+    exit 1
+fi
+
+# Install systemd service if not exists
+SERVICE_FILE="/etc/systemd/system/wardenips.service"
+if [ ! -f "$SERVICE_FILE" ]; then
+    echo "📝 Installing systemd service..."
+    cp "$SNAP_DATA/systemd/wardenips.service" "$SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl enable wardenips.service
+    echo -e "${GREEN}✓ Systemd service installed${NC}"
+fi
+
+echo "🚀 Starting WardenIPS service..."
+if systemctl start wardenips.service; then
+    echo -e "${GREEN}✓ WardenIPS service started${NC}"
+    systemctl --no-pager status wardenips.service
+else
+    echo -e "${RED}✗ Failed to start WardenIPS service${NC}"
+    systemctl --no-pager status wardenips.service
+    exit 1
+fi

@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+# WardenIPS Console Mode for Snap
+
+INSTALL_DIR="${SNAP_DATA}"
+CONFIG_FILE="${SNAP_DATA}/config.yaml"
+PYTHON_BIN="python3"
+MAIN_FILE="${SNAP}/lib/python3.10/site-packages/main.py"
+
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+print_banner() {
+    printf "\n"
+    printf "${CYAN}${BOLD}"
+    printf "╔════════════════════════════════════════════╗\n"
+    printf "║                                            ║\n"
+    printf "║  %b   WardenIPS Console   %b              ║\n" "$BLUE" "$CYAN"
+    printf "║                                            ║\n"
+    printf "║     Direct execution with live logs        ║\n"
+    printf "║                                            ║\n"
+    printf "╚════════════════════════════════════════════╝\n"
+    printf "${NC}\n"
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "⚠ WardenIPS not configured. Run: sudo wardenips.configure"
+    exit 1
+fi
+
+print_banner
+exec $PYTHON_BIN "$MAIN_FILE" --config "$CONFIG_FILE"
