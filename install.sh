@@ -16,6 +16,7 @@ VERBOSE="${WARDENIPS_VERBOSE:-0}"
 DEBUG_MODE="${WARDENIPS_DEBUG:-0}"
 SERVICE_USER="${WARDENIPS_USER:-wardenips}"
 SERVICE_GROUP="${WARDENIPS_GROUP:-wardenips}"
+FIRST_SETUP_MODE="${WARDENIPS_FIRST_SETUP_MODE:-}"
 APP_VERSION="unknown"
 APP_AUTHOR="msncakma"
 INSTALLED_VERSION=""
@@ -181,6 +182,54 @@ PY
 )"
     BOOTSTRAP_TOKEN_HASH="$(printf '%s\n' "$BOOTSTRAP_METADATA" | sed -n '1p')"
     BOOTSTRAP_EXPIRES_AT="$(printf '%s\n' "$BOOTSTRAP_METADATA" | sed -n '2p')"
+}
+
+prompt_first_setup_mode() {
+    if [ "$INSTALL_MODE" = "update" ]; then
+        return
+    fi
+
+    if [ -n "$FIRST_SETUP_MODE" ]; then
+        case "$FIRST_SETUP_MODE" in
+            7d|14d)
+                log "First-setup blocklist mode preset via env: $FIRST_SETUP_MODE"
+                return
+                ;;
+            *)
+                warn "Invalid WARDENIPS_FIRST_SETUP_MODE='$FIRST_SETUP_MODE'. Falling back to 7d."
+                FIRST_SETUP_MODE="7d"
+                return
+                ;;
+        esac
+    fi
+
+    if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
+        FIRST_SETUP_MODE="7d"
+        log "No interactive terminal detected. Using recommended first-setup mode: 7d."
+        return
+    fi
+
+    printf "%b\n" "${YELLOW}[?]${NC} First-setup blocklist mode"
+    printf "%b\n" "    1) 7d  (recommended, lower false-positive risk)"
+    printf "%b\n" "    2) 14d (broader initial coverage)"
+    printf "%b" "    Select [1/2] (default: 1): "
+
+    if [ -r /dev/tty ]; then
+        read -r USER_MODE </dev/tty || USER_MODE=""
+    else
+        read -r USER_MODE || USER_MODE=""
+    fi
+
+    case "$USER_MODE" in
+        2|14d|14D)
+            FIRST_SETUP_MODE="14d"
+            ;;
+        *)
+            FIRST_SETUP_MODE="7d"
+            ;;
+    esac
+
+    log "Selected first-setup blocklist mode: $FIRST_SETUP_MODE"
 }
 
 deploy_files() {
@@ -410,6 +459,25 @@ path.write_text(text, encoding='utf-8')
 PY
         log "Enabled dashboard by default on 127.0.0.1:7680."
     fi
+
+    "$INSTALL_DIR/venv/bin/python" - "$INSTALL_DIR/config.yaml" "$FIRST_SETUP_MODE" <<'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+
+path = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode not in {"7d", "14d"}:
+    mode = "7d"
+data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+blocklist = data.setdefault('blocklist', {})
+first_setup = blocklist.setdefault('first_setup', {})
+first_setup['mode'] = mode
+path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding='utf-8')
+PY
+    log "Configured first-setup blocklist mode: $FIRST_SETUP_MODE"
 
     if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN_HASH" ]; then
         "$INSTALL_DIR/venv/bin/python" - "$INSTALL_DIR/config.yaml" "$BOOTSTRAP_TOKEN_HASH" "$BOOTSTRAP_EXPIRES_AT" <<'PY'
@@ -652,6 +720,7 @@ PY
 install_dependencies
 detect_source_dir
 detect_existing_install
+prompt_first_setup_mode
 prepare_update
 prepare_bootstrap_token
 deploy_files "$SOURCE_DIR"
@@ -681,7 +750,6 @@ printf "\n"
 printf "%b\n" "${GREEN}============================================${NC}"
 printf "%b\n" "${GREEN}   WardenIPS Installation Complete${NC}"
 printf "%b\n" "${GREEN}============================================${NC}"
-printf "\n"
 printf "%b\n" "  ${GREEN}Deployment Summary${NC}"
 printf "%b\n" "    Mode           : ${CYAN}$INSTALL_MODE${NC}"
 if [ "$INSTALL_MODE" = "update" ]; then
@@ -696,6 +764,9 @@ printf "%b\n" "    Dashboard      : ${CYAN}$DASHBOARD_SUMMARY${NC}"
 printf "%b\n" "    Service Unit   : ${CYAN}wardenips.service${NC}"
 printf "%b\n" "    Service User   : ${CYAN}$SERVICE_USER${NC}"
 printf "%b\n" "    Service State  : ${CYAN}$SERVICE_STATE_SUMMARY${NC}"
+if [ "$INSTALL_MODE" != "update" ]; then
+    printf "%b\n" "    First-Setup    : ${CYAN}$FIRST_SETUP_MODE${NC}"
+fi
 if [ "$INSTALL_MODE" = "update" ]; then
     printf "%b\n" "    Config Merge   : ${CYAN}Existing config preserved, missing template keys merged automatically${NC}"
 else
@@ -707,14 +778,12 @@ if [ "$INSTALL_MODE" != "update" ] && [ -n "$BOOTSTRAP_TOKEN" ]; then
     printf "%b\n" "    Setup URL      : ${CYAN}http://127.0.0.1:7680/setup${NC}"
     printf "%b\n" "    Bootstrap Token: ${CYAN}$BOOTSTRAP_TOKEN${NC}"
     printf "%b\n" "    Expires At     : ${CYAN}$BOOTSTRAP_EXPIRES_AT${NC}"
-    printf "\n"
 fi
 printf "%b\n" "  ${YELLOW}Recommended Next Steps${NC}"
 printf "%b\n" "    1. Review ${CYAN}$INSTALL_DIR/config.yaml${NC}"
 printf "%b\n" "    2. Update whitelist.ips with your trusted addresses"
 printf "%b\n" "    3. Verify plugin log paths and notification credentials"
 printf "%b\n" "    4. Open /admin and review release notices after login"
-printf "\n"
 printf "%b\n" "  ${GREEN}Operational Commands${NC}"
 printf "%b\n" "    sudo systemctl start wardenips"
 printf "%b\n" "    sudo systemctl status wardenips"

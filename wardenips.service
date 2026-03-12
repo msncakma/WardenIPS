@@ -33,7 +33,7 @@ RestrictSUIDSGID=yes
 
 # Allow write access to mutable runtime state and the editable config file.
 # Keep the rest of the install tree read-only.
-ReadWritePaths=/var/lib/wardenips /var/log/wardenips __INSTALL_DIR__/config.yaml __INSTALL_DIR__/config.yaml.backup __INSTALL_DIR__/config_backup.yaml
+ReadWritePaths=/var/lib/wardenips /var/log/wardenips __INSTALL_DIR__/config.yaml __INSTALL_DIR__/config_backup.yaml
 
 # Required for ipset/iptables
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW

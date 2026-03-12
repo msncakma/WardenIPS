@@ -26,6 +26,17 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/
 
 The installer handles everything: dependencies, venv, config, systemd service, and a dedicated service user.
 
+During a fresh one-line install, the installer asks which first-setup blocklist window to use:
+
+- `7d` (recommended): lower false-positive risk
+- `14d`: broader initial coverage
+
+For unattended installs, preseed the choice:
+
+```bash
+sudo env WARDENIPS_FIRST_SETUP_MODE=7d sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
+```
+
 To start immediately after install:
 
 ```bash
