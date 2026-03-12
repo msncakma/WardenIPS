@@ -182,13 +182,13 @@ class SSHPlugin(BasePlugin):
         Factors:
           - Event type (invalid_user > failed_password > connection_closed)
           - Number of attempts in the last N minutes (repeated attempts increase risk)
-          - Datacenter IP? (datacenter = high risk)
+          - Suspicious ASN? (e.g. known datacenter provider = higher risk)
           - root user? (root = additional risk)
         """
         score = 0
         event_type = event.details.get("event_type", "")
         event_count = context.get("event_count", 0)
-        is_datacenter = context.get("is_datacenter", False)
+        is_suspicious_asn = context.get("is_suspicious_asn", False)
 
         # Olay tipi bazli taban skor
         if event_type == "invalid_user":
@@ -207,8 +207,8 @@ class SSHPlugin(BasePlugin):
         if event_count > 0:
             score += min(event_count * 10, 60)
 
-        # Datacenter IP
-        if is_datacenter:
+        # Suspicious ASN (user-defined suspicious list)
+        if is_suspicious_asn:
             score += 20
 
         # root hedefi

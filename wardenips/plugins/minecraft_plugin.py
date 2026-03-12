@@ -189,13 +189,13 @@ class MinecraftPlugin(BasePlugin):
         Factors:
           - Event type (failed_packet > ip_disconnect > login)
           - Number of connections in the last N seconds (fast = botnet)
-          - Datacenter IP?
+          - Suspicious ASN?
           - Player name missing? (bot indicator)
         """
         score = 0
         event_type = event.details.get("event_type", "")
         event_count = context.get("event_count", 0)
-        is_datacenter = context.get("is_datacenter", False)
+        is_suspicious_asn = context.get("is_suspicious_asn", False)
         global_burst_count = 0
         global_burst_unique_ips = 0
 
@@ -238,8 +238,8 @@ class MinecraftPlugin(BasePlugin):
         elif global_burst_unique_ips >= self._global_burst_min_unique_ips:
             score += 25
 
-        # Datacenter IP
-        if is_datacenter:
+        # Suspicious ASN (user-defined suspicious list)
+        if is_suspicious_asn:
             score += 20
 
         # Player name missing? (bot indicator)

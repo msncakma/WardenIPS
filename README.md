@@ -8,7 +8,7 @@ Maintainer: `msncakma`
 
 If you want a cleaner product-style overview for sharing or presentation, see [docs/index.md](docs/index.md).
 
-[![Version](https://img.shields.io/badge/version-0.2.0--beta-blue.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-0.2.2--green.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

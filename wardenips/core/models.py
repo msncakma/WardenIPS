@@ -42,19 +42,17 @@ class ConnectionEvent:
     Immutable data model representing a single connection event.
 
     Attributes:
-        timestamp:        Timestamp of when the event occurred.
-        source_ip:        Source IP address (plaintext, used only in analysis,
-                          hashed before being written to the database).
-        connection_type:  Connection type (e.g. SSH, Minecraft)
-        player_name:      Player nick (Minecraft) or username (SSH).
-        asn_number:       ASN number the IP belongs to.
-        asn_org:          ASN organization name.
-        country_code:     Country code (ISO 3166-1 alpha-2, e.g. "TR").
-        is_datacenter:    Does the IP belong to a datacenter?
-        threat_level:     Calculated threat level.
-        risk_score:       Risk score from 0 to 100.
-        raw_log_line:     Raw log line (for debugging).
-        details:          Additional analysis details.
+        timestamp:         Timestamp of when the event occurred.
+        source_ip:         Source IP address (plaintext, used only in analysis).
+        connection_type:   Connection type (e.g. SSH, Minecraft)
+        player_name:       Player nick (Minecraft) or username (SSH).
+        asn_number:        ASN number the IP belongs to.
+        asn_org:           ASN organization name.
+        is_suspicious_asn: Is the IP's ASN on the user's suspicious list?
+        threat_level:      Calculated threat level.
+        risk_score:        Risk score from 0 to 100.
+        raw_log_line:      Raw log line (for debugging).
+        details:           Additional analysis details.
     """
 
     timestamp: datetime
@@ -63,8 +61,7 @@ class ConnectionEvent:
     player_name: Optional[str] = None
     asn_number: Optional[int] = None
     asn_org: Optional[str] = None
-    country_code: Optional[str] = None
-    is_datacenter: bool = False
+    is_suspicious_asn: bool = False
     threat_level: ThreatLevel = ThreatLevel.NONE
     risk_score: int = 0
     raw_log_line: Optional[str] = None

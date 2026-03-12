@@ -15,7 +15,7 @@ Endpoints:
   GET  /api/firewall            — Firewall status
   GET  /api/top-attackers       — Top attacking source IPs
   GET  /api/events-timeline     — Events grouped by hour
-  GET  /api/country-stats       — Events grouped by country
+  GET  /api/asn-stats           — Events grouped by ASN organization
   GET  /api/threat-distribution — Events grouped by threat level
   GET  /api/plugin-stats        — Events grouped by plugin/connection type
   GET  /login                   — Dashboard login page
@@ -404,7 +404,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/firewall", self._handle_firewall)
     self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
     self._app.router.add_get("/api/events-timeline", self._handle_events_timeline)
-    self._app.router.add_get("/api/country-stats", self._handle_country_stats)
+    self._app.router.add_get("/api/asn-stats", self._handle_asn_stats)
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
@@ -484,7 +484,7 @@ class DashboardAPI:
           """
           SELECT id, timestamp, source_ip, player_name,
                connection_type, asn_number, asn_org,
-               country_code, is_datacenter, risk_score,
+               is_suspicious_asn, risk_score,
                threat_level, details
           FROM connection_events
           ORDER BY id DESC
@@ -570,25 +570,27 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
-  async def _handle_country_stats(self, request: web.Request) -> web.Response:
+  async def _handle_asn_stats(self, request: web.Request) -> web.Response:
+    """Top ASN organizations by attack count and suspicious flag."""
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
       async with self._db._lock:
         async with self._db._db.execute(
           """
-          SELECT COALESCE(country_code, 'Unknown') as country,
-               COUNT(*) as count
+          SELECT COALESCE(asn_org, 'Unknown') as org,
+               COUNT(*) as count,
+               SUM(CASE WHEN is_suspicious_asn=1 THEN 1 ELSE 0 END) as suspicious_count
           FROM connection_events
-          WHERE country_code IS NOT NULL
-          GROUP BY country_code
+          WHERE asn_org IS NOT NULL
+          GROUP BY asn_org
           ORDER BY count DESC
           LIMIT 20
           """
         ) as cursor:
           rows = await cursor.fetchall()
-          countries = [{"country": r[0], "count": r[1]} for r in rows]
-      return web.json_response({"countries": countries})
+          orgs = [{"org": r[0], "count": r[1], "suspicious": r[2]} for r in rows]
+      return web.json_response({"asn_orgs": orgs})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -1868,7 +1870,7 @@ async function refresh(){
   var bn=await A('/api/bans');
   var ev=await A('/api/events?limit=50');
   var tl=await A('/api/events-timeline?hours=24');
-  var co=await A('/api/country-stats');
+  var co=await A('/api/asn-stats');
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var at=await A('/api/top-attackers?limit=10');
@@ -1908,11 +1910,10 @@ async function refresh(){
   if(!ev||!ev.events||!ev.events.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0'}
   else{ee.style.display='none';ep.textContent=ev.count;
     etb.innerHTML=ev.events.map(function(e){
-      var fl=CF(e.country_code);
       var pl=(e.connection_type||'unknown').toUpperCase();
       var tc=e.threat_level;
       var tcl=tc==='HIGH'||tc==='CRITICAL'?'tg-H':tc==='MEDIUM'?'tg-M':tc==='LOW'?'tg-L':'tg-N';
-      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td>'+(fl?'<span style="font-size:1.1rem;margin-right:.3rem">'+fl+'</span>':'')+E(e.country_code||'-')+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td></tr>';
+      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td></tr>';
     }).join('')}
 
   // Timeline
@@ -2388,9 +2389,9 @@ function renderSummary(){
 }
 function renderEvents(){
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
-  rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.country_code,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
+  rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
   rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.timestamp||'').localeCompare(String(a.timestamp||'')); });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').slice(0,16))+'…</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td>'+E(e.country_code||'-')+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+E(e.asn_org||'-')+'</td></tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').slice(0,16))+'…</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td></tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
   var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;

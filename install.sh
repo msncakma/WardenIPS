@@ -3,6 +3,8 @@
 # Supports both local execution and curl | sh style remote execution.
 set -eu
 
+trap 'printf "\n%b\n" "${RED}✗ Installation failed at line $LINENO.${NC}"; exit 1' ERR
+
 INSTALL_DIR="${INSTALL_DIR:-/opt/wardenips}"
 DATA_DIR="${DATA_DIR:-/var/lib/wardenips}"
 LOG_DIR="${LOG_DIR:-/var/log/wardenips}"
@@ -543,6 +545,42 @@ PY
     fi
 }
 
+download_geoip_database() {
+    log "Downloading MaxMind GeoLite2-ASN database (from Loyalsoldier/geoip)..."
+    
+    ASSETS_DIR="/opt/wardenips/assets"
+    GEOIP_URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
+    GEOIP_FILE="$ASSETS_DIR/GeoLite2-ASN.mmdb"
+    
+    mkdir -p "$ASSETS_DIR"
+    
+    if [ -f "$GEOIP_FILE" ]; then
+        warn "GeoLite2-ASN.mmdb already exists, skipping download."
+        return
+    fi
+    
+    if command -v curl >/dev/null 2>&1; then
+        if ! run_quiet curl -fsSL -o "$GEOIP_FILE" "$GEOIP_URL"; then
+            error "Failed to download GeoLite2-ASN.mmdb from GitHub. Check your internet connection."
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if ! run_quiet wget -q -O "$GEOIP_FILE" "$GEOIP_URL"; then
+            error "Failed to download GeoLite2-ASN.mmdb from GitHub. Check your internet connection."
+        fi
+    else
+        error "Neither curl nor wget found. Cannot download GeoLite2-ASN.mmdb. Install curl or wget and try again."
+    fi
+    
+    # Verify file was downloaded correctly (should be ~10MB)
+    if [ ! -f "$GEOIP_FILE" ] || [ ! -s "$GEOIP_FILE" ]; then
+        error "GeoLite2-ASN.mmdb download failed or file is empty."
+    fi
+    
+    chown "$SERVICE_USER":"$SERVICE_GROUP" "$GEOIP_FILE"
+    chmod 640 "$GEOIP_FILE"
+    log "GeoLite2-ASN.mmdb downloaded and configured."
+}
+
 install_cli_wrapper() {
     log "Installing CLI wrapper..."
     cat > "$CLI_WRAPPER" <<'EOF'
@@ -555,6 +593,28 @@ PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
 MAIN_FILE="$INSTALL_DIR/main.py"
 SERVICE_NAME="wardenips"
 
+# Renkler (ANSI kod)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+print_banner() {
+    printf "\n"
+    printf "${CYAN}${BOLD}"
+    printf "╔════════════════════════════════════════════╗\n"
+    printf "║                                            ║\n"
+    printf "║  %b   WardenIPS   %b              ║\n" "$BLUE" "$CYAN"
+    printf "║                                            ║\n"
+    printf "║     Autonomous Intrusion Protection        ║\n"
+    printf "║                                            ║\n"
+    printf "╚════════════════════════════════════════════╝\n"
+    printf "${NC}\n"
+}
+
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         exec "$@"
@@ -564,40 +624,29 @@ run_privileged() {
         exec sudo "$@"
     fi
 
-    printf "This command requires root or sudo.\n" >&2
-    exit 1
-}
-
-run_privileged_shell() {
-    if [ "$(id -u)" -eq 0 ]; then
-        cd "$INSTALL_DIR"
-        exec "${SHELL:-/bin/sh}"
-    fi
-
-    if command -v sudo >/dev/null 2>&1; then
-        exec sudo env INSTALL_DIR="$INSTALL_DIR" WRAPPER_SHELL="${SHELL:-/bin/sh}" sh -c 'cd "$INSTALL_DIR" && exec "$WRAPPER_SHELL"'
-    fi
-
-    printf "This command requires root or sudo.\n" >&2
+    printf "${RED}✗ This command requires root or sudo.${NC}\n" >&2
     exit 1
 }
 
 usage() {
-    printf "WardenIPS command wrapper\n"
-    printf "Usage: wardenips <command> [args]\n\n"
-    printf "Commands:\n"
-    printf "  version         Show installed version\n"
-    printf "  status          Show WardenIPS database summary\n"
-    printf "  start           Start the systemd service\n"
-    printf "  stop            Stop the systemd service\n"
-    printf "  restart         Restart the systemd service\n"
-    printf "  service-status  Show systemd service status\n"
-    printf "  logs            Tail service logs\n"
-    printf "  config          Print config path\n"
-    printf "  path            Print install path\n"
-    printf "  ls              List install directory\n"
-    printf "  shell           Open a shell in the install directory\n"
-    printf "  run [args]      Run main.py directly with the installed config\n"
+    print_banner
+    printf "${GREEN}${BOLD}Usage:${NC} wardenips <command> [args]\n\n"
+    printf "${BOLD}Core Commands:${NC}\n"
+    printf "  ${CYAN}console${NC}         Run in console mode with direct logs (requires sudo)\n"
+    printf "  ${CYAN}start${NC}           Start the WardenIPS service\n"
+    printf "  ${CYAN}stop${NC}            Stop the WardenIPS service\n"
+    printf "  ${CYAN}restart${NC}         Restart the WardenIPS service\n\n"
+    printf "${BOLD}Status & Monitoring:${NC}\n"
+    printf "  ${CYAN}status${NC}          Show service status\n"
+    printf "  ${CYAN}logs${NC}            Stream live service logs\n"
+    printf "  ${CYAN}summary${NC}         Display database statistics\n\n"
+    printf "${BOLD}Configuration:${NC}\n"
+    printf "  ${CYAN}config${NC}          Print configuration file path\n"
+    printf "  ${CYAN}path${NC}            Print installation directory\n"
+    printf "  ${CYAN}edit${NC}            Edit configuration (requires sudo)\n\n"
+    printf "${BOLD}Utilities:${NC}\n"
+    printf "  ${CYAN}version${NC}         Show WardenIPS version\n"
+    printf "  ${CYAN}help${NC}            Show this help message\n\n"
 }
 
 case "${1:-help}" in
@@ -605,21 +654,28 @@ case "${1:-help}" in
         usage
         ;;
     version)
-        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --version
+        "$PYTHON_BIN" "$MAIN_FILE" --version
         ;;
-    status)
-        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+    summary|status-summary)
+        "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+        ;;
+    console)
+        print_banner
+        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE"
         ;;
     start)
         run_privileged systemctl start "$SERVICE_NAME"
+        printf "${GREEN}✓ WardenIPS service started${NC}\n"
         ;;
     stop)
         run_privileged systemctl stop "$SERVICE_NAME"
+        printf "${YELLOW}✓ WardenIPS service stopped${NC}\n"
         ;;
     restart)
         run_privileged systemctl restart "$SERVICE_NAME"
+        printf "${GREEN}✓ WardenIPS service restarted${NC}\n"
         ;;
-    service-status)
+    status)
         run_privileged systemctl status "$SERVICE_NAME"
         ;;
     logs)
@@ -631,18 +687,13 @@ case "${1:-help}" in
     path)
         printf "%s\n" "$INSTALL_DIR"
         ;;
-    ls)
-        run_privileged ls -la "$INSTALL_DIR"
-        ;;
-    shell)
-        run_privileged_shell
-        ;;
-    run)
-        shift
-        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+    edit)
+        run_privileged env EDITOR="${EDITOR:-nano}" sh -c "exec \"\$EDITOR\" \"$CONFIG_FILE\""
         ;;
     *)
-        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" "$@"
+        printf "${RED}✗ Unknown command: ${BOLD}$1${NC}\n" >&2
+        printf "Run '${CYAN}wardenips help${NC}' for available commands.\n" >&2
+        exit 1
         ;;
 esac
 EOF
@@ -708,6 +759,7 @@ merge_config_template
 configure_defaults
 configure_permissions
 grant_plugin_log_access
+download_geoip_database
 install_cli_wrapper
 install_service
 
@@ -761,12 +813,11 @@ printf "%b\n" "    1. Review ${CYAN}$INSTALL_DIR/config.yaml${NC}"
 printf "%b\n" "    2. Update whitelist.ips with your trusted addresses"
 printf "%b\n" "    3. Verify plugin log paths and notification credentials"
 printf "%b\n" "    4. Open /admin and review release notices after login"
-printf "%b\n" "  ${GREEN}Operational Commands${NC}"
-printf "%b\n" "    sudo systemctl start wardenips"
-printf "%b\n" "    sudo systemctl status wardenips"
-printf "%b\n" "    sudo journalctl -u wardenips -f"
-printf "%b\n" "    wardenips status"
-printf "%b\n" "    wardenips logs"
-printf "%b\n" "    wardenips service-status"
-printf "%b\n" "    wardenips shell"
-printf "\n"
+printf "%b\n" "  ${GREEN}Quick Start Commands${NC}"
+printf "%b\n" "    wardenips start              Start the service"
+printf "%b\n" "    wardenips status             Show service status"
+printf "%b\n" "    wardenips logs               Show live logs (tail -f)"
+printf "%b\n" "    wardenips status             Database summary"
+printf "%b\n" "    wardenips config             Show config file path"
+printf "%b\n" "    wardenips shell              Open install directory shell"
+printf "%b\n" ""

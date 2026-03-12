@@ -54,6 +54,7 @@ class WardenIPS:
         self._logger = None
         self._whitelist: WhitelistManager = None
         self._asn_engine: ASNLookupEngine = None
+        self._asn_update_task: asyncio.Task = None
         self._db: DatabaseManager = None
         self._firewall: FirewallManager = None
         self._abuse_reporter: AbuseIPDBReporter = None
@@ -106,8 +107,20 @@ class WardenIPS:
         self._whitelist = await WhitelistManager.create(self._config)
         self._logger.info("Whitelist: %s", self._whitelist.stats)
 
+        # ── 4.1 ASN Protection (GitHub'dan otomatik indirme) ──
         self._asn_engine = ASNLookupEngine(self._config)
+        # GeoLite2-ASN.mmdb yoksa GitHub'dan indir
+        asn_ready = await self._asn_engine.ensure_asn_database(self._config)
+        if asn_ready and self._asn_engine._asn_reader is None:
+            # Dosya indirildi, reload et
+            self._asn_engine._load(self._config)
         self._logger.info("ASN Engine: %s", self._asn_engine)
+        
+        # ── 4.2 ASN Weekly Scheduler (GitHub'dan haftalık güncelleme) ──
+        asn_auto_update = self._config.get("asn_protection.auto_update_enabled", True)
+        if asn_auto_update:
+            self._asn_update_task = self._asn_engine.start_weekly_scheduler(self._config)
+            self._logger.info("ASN weekly updater scheduled (every Thursday 03:00 UTC)")
 
         # Select database backend (sqlite or redis)
         db_backend = self._config.get("database.backend", "sqlite")
@@ -305,7 +318,7 @@ class WardenIPS:
             # 6. Calculate risk score
             context = {
                 "event_count": event_count,
-                "is_datacenter": asn_result.is_datacenter,
+                "is_suspicious_asn": asn_result.is_suspicious,
                 "asn_result": asn_result,
             }
             risk_score = await plugin.calculate_risk(event, context)
@@ -333,8 +346,7 @@ class WardenIPS:
                 player_name=event.player_name,
                 asn_number=asn_result.asn_number,
                 asn_org=asn_result.asn_org,
-                country_code=asn_result.country_code,
-                is_datacenter=asn_result.is_datacenter,
+                is_suspicious_asn=asn_result.is_suspicious,
                 threat_level=threat,
                 risk_score=risk_score,
                 raw_log_line=event.raw_log_line,
@@ -351,13 +363,7 @@ class WardenIPS:
                 )
                 return
 
-            # 9. Geofencing check
-            if not await self._whitelist.is_country_allowed(
-                asn_result.country_code
-            ):
-                risk_score = max(risk_score, 80)
-
-            # 10. Execute action
+            # 9. Execute action
             action = plugin.get_action_recommendation(risk_score)
 
             if action == "BAN":
@@ -576,6 +582,15 @@ class WardenIPS:
             await self._firewall.shutdown()
         if self._db:
             await self._db.close()
+        
+        # Cancel ASN update scheduler
+        if self._asn_update_task and not self._asn_update_task.done():
+            self._asn_update_task.cancel()
+            try:
+                await self._asn_update_task
+            except asyncio.CancelledError:
+                pass
+        
         if self._asn_engine:
             self._asn_engine.close()
 

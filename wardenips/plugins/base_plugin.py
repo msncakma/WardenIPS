@@ -130,7 +130,7 @@ class BasePlugin(abc.ABC):
                      - "recent_events": Recent events N minutes
                      - "event_count": Event count
                      - "asn_result": ASN lookup result
-                     - "is_datacenter": Is it Datacenter IP?
+                     - "is_suspicious_asn": Is IP's ASN on suspicious list?
 
         Returns:
             0-100 arasi risk skoru.

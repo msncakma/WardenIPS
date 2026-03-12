@@ -215,12 +215,12 @@ class NginxPlugin(BasePlugin):
         Factors:
           - Event type severity
           - Number of events in time window (scanning behaviour)
-          - Datacenter IP
+          - Suspicious ASN
         """
         score = 0
         event_type = event.details.get("event_type", "")
         event_count = context.get("event_count", 0)
-        is_datacenter = context.get("is_datacenter", False)
+        is_suspicious_asn = context.get("is_suspicious_asn", False)
 
         # Event type base scores
         type_scores = {
@@ -239,8 +239,8 @@ class NginxPlugin(BasePlugin):
         if event_count > 0:
             score += min(event_count * 8, 50)
 
-        # Datacenter IP
-        if is_datacenter:
+        # Suspicious ASN (user-defined suspicious list)
+        if is_suspicious_asn:
             score += 15
 
         return min(score, 100)

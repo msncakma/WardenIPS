@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -48,8 +48,7 @@ CREATE TABLE IF NOT EXISTS connection_events (
     connection_type TEXT    NOT NULL DEFAULT 'unknown',
     asn_number      INTEGER,
     asn_org         TEXT,
-    country_code    TEXT,
-    is_datacenter   INTEGER NOT NULL DEFAULT 0,
+    is_suspicious_asn INTEGER NOT NULL DEFAULT 0,
     risk_score      INTEGER NOT NULL DEFAULT 0,
     threat_level    TEXT    NOT NULL DEFAULT 'NONE',
     details         TEXT,
@@ -304,9 +303,9 @@ class DatabaseManager:
                     """
                     INSERT INTO connection_events
                         (timestamp, source_ip, player_name, connection_type,
-                         asn_number, asn_org, country_code, is_datacenter,
+                         asn_number, asn_org, is_suspicious_asn,
                          risk_score, threat_level, details)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.timestamp.isoformat(),
@@ -315,8 +314,7 @@ class DatabaseManager:
                         event.connection_type.value,
                         event.asn_number,
                         event.asn_org,
-                        event.country_code,
-                        1 if event.is_datacenter else 0,
+                        1 if event.is_suspicious_asn else 0,
                         event.risk_score,
                         event.threat_level.name,
                         details_json,
@@ -423,7 +421,7 @@ class DatabaseManager:
                 """
                   SELECT id, timestamp, source_ip, player_name,
                        connection_type, asn_number, asn_org,
-                       country_code, is_datacenter, risk_score,
+                       is_suspicious_asn, risk_score,
                        threat_level, details
                 FROM connection_events
                   WHERE source_ip = ? AND timestamp >= ?
