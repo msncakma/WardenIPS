@@ -75,14 +75,14 @@ class DashboardAPI:
     firewall,
     start_time: float,
     notifier=None,
-    threat_intel=None,
+    blocklist=None,
   ) -> None:
     self._config = config
     self._db = db
     self._firewall = firewall
     self._start_time = start_time
     self._notifier = notifier
-    self._threat_intel = threat_intel
+    self._blocklist = blocklist
     self._enabled: bool = False
     self._host: str = "127.0.0.1"
     self._port: int = 7680
@@ -402,7 +402,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/country-stats", self._handle_country_stats)
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
-    self._app.router.add_get("/api/threat-intel", self._handle_threat_intel)
+    self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
     self._app.router.add_post("/api/admin/deactivate-ban", self._handle_admin_deactivate_ban)
     self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
@@ -625,20 +625,19 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
-  async def _handle_threat_intel(self, request: web.Request) -> web.Response:
+  async def _handle_blocklist(self, request: web.Request) -> web.Response:
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
-    if not self._threat_intel:
+    if not self._blocklist:
       return web.json_response(
         {
           "enabled": False,
           "mode": "disabled",
-          "description": "Threat intelligence sync is not configured.",
-          "peers": [],
+          "description": "Blocklist protection is not configured.",
         }
       )
     try:
-      return web.json_response(await self._threat_intel.get_status())
+      return web.json_response(await self._blocklist.get_status())
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -1713,7 +1712,7 @@ footer a:hover{text-decoration:underline}
   <div class="hero-band ai d1">
     <div class="hero-panel">
       <strong>What you can see here</strong>
-      <p>Live totals, attacker concentration, event history, country spread, plugin activity, and threat-intel visibility are available without exposing write operations.</p>
+      <p>Live totals, attacker concentration, event history, country spread, plugin activity, and blocklist status are available without exposing write operations.</p>
     </div>
     <div class="signal-panel">
       <strong>Access split</strong>
@@ -1766,17 +1765,15 @@ footer a:hover{text-decoration:underline}
       <div class="pb" style="overflow:visible"><div class="tc" id="tlc"></div><div class="tl" id="tll"></div></div>
     </div>
     <div class="pl fw ai d2">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 7 7 17"/><path d="M7 7h10v10"/><path d="M5 5h4"/><path d="M15 19h4"/></svg>Threat Mesh</h2><span class="pill" id="tic">0</span></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Blocklist Protection</h2></div>
       <div class="pb">
-        <div class="desc" id="tid">Threat intelligence is disabled.</div>
+        <div class="desc" id="tid">Blocklist protection is disabled.</div>
         <div class="mesh-grid">
           <div class="mesh-stat"><div class="k">Mode</div><div class="v" id="tim">Disabled</div></div>
-          <div class="mesh-stat"><div class="k">Peers</div><div class="v" id="tip">0</div></div>
-          <div class="mesh-stat"><div class="k">Hashes Shared</div><div class="v" id="tis">0</div></div>
-          <div class="mesh-stat"><div class="k">Hashes Received</div><div class="v" id="tir">0</div></div>
+          <div class="mesh-stat"><div class="k">First Setup</div><div class="v" id="tip">--</div></div>
+          <div class="mesh-stat"><div class="k">Active IPs</div><div class="v" id="tis">0</div></div>
+          <div class="mesh-stat"><div class="k">Last Fetch</div><div class="v" id="tir">--</div></div>
         </div>
-        <div class="mesh-topology"><div class="mesh-canvas" id="tmc"></div></div>
-        <div class="peer-list" id="til"></div>
       </div>
     </div>
     <div class="pl fw ai d2">
@@ -1848,50 +1845,19 @@ function bars(id,items,lk,vk,ci){
   }).join('');
 }
 
-function renderThreatIntel(ti){
-  $('#tic').textContent = ti&&ti.peers ? ti.peers.length : 0;
+function renderBlocklist(ti){
   $('#tim').textContent = ti&&ti.enabled ? (ti.mode||'Enabled') : 'Disabled';
-  $('#tip').textContent = N(ti&&ti.peers ? ti.peers.length : 0);
-  $('#tis').textContent = N(ti&&ti.shared_total ? ti.shared_total : 0);
-  $('#tir').textContent = N(ti&&ti.received_total ? ti.received_total : 0);
-  $('#tid').textContent = ti&&ti.description ? ti.description : 'Threat intelligence is disabled.';
-  var list = $('#til');
-  var canvas = $('#tmc');
-  if(!ti||!ti.enabled||!ti.peers||!ti.peers.length){
-    list.innerHTML = '<div class="em" style="padding:1rem 0"><div>No peers configured</div></div>';
-    canvas.innerHTML = '<div class="mesh-node local">This Node<small>No peers</small></div>';
-    return;
+  if(ti&&ti.enabled&&ti.first_setup){
+    var fs=ti.first_setup;
+    $('#tip').textContent = fs.completed ? 'Completed' : (fs.remaining||fs.mode);
+    $('#tis').textContent = N(ti.active&&ti.active.total_ips_loaded ? ti.active.total_ips_loaded : 0);
+    $('#tir').textContent = ti.active&&ti.active.last_fetch_at ? ti.active.last_fetch_at.split('T')[0] : '--';
+  } else {
+    $('#tip').textContent = '--';
+    $('#tis').textContent = '0';
+    $('#tir').textContent = '--';
   }
-  var peers = ti.peers.slice(0, 6);
-  var centerX = 260;
-  var centerY = 100;
-  var radius = peers.length > 1 ? 78 : 0;
-  var html = '<div class="mesh-node local" style="left:'+centerX+'px;top:'+centerY+'px">This Node<small>'+E(ti.mode||'mesh')+'</small></div>';
-  peers.forEach(function(peer, idx){
-    var angle = peers.length === 1 ? 0 : ((Math.PI * 2) / peers.length) * idx - Math.PI / 2;
-    var x = centerX + Math.cos(angle) * radius;
-    var y = centerY + Math.sin(angle) * radius;
-    var dx = x - centerX;
-    var dy = y - centerY;
-    var len = Math.sqrt((dx * dx) + (dy * dy));
-    var deg = Math.atan2(dy, dx) * (180 / Math.PI);
-    var cls = peer.reachable ? 'ok' : 'bad';
-    html += '<div class="mesh-line" style="left:'+centerX+'px;top:'+centerY+'px;width:'+len+'px;transform:rotate('+deg+'deg)"></div>';
-    html += '<div class="mesh-node peer '+cls+'" style="left:'+x+'px;top:'+y+'px;transform:translate(-50%,-50%)" title="'+E(peer.peer||'peer')+'">Peer '+(idx+1)+'<small>'+(peer.reachable?'online':'offline')+'</small></div>';
-  });
-  canvas.innerHTML = html;
-  list.innerHTML = ti.peers.map(function(peer){
-    var ok = !!peer.reachable;
-    return '<div class="peer-card">'
-      + '<div class="peer-head"><div class="peer-url">'+E(peer.peer||'unknown')+'</div><span class="st '+(ok?'ok':'bad')+'">'+(ok?'Reachable':'Offline')+'</span></div>'
-      + '<div class="peer-meta">'
-      + '<span>Last success: '+TG(peer.last_success_at)+'</span>'
-      + '<span>Last attempt: '+TG(peer.last_attempt_at)+'</span>'
-      + '<span>New hashes: '+N(peer.last_received_count||0)+'</span>'
-      + '<span>Total received: '+N(peer.total_received||0)+'</span>'
-      + (peer.last_error?'<span>Error: '+E(peer.last_error)+'</span>':'')
-      + '</div></div>';
-  }).join('');
+  $('#tid').textContent = ti&&ti.description ? ti.description : 'Blocklist protection is disabled.';
 }
 
 async function refresh(){
@@ -1904,7 +1870,7 @@ async function refresh(){
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var at=await A('/api/top-attackers?limit=10');
-  var ti=await A('/api/threat-intel');
+  var ti=await A('/api/blocklist');
 
   // Health
   if(h){
@@ -1987,7 +1953,7 @@ async function refresh(){
     bars('atc',ait,'label','count',1)}
   else{ap.textContent='0';bars('atc',[],'label','count',1)}
 
-  renderThreatIntel(ti);
+  renderBlocklist(ti);
 }
 
 initTheme();
@@ -2093,7 +2059,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div class="metric"><div class="k">Total Events</div><div class="v" id="mEvents">0</div></div>
         <div class="metric"><div class="k">Active DB Bans</div><div class="v" id="mDbBans">0</div></div>
         <div class="metric"><div class="k">Firewall IPs</div><div class="v" id="mFwBans">0</div></div>
-        <div class="metric"><div class="k">Threat Mesh Peers</div><div class="v" id="mPeers">0</div></div>
+        <div class="metric"><div class="k">Blocklist</div><div class="v" id="mPeers">Disabled</div></div>
       </div>
     </div>
     <div class="side-card">
@@ -2163,7 +2129,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 
     <div class="stack">
       <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
-      <div class="card"><h2>Threat Mesh</h2><div class="list" id="meshList"></div></div>
+      <div class="card"><h2>Blocklist Protection</h2><div class="list" id="meshList"></div></div>
       <div class="card"><h2>Top Attackers</h2><div class="list" id="attackerList"></div></div>
     </div>
   </div>
@@ -2410,7 +2376,7 @@ function renderSummary(){
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
   $('#mFwBans').textContent = N(state.firewall.length);
-  $('#mPeers').textContent = N(state.mesh&&state.mesh.peers ? state.mesh.peers.length : 0);
+  $('#mPeers').textContent = state.blocklist&&state.blocklist.enabled ? (state.blocklist.first_setup&&state.blocklist.first_setup.completed?'Active Only':'First Setup + Active') : 'Disabled';
   $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
   $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
@@ -2433,7 +2399,7 @@ function renderFirewall(){
   $('#firewallRows').innerHTML = rows.length ? rows.map(function(item){ return '<tr><td class="mono">'+E(item.ip)+'</td><td>'+E(item.family)+'</td><td><button class="btn small primary fw-action" data-ip="'+E(item.ip)+'">Unban</button></td></tr>'; }).join('') : '<tr><td colspan="3" class="empty">No firewall IPs match the current filters.</td></tr>';
 }
 function renderAttackers(){ $('#attackerList').innerHTML = state.attackers.length ? state.attackers.map(function(a){ return '<div class="list-item"><strong class="mono">'+E((a.ip_hash||'').slice(0,20))+'…</strong><div class="sub">Bans: '+N(a.ban_count)+' · Max risk: '+N(a.max_risk||0)+' · Last: '+ago(a.last_ban)+'</div></div>'; }).join('') : '<div class="empty">No attacker history yet.</div>'; }
-function renderMesh(){ var mesh=state.mesh; if(!mesh||!mesh.enabled){ $('#meshList').innerHTML='<div class="empty">Threat mesh is disabled.</div>'; return; } $('#meshList').innerHTML=(mesh.peers&&mesh.peers.length?mesh.peers:[]).map(function(peer){ return '<div class="list-item"><strong>'+E(peer.peer||'peer')+'</strong><div class="sub">Status: '+(peer.reachable?'online':'offline')+' · New hashes: '+N(peer.last_received_count||0)+' · Total received: '+N(peer.total_received||0)+' · Last success: '+ago(peer.last_success_at)+'</div></div>'; }).join('') || '<div class="empty">Threat mesh enabled, but no peers configured.</div>'; }
+function renderBlocklistAdmin(){ var bl=state.blocklist; if(!bl||!bl.enabled){ $('#meshList').innerHTML='<div class="empty">Blocklist protection is disabled.</div>'; return; } var items=[]; if(bl.first_setup){ items.push('<div class="list-item"><strong>First Setup ('+E(bl.first_setup.mode)+')</strong><div class="sub">Status: '+(bl.first_setup.completed?'Completed':'Active — '+E(bl.first_setup.remaining||'unknown')+' remaining')+' · IPs loaded: '+N(bl.first_setup.ips_loaded||0)+'</div></div>'); } if(bl.active){ items.push('<div class="list-item"><strong>Active Blocklist</strong><div class="sub">Total IPs loaded: '+N(bl.active.total_ips_loaded||0)+' · Last fetch: '+ago(bl.active.last_fetch_at)+' · Last count: '+N(bl.active.last_fetch_count||0)+'</div></div>'); } if(bl.last_error){ items.push('<div class="list-item"><strong>Last Error</strong><div class="sub">'+E(bl.last_error)+'</div></div>'); } $('#meshList').innerHTML=items.join('')||'<div class="empty">Blocklist enabled, awaiting first fetch.</div>'; }
 function renderConfigStudio(){
   $('#cfgLogLevel').value=String(getConfigValue('general.log_level','INFO'));
   $('#cfgAnalysisInterval').value=String(getConfigValue('general.analysis_interval',5));
@@ -2517,20 +2483,20 @@ async function saveConfigYaml(){
   return true;
 }
 function renderAdvice(){
-  var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length; var offlinePeers=state.mesh&&state.mesh.peers?state.mesh.peers.filter(function(peer){ return !peer.reachable; }).length:0;
+  var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length;
   if(stats.simulation_mode){ items.push({title:'Simulation mode is still enabled', body:'Useful for validation, but no real firewall action happens until you switch to live enforcement.'}); }
   if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'Check firewall permissions or service startup ordering because active ban state appears to be drifting.'}); }
   if(highRiskEvents>=10){ items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'}); }
-  if(offlinePeers>0){ items.push({title:'Some threat mesh peers are offline', body:'Investigate peer reachability or shared API keys so correlation remains complete across nodes.'}); }
-  if(!items.length){ items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream and peer health.'}); }
+  if(state.blocklist&&state.blocklist.last_error){ items.push({title:'Blocklist fetch encountered an error', body:'Check the configured URLs and network connectivity. Error: '+(state.blocklist.last_error||'unknown')}); }
+  if(!items.length){ items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream.'}); }
   $('#adviceList').innerHTML=items.map(function(item){ return '<div class="advice-item"><strong>'+E(item.title)+'</strong><div class="sub">'+E(item.body)+'</div></div>'; }).join('');
 }
 function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort(); select.innerHTML='<option value="">All Plugins</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 async function refresh(){
-  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-attackers?limit=12'),api('/api/threat-intel')]);
+  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-attackers?limit=12'),api('/api/blocklist')]);
   if(results.some(function(item){ return item===null; })){ return; }
-  state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.attackers=results[5]&&results[5].attackers?results[5].attackers:[]; state.mesh=results[6]||null;
-  syncPluginFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderMesh(); renderAdvice();
+  state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.attackers=results[5]&&results[5].attackers?results[5].attackers:[]; state.blocklist=results[6]||null;
+  syncPluginFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderBlocklistAdmin(); renderAdvice();
 }
 async function performAction(path, body, successTitle, successMessage){ var payload = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); if(!payload){ return false; } setStatus('ok', successTitle, successMessage(payload)); await refresh(); return true; }
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }

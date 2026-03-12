@@ -99,18 +99,19 @@ dashboard:
     token_hash: ""
     token_expires_at: ""
 
-threat_intel:
-  enabled: false
-  sync_interval: 300          # Pull from peers every N seconds
-  share_bans: true            # Share our ban hashes with peers
-  auto_ban_received: false    # Current feed mode is hash-only, so this is informational/correlation-focused
-  received_ban_duration: 1800 # Reserved for future direct-ban compatible peer feed modes
-  peers: []                   # List of peer URLs, e.g. ["http://10.0.0.2:7681"]
-  server:
-    enabled: true
-    host: "0.0.0.0"
-    port: 7681
-    api_key: ""               # Shared secret between all nodes
+blocklist:
+  enabled: true
+  # Your local timezone (e.g. "Europe/Istanbul", "America/New_York")
+  # You can find your timezone string here: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+  timezone: "UTC"               # Your local timezone (e.g. "Europe/Istanbul", "America/New_York")
+  fetch_time: "04:00"           # Daily fetch time in 24h format (HH:MM) in your timezone
+  first_setup:
+    mode: "7d"                  # "7d" (recommended) or "14d" — initial blocklist period
+    url_7d: "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/main/abuseipdb-s100-7d.ipv4"
+    url_14d: "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/main/abuseipdb-s100-14d.ipv4"
+    installed_at: ""            # Auto-set on first run — do not edit manually
+    completed: false            # Auto-set when the initial period expires
+  daily_url: "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/main/abuseipdb-s100-1d.ipv4"
 
 plugins:
   ssh:

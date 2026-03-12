@@ -30,7 +30,7 @@ from wardenips.core.database import DatabaseManager
 from wardenips.core.firewall import FirewallManager
 from wardenips.core.abuseipdb import AbuseIPDBReporter
 from wardenips.core.notifications import NotificationManager
-from wardenips.core.threat_intel import ThreatIntelSync
+from wardenips.core.blocklist import BlocklistManager
 from wardenips.core.log_tailer import LogTailer
 from wardenips.core.models import ConnectionEvent, ThreatLevel
 from wardenips.core.updater import UpdateChecker
@@ -61,7 +61,7 @@ class WardenIPS:
         self._abuse_reporter: AbuseIPDBReporter = None
         self._notifier: NotificationManager = None
         self._dashboard: DashboardAPI = None
-        self._threat_intel: ThreatIntelSync = None
+        self._blocklist: BlocklistManager = None
         self._plugin_manager: PluginManager = None
         self._tailers: list[LogTailer] = []
         self._running = False
@@ -144,13 +144,13 @@ class WardenIPS:
         self._running = True
         self._start_time = time.monotonic()
 
-        # ── 7. Threat Intelligence Sync (optional) ──
-        self._threat_intel = await ThreatIntelSync.create(
-            self._config, self._db, self._firewall,
+        # ── 7. Blocklist Manager (optional) ──
+        self._blocklist = await BlocklistManager.create(
+            self._config, self._firewall,
         )
-        if self._threat_intel.enabled:
-            await self._threat_intel.start()
-            self._logger.info("Threat Intel: %s", self._threat_intel)
+        if self._blocklist.enabled:
+            await self._blocklist.start()
+            self._logger.info("Blocklist: %s", self._blocklist)
 
         # ── 8. Dashboard API (optional) ──
         self._dashboard = DashboardAPI(
@@ -159,7 +159,7 @@ class WardenIPS:
             self._firewall,
             self._start_time,
             notifier=self._notifier,
-            threat_intel=self._threat_intel,
+            blocklist=self._blocklist,
         )
         if self._dashboard.enabled:
             await self._dashboard.start()
@@ -574,8 +574,8 @@ class WardenIPS:
             await self._notifier.close()
         if self._dashboard:
             await self._dashboard.stop()
-        if self._threat_intel:
-            await self._threat_intel.stop()
+        if self._blocklist:
+            await self._blocklist.stop()
         if self._firewall:
             await self._firewall.shutdown()
         if self._db:

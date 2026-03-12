@@ -1,99 +1,231 @@
-# WardenIPS - Installation and Configuration Guide
+# WardenIPS — Installation & Configuration Guide
+
+Complete guide for deploying WardenIPS on a Linux server.
+
+---
 
 ## System Requirements
 
 | Requirement | Minimum |
-|-----------|---------|
+|-------------|---------|
 | **OS** | Ubuntu 20.04+ / Debian 11+ / CentOS 8+ |
 | **Python** | 3.10+ |
-| **Privileges**| root (sudo) — required for ipset and iptables |
+| **Privileges** | root (sudo) — required for ipset and iptables |
 | **RAM** | 128 MB |
 | **Disk** | 50 MB (+ GeoLite2 databases ~10 MB) |
 
 ---
 
-## 1. Install System Packages
+## Quick Install (One-Line)
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
+```
+
+The installer handles everything: dependencies, venv, config, systemd service, and a dedicated service user.
+
+To start immediately after install:
+
+```bash
+sudo env WARDENIPS_AUTOSTART=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/install.sh)"
+```
+
+Skip to [Section 5](#5-configure-configyaml) if you used the one-line installer.
+
+---
+
+## Manual Installation
+
+### 1. Install System Packages
 
 ```bash
 # Ubuntu / Debian
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv ipset iptables
+sudo apt install -y python3 python3-pip python3-venv ipset iptables git
 
 # CentOS / RHEL
-sudo dnf install -y python3 python3-pip ipset iptables
+sudo dnf install -y python3 python3-pip ipset iptables git
 ```
 
----
-
-## 2. Deploy Project Files
-
-Copy all WardenIPS files to your server:
+### 2. Clone and Deploy
 
 ```bash
-# Example: Deploying to /opt/wardenips
-sudo mkdir -p /opt/wardenips
-sudo cp -r . /opt/wardenips/
+sudo git clone https://github.com/msncakma/WardenIPS.git /opt/wardenips
 cd /opt/wardenips
 ```
 
-**Final directory structure:**
-
-```
-/opt/wardenips/
-├── wardenips/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── config.py
-│   │   ├── whitelist.py
-│   │   ├── logger.py
-│   │   ├── exceptions.py
-│   │   ├── models.py
-│   │   ├── asn_lookup.py
-│   │   ├── ip_hasher.py
-│   │   ├── database.py
-│   │   ├── firewall.py
-│   │   ├── abuseipdb.py
-│   │   ├── updater.py
-│   │   └── log_tailer.py
-│   └── plugins/
-│       ├── __init__.py
-│       ├── base_plugin.py
-│       ├── ssh_plugin.py
-│       └── minecraft_plugin.py
-├── config.yaml
-├── requirements.txt
-├── main.py
-└── INSTALL.md
-```
-
----
-
-## 3. Python Virtual Environment (Venv) Setup
-
-Running WardenIPS in an isolated environment is the safest method.
+### 3. Create Python Virtual Environment
 
 ```bash
-cd /opt/wardenips
 python3 -m venv venv
 source venv/bin/activate
 pip3 install -r requirements.txt
 deactivate
 ```
 
+### 4. Create Runtime Directories
+
+```bash
+sudo mkdir -p /var/log/wardenips
+sudo mkdir -p /var/lib/wardenips
+```
+
 ---
 
-## 4. Download MaxMind GeoLite2 Databases
+## 5. Configure config.yaml
 
-WardenIPS uses MaxMind GeoLite2 databases to locally resolve ASN and country information. A **free** MaxMind account is required.
+```bash
+sudo nano /opt/wardenips/config.yaml
+```
 
-### 4.1 Create a MaxMind Account
+### 5.1 IP Hashing Salt (REQUIRED)
 
-1. Go to https://www.maxmind.com/en/geolite2/signup
-2. Create a free account
-3. Get your license key (**Account > Manage License Keys**)
+You **must** change this to a unique random value for GDPR/KVKK compliance:
 
-### 4.2 Download the Databases
+```yaml
+database:
+  ip_hashing:
+    salt: "ENTER-A-STRONG-RANDOM-VALUE-HERE"
+```
+
+Generate a salt:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 5.2 Whitelist Your IPs (CRITICAL)
+
+Add your server IP, home IP, and any management IPs. If you skip this, a false positive could lock you out.
+
+```yaml
+whitelist:
+  ips:
+    - "127.0.0.1"
+    - "::1"
+    - "YOUR_SERVER_IP"
+    - "YOUR_HOME_IP"
+  cidr_ranges:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+```
+
+### 5.3 Blocklist Protection
+
+WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). This is **enabled by default** and provides two layers of protection:
+
+**How it works:**
+
+| Phase | ipset Name | Purpose |
+|-------|-----------|---------|
+| **First Setup** | `wardenips_first_setup` | Loads ~107K IPs (7d) or ~132K IPs (14d) on first run. Auto-removed after the chosen period to prevent stale false-positives. |
+| **Active** | `wardenips_active` | Refreshed daily at your configured time with ~80K known bad IPs from the last 24 hours. Additive — IPs accumulate. |
+
+**Configuration:**
+
+```yaml
+blocklist:
+  enabled: true
+  timezone: "Europe/Istanbul"     # Your local timezone
+  fetch_time: "04:00"             # When to fetch the daily list (24h format)
+  first_setup:
+    mode: "7d"                    # "7d" (recommended) or "14d"
+```
+
+| Option | What it does |
+|--------|-------------|
+| `mode: "7d"` | **(Recommended)** Loads the last 7 days of worst offenders (~107K IPs). Smaller set, less chance of false positives. Cleans up after 7 days. |
+| `mode: "14d"` | Loads the last 14 days (~132K IPs). Broader initial coverage but slightly higher false-positive risk. Cleans up after 14 days. |
+| `timezone` | Your local timezone for scheduling. Examples: `Europe/Istanbul`, `America/New_York`, `Asia/Tokyo`, `UTC`. |
+| `fetch_time` | Daily fetch time in your timezone. `"04:00"` = 4 AM local time. Low-traffic hours recommended. |
+
+The `installed_at` and `completed` fields are managed automatically — do not edit them.
+
+**Data source:** Lists are sourced from [`borestad/blocklist-abuseipdb`](https://github.com/borestad/blocklist-abuseipdb) — ~100% confidence AbuseIPDB offenders, updated multiple times per day.
+
+### 5.4 Dashboard
+
+```yaml
+dashboard:
+  enabled: true
+  host: "127.0.0.1"     # Use 0.0.0.0 for remote access
+  port: 7680
+```
+
+After first start, navigate to `http://HOST:7680/setup` to create your admin account.
+
+| Route | Access |
+|-------|--------|
+| `/dashboard` | Public read-only overview |
+| `/admin` | Login-protected admin console |
+| `/setup` | First-boot admin account creation |
+
+### 5.5 Plugin Configuration
+
+Enable the plugins you need:
+
+```yaml
+plugins:
+  ssh:
+    enabled: true
+    log_path: "/var/log/auth.log"
+
+  minecraft:
+    enabled: false
+    log_path: "/opt/minecraft/logs/latest.log"
+
+  nginx:
+    enabled: false
+    log_path: "/var/log/nginx/access.log"
+```
+
+### 5.6 Geofencing (Optional)
+
+Allow connections only from specific countries:
+
+```yaml
+geofencing:
+  enabled: true
+  mode: "allow"
+  countries:
+    - "TR"
+    - "US"
+```
+
+### 5.7 AbuseIPDB Reporting (Optional)
+
+Automatically report banned IPs to AbuseIPDB:
+
+```yaml
+abuseipdb:
+  enabled: true
+  api_key: "YOUR_ABUSEIPDB_API_KEY"
+```
+
+### 5.8 Notifications (Optional)
+
+```yaml
+notifications:
+  telegram:
+    enabled: true
+    bot_token: "YOUR_BOT_TOKEN"
+    chat_id: "YOUR_CHAT_ID"
+
+  discord:
+    enabled: true
+    webhook_url: "YOUR_WEBHOOK_URL"
+```
+
+---
+
+## 6. Download MaxMind GeoLite2 Databases
+
+WardenIPS uses MaxMind GeoLite2 for ASN and country lookups. A **free** MaxMind account is required.
+
+1. Sign up at [maxmind.com/en/geolite2/signup](https://www.maxmind.com/en/geolite2/signup)
+2. Get your license key from **Account > Manage License Keys**
+3. Download:
 
 ```bash
 sudo mkdir -p /var/lib/wardenips
@@ -110,96 +242,14 @@ wget -O /tmp/GeoLite2-Country.tar.gz \
 tar -xzf /tmp/GeoLite2-Country.tar.gz -C /tmp/
 sudo cp /tmp/GeoLite2-Country_*/GeoLite2-Country.mmdb /var/lib/wardenips/
 
-# Cleanup
 rm -rf /tmp/GeoLite2-*
 ```
 
-> **NOTE:** Replace `YOUR_LICENSE_KEY` with your actual key.
+Replace `YOUR_LICENSE_KEY` with your actual key.
 
 ---
 
-## 5. config.yaml Configuration
-
-Edit the `/opt/wardenips/config.yaml` file:
-
-### 5.1 REQUIRED Changes
-
-```yaml
-# IP Hashing Salt Value — U MUST CHANGE THIS!
-database:
-  ip_hashing:
-    salt: "ENTER-A-STRONG-RANDOM-VALUE-HERE"
-```
-
-To generate a salt:
-
-```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
-```
-
-### 5.2 Whitelist — Add Your IP
-
-```yaml
-whitelist:
-  ips:
-    - "127.0.0.1"
-    - "::1"
-    - "YOUR_SERVER_IP"            # <-- Add your IP!
-    - "YOUR_HOME_IP"              # <-- Add your home IP!
-  cidr_ranges:
-    - "10.0.0.0/8"
-    - "172.16.0.0/12"
-    - "192.168.0.0/16"
-```
-
-> **WARNING:** If you don't add your own IP to the whitelist, you could be locked out of the server in case of a false positive!
-
-### 5.3 Geofencing (Optional)
-
-To allow connections only from specific countries:
-
-```yaml
-geofencing:
-  enabled: true
-  mode: "allow"
-  countries:
-    - "US"
-    - "GB"
-```
-
-### 5.4 Minecraft Log Path
-
-Update your Minecraft server's log path:
-
-```yaml
-plugins:
-  minecraft:
-    enabled: true
-    log_path: "/opt/minecraft/logs/latest.log"  # <-- Actual path
-```
-
-### 5.5 AbuseIPDB (Optional)
-
-Define your AbuseIPDB API key for automatic reporting:
-
-```yaml
-abuseipdb:
-  enabled: true
-  api_key: "YOUR_ABUSEIPDB_API_KEY"
-```
-
----
-
-## 6. Create Log and Database Directories
-
-```bash
-sudo mkdir -p /var/log/wardenips
-sudo mkdir -p /var/lib/wardenips
-```
-
----
-
-## 7. Execution
+## 7. Start WardenIPS
 
 ### Manual Run (Testing)
 
@@ -211,63 +261,76 @@ sudo ./venv/bin/python main.py
 ### Systemd Service (Production)
 
 ```bash
-sudo tee /etc/systemd/system/wardenips.service << 'EOF'
-[Unit]
-Description=WardenIPS - Autonomous Intrusion Prevention System
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/wardenips/venv/bin/python /opt/wardenips/main.py --config /opt/wardenips/config.yaml
-WorkingDirectory=/opt/wardenips
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start the service
 sudo systemctl daemon-reload
 sudo systemctl enable wardenips
 sudo systemctl start wardenips
+```
 
-# Check the status
+Monitor:
+
+```bash
 sudo systemctl status wardenips
-
-# Monitor logs
 sudo journalctl -u wardenips -f
+```
+
+### Docker
+
+```bash
+docker compose up -d --build
+docker compose logs -f wardenips
 ```
 
 ---
 
-## 8. Verification
+## 8. Post-Install Verification
 
 ```bash
-# Is WardenIPS running?
+# Service running?
 sudo systemctl status wardenips
 
-# Is the ipset set created?
-sudo ipset list warden_blacklist
+# ipset sets created?
+sudo ipset list warden_blacklist -t
+sudo ipset list wardenips_first_setup -t    # Blocklist first-setup
+sudo ipset list wardenips_active -t          # Blocklist active
 
-# Is the log file being written to?
+# Log output?
 tail -f /var/log/wardenips/warden.log
+```
 
-# Test: SSH brute-force simulation (FROM ANOTHER MACHINE)
-ssh -o StrictHostKeyChecking=no fake_user@SERVER_IP
+---
+
+## 9. CLI Commands
+
+After install, the `wardenips` wrapper is available system-wide:
+
+```bash
+wardenips version
+wardenips status
+wardenips service-status
+wardenips logs
+wardenips shell
+```
+
+---
+
+## Uninstall
+
+```bash
+sudo sh uninstall.sh          # Keep config and data
+sudo sh uninstall.sh --purge  # Remove everything
 ```
 
 ---
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|-------|
+| Problem | Solution |
+|---------|----------|
 | `Permission denied` | Run with `sudo` |
 | `ipset not found` | `sudo apt install ipset` |
-| `geoip2 not found` | `pip3 install geoip2` within the venv |
-| ASN results empty | Check GeoLite2 .mmdb files |
-| Locked out of server | Did you forget to add your IP to the Whitelist? |
-| Log file not found | Check log paths in `config.yaml` |
+| `geoip2 not found` | Activate venv first: `source venv/bin/activate && pip install geoip2` |
+| ASN results are empty | Check GeoLite2 `.mmdb` files exist in `/var/lib/wardenips/` |
+| Locked out of server | Your IP is missing from `whitelist.ips` in config.yaml |
+| Log file not found | Verify `log_path` values in the plugins section |
+| Dashboard shows HTTPS error | Dashboard is plain HTTP by default. Use `http://`, not `https://` |
+| Blocklist not loading | Check network connectivity and that `blocklist.enabled` is `true` |
