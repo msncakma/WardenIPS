@@ -87,7 +87,6 @@ What the installer does:
 - Creates and repairs the Python virtual environment if needed.
 - Installs Python dependencies.
 - Creates a dedicated `wardenips` service user by default and prepares runtime ownership automatically.
-- Generates a secure hashing salt automatically.
 - Preserves the previous `config.yaml`, then merges any newly added template keys from `config_backup.yaml` into the active config.
 - Grants the service account read access to the SSH log path and adds it to `adm` on Debian/Ubuntu-style systems.
 - Enables the dashboard by default on `127.0.0.1:7680`.
@@ -171,7 +170,6 @@ Detailed setup instructions: [INSTALL.md](INSTALL.md)
 
 Before enabling autonomous enforcement in a real environment:
 
-- Replace or verify the generated IP hashing salt.
 - Add your server, home, VPN, and management IPs to `whitelist.ips`.
 - Validate the log paths for enabled plugins.
 - Review `firewall.ban_threshold` and ban duration settings.
@@ -182,7 +180,7 @@ Before enabling autonomous enforcement in a real environment:
 - Async event pipeline built for low overhead.
 - IPv4 and IPv6 ban enforcement.
 - Blocklist protection with AbuseIPDB curated threat data.
-- Salted IP hashing for privacy-aware storage.
+- Source IP based event and ban correlation.
 - SQLite or Redis backend.
 - AbuseIPDB reporting.
 - Telegram and Discord notifications.

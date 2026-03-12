@@ -20,7 +20,7 @@ graph TD
     
     E -->|Check whitelist| F[WhitelistManager]
     F -->|Allowed?| G[Ignore]
-    F -->|Not Allowed?| H[ASN Lookup & IP Hasher]
+    F -->|Not Allowed?| H[ASN Lookup]
     
     H -->|Save to SQLite| I[(DatabaseManager)]
     H -->|Trigger Ban| J[FirewallManager ipset/iptables]
@@ -44,7 +44,6 @@ If you want to edit the core, here is where everything lives inside `wardenips/c
 | **DB** | `database.py` | Asynchronous SQLite operations. | *This is crucial for Web Dashboards. The `get_active_bans()` function is what your dashboard will query to show charts!* |
 | **Firewall** | `firewall.py` | Manages `ipset`. Simulation mode on Windows. | *If you add Docker support, you will need to modify this file to interact with Docker's internal networking instead of just host `iptables`.* |
 | **Tailer** | `log_tailer.py`| Cross-platform asynchronous file reader. | *Uses polling instead of `inotify`. Safe for all OS. If logs rotate, it catches them gracefully.* |
-| **KVKK/GDPR**| `ip_hasher.py` | HMAC SHA256 IP anonymization. | *If `enabled: false`, it stores raw IPs. This makes building a geographic map for a dashboard much easier.* |
 | **Blocklist** | `blocklist.py` | AbuseIPDB curated IP blocklist manager. | *Manages two ipset sets: `wardenips_first_setup` (temporary bulk load) and `wardenips_active` (daily refresh). Uses `ipset restore` for high-performance bulk loading. Fetches from GitHub raw URLs.* |
 
 ---

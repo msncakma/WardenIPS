@@ -11,9 +11,9 @@ It is designed for teams that want fast feedback, practical automation, and a cl
 - Real-time detection and enforcement.
 - Linux-native firewall blocking with IPv4 and IPv6 support.
 - Live dashboard with active bans, event flow, threat breakdowns, and attacker concentration.
-- Privacy-aware design with salted IP hashing.
+- Source IP based event correlation for operations.
 - Plugin-driven model for SSH, Minecraft, and Nginx workloads.
-- Threat mesh for cross-node awareness using hash-based intelligence exchange.
+- AbuseIPDB curated blocklist ingestion with first-setup and daily refresh modes.
 - Straightforward deployment through systemd, Docker, or one-line bootstrap install.
 
 ## Product direction
@@ -51,23 +51,17 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/msncakma/WardenIPS/master/
 - Dependencies are installed.
 - Project files are deployed.
 - The Python environment is prepared automatically.
-- A secure hashing salt is generated.
 - The dashboard is enabled by default.
 - A systemd service is installed.
 
-## Threat Mesh
+## Blocklist Protection
 
-Threat Mesh is one of the most interesting parts of WardenIPS.
+WardenIPS uses AbuseIPDB curated blocklists from GitHub with a two-phase model:
 
-Multiple nodes can share hashed active-ban indicators with each other over HTTP. That means a fleet can build collective awareness without shipping raw source IPs around the network.
+- First setup warm-start list (`7d` or `14d`) to quickly reduce exposure on fresh installs.
+- Daily active list refresh (`1d`) for ongoing protection against recent abusive sources.
 
-Current mode is intentionally conservative:
-
-- Shared intelligence is correlation-oriented.
-- Plaintext IPs are not exchanged.
-- Peer data improves visibility and future decision-making.
-
-This is the right design tradeoff for an early secure implementation.
+This model keeps operations simple while still providing broad coverage.
 
 ## Built for people running real services
 

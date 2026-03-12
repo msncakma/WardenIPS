@@ -91,23 +91,7 @@ sudo mkdir -p /var/lib/wardenips
 sudo nano /opt/wardenips/config.yaml
 ```
 
-### 5.1 IP Hashing Salt (REQUIRED)
-
-You **must** change this to a unique random value for GDPR/KVKK compliance:
-
-```yaml
-database:
-  ip_hashing:
-    salt: "ENTER-A-STRONG-RANDOM-VALUE-HERE"
-```
-
-Generate a salt:
-
-```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
-```
-
-### 5.2 Whitelist Your IPs (CRITICAL)
+### 5.1 Whitelist Your IPs (CRITICAL)
 
 Add your server IP, home IP, and any management IPs. If you skip this, a false positive could lock you out.
 
@@ -124,7 +108,7 @@ whitelist:
     - "192.168.0.0/16"
 ```
 
-### 5.3 Blocklist Protection
+### 5.2 Blocklist Protection
 
 WardenIPS ships with built-in blocklist protection powered by [AbuseIPDB curated lists](https://github.com/borestad/blocklist-abuseipdb). This is **enabled by default** and provides two layers of protection:
 

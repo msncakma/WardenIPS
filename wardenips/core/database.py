@@ -4,7 +4,7 @@ WardenIPS - Async Database Manager
 
 Record fields:
   - Timestamp
-  - Hash'ed IP
+    - Source IP
   - Player name / username
   - Connection type (connection_type: ssh, minecraft, etc.)
   - ASN number (asn_number)
@@ -29,14 +29,13 @@ from typing import Any, Dict, List, Optional
 import aiosqlite
 
 from wardenips.core.exceptions import WardenDatabaseError
-from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.models import ConnectionEvent, ConnectionType, ThreatLevel
 from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -44,7 +43,7 @@ _CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS connection_events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp       TEXT    NOT NULL,
-    ip_hash         TEXT    NOT NULL,
+    source_ip       TEXT    NOT NULL,
     player_name     TEXT,
     connection_type TEXT    NOT NULL DEFAULT 'unknown',
     asn_number      INTEGER,
@@ -58,8 +57,8 @@ CREATE TABLE IF NOT EXISTS connection_events (
 );
 
 -- Performance indexes
-CREATE INDEX IF NOT EXISTS idx_events_ip_hash
-    ON connection_events(ip_hash);
+CREATE INDEX IF NOT EXISTS idx_events_source_ip
+    ON connection_events(source_ip);
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp
     ON connection_events(timestamp);
@@ -73,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_events_connection_type
 -- Ban history table
 CREATE TABLE IF NOT EXISTS ban_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip_hash         TEXT    NOT NULL,
+    source_ip       TEXT    NOT NULL,
     reason          TEXT    NOT NULL,
     risk_score      INTEGER NOT NULL DEFAULT 0,
     ban_duration    INTEGER NOT NULL DEFAULT 0,
@@ -82,8 +81,8 @@ CREATE TABLE IF NOT EXISTS ban_history (
     is_active       INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE INDEX IF NOT EXISTS idx_bans_ip_hash
-    ON ban_history(ip_hash);
+CREATE INDEX IF NOT EXISTS idx_bans_source_ip
+    ON ban_history(source_ip);
 
 CREATE INDEX IF NOT EXISTS idx_bans_active
     ON ban_history(is_active);
@@ -128,16 +127,15 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 class DatabaseManager:
     """
-    Asenkron GDPR uyumlu SQLite veritabani yoneticisi.
+    Asenkron SQLite veritabani yoneticisi.
 
     All I/O operations are asynchronous (aiosqlite).
-    IP addresses are hashed using IPHasher and stored.
-    Correlation analysis is possible but IP addresses cannot be retrieved.
+    IP addresses are stored as source IP values.
 
     Usage:
         db = await DatabaseManager.create(config)
-        await db.log_event(event, ip_hash="a3f2b8c1...")
-        recent = await db.get_recent_events_by_ip("a3f2b8c1...", minutes=5)
+        await db.log_event(event, source_ip="203.0.113.7")
+        recent = await db.get_recent_events_by_ip("203.0.113.7", minutes=5)
         await db.close()
     """
 
@@ -239,22 +237,56 @@ class DatabaseManager:
                             "Migration gerekebilir.",
                             current, _SCHEMA_VERSION,
                         )
+                        if current < 3:
+                            await self._migrate_v2_to_v3_source_ip()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
                         )
 
+    async def _migrate_v2_to_v3_source_ip(self) -> None:
+        """Renames legacy ip_hash columns to source_ip and refreshes indexes."""
+
+        async def _has_column(table: str, column: str) -> bool:
+            async with self._db.execute(f"PRAGMA table_info({table})") as cursor:
+                rows = await cursor.fetchall()
+                return any(str(row[1]) == column for row in rows)
+
+        # Migrate connection_events.ip_hash -> source_ip
+        has_source_ip = await _has_column("connection_events", "source_ip")
+        has_ip_hash = await _has_column("connection_events", "ip_hash")
+        if (not has_source_ip) and has_ip_hash:
+            await self._db.execute(
+                "ALTER TABLE connection_events RENAME COLUMN ip_hash TO source_ip"
+            )
+
+        # Migrate ban_history.ip_hash -> source_ip
+        has_source_ip = await _has_column("ban_history", "source_ip")
+        has_ip_hash = await _has_column("ban_history", "ip_hash")
+        if (not has_source_ip) and has_ip_hash:
+            await self._db.execute(
+                "ALTER TABLE ban_history RENAME COLUMN ip_hash TO source_ip"
+            )
+
+        # Refresh legacy index names
+        await self._db.execute("DROP INDEX IF EXISTS idx_events_ip_hash")
+        await self._db.execute("DROP INDEX IF EXISTS idx_bans_ip_hash")
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_source_ip ON connection_events(source_ip)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bans_source_ip ON ban_history(source_ip)"
+        )
+
     # ── Olay Kaydi ──
 
-    async def log_event(self, event: ConnectionEvent, ip_hash: str) -> int:
+    async def log_event(self, event: ConnectionEvent, source_ip: str) -> int:
         """
         Logs a connection event to the database.
 
-        IP addresses are replaced with hashed IP addresses (GDPR-compliant).
-
         Args:
             event:   ConnectionEvent object.
-            ip_hash: Hash generated by IPHasher.hash_ip().
+            source_ip: Source IP address.
 
         Returns:
             ID of the added record.
@@ -271,14 +303,14 @@ class DatabaseManager:
                 async with self._db.execute(
                     """
                     INSERT INTO connection_events
-                        (timestamp, ip_hash, player_name, connection_type,
+                        (timestamp, source_ip, player_name, connection_type,
                          asn_number, asn_org, country_code, is_datacenter,
                          risk_score, threat_level, details)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.timestamp.isoformat(),
-                        ip_hash,
+                        source_ip,
                         event.player_name,
                         event.connection_type.value,
                         event.asn_number,
@@ -293,8 +325,8 @@ class DatabaseManager:
                     await self._db.commit()
                     row_id = cursor.lastrowid
                     logger.debug(
-                        "Event logged ID=%d, IP_HASH=%s..., Risk=%d",
-                        row_id, ip_hash[:12], event.risk_score,
+                        "Event logged ID=%d, IP=%s, Risk=%d",
+                        row_id, source_ip, event.risk_score,
                     )
                     return row_id
 
@@ -307,7 +339,7 @@ class DatabaseManager:
 
     async def log_ban(
         self,
-        ip_hash: str,
+        source_ip: str,
         reason: str,
         risk_score: int,
         ban_duration: int = 0,
@@ -316,7 +348,7 @@ class DatabaseManager:
         Logs a ban operation to the database.
 
         Args:
-            ip_hash:      Hashed IP.
+            source_ip:    Source IP.
             reason:       Ban reason.
             risk_score:   Risk score that triggered the ban.
             ban_duration: Ban duration (seconds). 0 = permanent.
@@ -336,12 +368,12 @@ class DatabaseManager:
                 async with self._db.execute(
                     """
                     INSERT INTO ban_history
-                        (ip_hash, reason, risk_score, ban_duration,
+                        (source_ip, reason, risk_score, ban_duration,
                          banned_at, expires_at, is_active)
                     VALUES (?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
-                        ip_hash,
+                        source_ip,
                         reason,
                         risk_score,
                         ban_duration,
@@ -352,9 +384,9 @@ class DatabaseManager:
                     await self._db.commit()
                     row_id = cursor.lastrowid
                     logger.info(
-                        "Ban logged ID=%d, IP_HASH=%s..., "
+                        "Ban logged ID=%d, IP=%s, "
                         "Reason='%s', Duration=%ds",
-                        row_id, ip_hash[:12], reason, ban_duration,
+                        row_id, source_ip, reason, ban_duration,
                     )
                     return row_id
 
@@ -367,16 +399,16 @@ class DatabaseManager:
 
     async def get_recent_events_by_ip(
         self,
-        ip_hash: str,
+        source_ip: str,
         minutes: int = 5,
     ) -> List[Dict[str, Any]]:
         """
-        Returns the last N minutes of events for a given hashed IP.
+        Returns the last N minutes of events for a given source IP.
 
         This method is used to detect repeated attacks.
 
         Args:
-            ip_hash: Hashed IP address.
+            source_ip: Source IP address.
             minutes: Time window in minutes.
 
         Returns:
@@ -389,15 +421,15 @@ class DatabaseManager:
         try:
             async with self._db.execute(
                 """
-                SELECT id, timestamp, ip_hash, player_name,
+                  SELECT id, timestamp, source_ip, player_name,
                        connection_type, asn_number, asn_org,
                        country_code, is_datacenter, risk_score,
                        threat_level, details
                 FROM connection_events
-                WHERE ip_hash = ? AND timestamp >= ?
+                  WHERE source_ip = ? AND timestamp >= ?
                 ORDER BY timestamp DESC
                 """,
-                (ip_hash, cutoff),
+                (source_ip, cutoff),
             ) as cursor:
                 rows = await cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
@@ -409,17 +441,17 @@ class DatabaseManager:
 
     async def get_event_count_by_ip(
         self,
-        ip_hash: str,
+        source_ip: str,
         minutes: int = 5,
         connection_type: Optional[str] = None,
         reset_on_success: bool = False,
         success_event_types: Optional[List[str]] = None,
     ) -> int:
         """
-        Returns the count of events for a given hashed IP in the last N minutes.
+        Returns the count of events for a given source IP in the last N minutes.
 
         Args:
-            ip_hash: Hashed IP address.
+            source_ip: Source IP address.
             minutes: Time window in minutes.
 
         Returns:
@@ -439,9 +471,9 @@ class DatabaseManager:
             if reset_on_success and success_patterns:
                 latest_query = """
                     SELECT MAX(timestamp) FROM connection_events
-                    WHERE ip_hash = ? AND timestamp >= ?
+                    WHERE source_ip = ? AND timestamp >= ?
                 """
-                latest_params: list[Any] = [ip_hash, cutoff]
+                latest_params: list[Any] = [source_ip, cutoff]
                 if connection_type:
                     latest_query += " AND connection_type = ?"
                     latest_params.append(connection_type)
@@ -454,9 +486,9 @@ class DatabaseManager:
 
             count_query = """
                 SELECT COUNT(*) FROM connection_events
-                WHERE ip_hash = ? AND timestamp >= ?
+                WHERE source_ip = ? AND timestamp >= ?
             """
-            count_params: list[Any] = [ip_hash, effective_cutoff]
+            count_params: list[Any] = [source_ip, effective_cutoff]
             if connection_type:
                 count_query += " AND connection_type = ?"
                 count_params.append(connection_type)
@@ -471,14 +503,14 @@ class DatabaseManager:
             logger.error("Event count query failed: %s", exc)
             return 0
 
-    async def is_ip_banned(self, ip_hash: str) -> bool:
+    async def is_ip_banned(self, source_ip: str) -> bool:
         """
-        Checks if a hashed IP has an active ban.
+        Checks if a source IP has an active ban.
 
         Expired bans are automatically disabled.
 
         Args:
-            ip_hash: Hashed IP.
+            source_ip: Source IP.
 
         Returns:
             True ise IP banlı.
@@ -503,9 +535,9 @@ class DatabaseManager:
             async with self._db.execute(
                 """
                 SELECT COUNT(*) FROM ban_history
-                WHERE ip_hash = ? AND is_active = 1
+                WHERE source_ip = ? AND is_active = 1
                 """,
-                (ip_hash,),
+                (source_ip,),
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] > 0 if row else False
@@ -599,17 +631,17 @@ class DatabaseManager:
                     f"Failed to deactivate active bans: {exc}"
                 ) from exc
 
-    async def deactivate_ban_by_hash(self, ip_hash: str) -> int:
-        """Marks active bans for a specific hashed IP as inactive."""
+    async def deactivate_ban_by_ip(self, source_ip: str) -> int:
+        """Marks active bans for a specific source IP as inactive."""
         async with self._lock:
             try:
                 async with self._db.execute(
                     """
                     UPDATE ban_history
                     SET is_active = 0
-                    WHERE ip_hash = ? AND is_active = 1
+                    WHERE source_ip = ? AND is_active = 1
                     """,
-                    (ip_hash,),
+                    (source_ip,),
                 ) as cursor:
                     await self._db.commit()
                     return cursor.rowcount if cursor.rowcount is not None else 0
@@ -617,6 +649,7 @@ class DatabaseManager:
                 raise WardenDatabaseError(
                     f"Failed to deactivate ban record: {exc}"
                 ) from exc
+
 
     # ── Admin Auth and Audit ──
 

@@ -29,7 +29,6 @@ replacements = {
     "Bir plugin icin olay isleme callback'i olusturur.": "Creates an event processing callback for a plugin.",
     "Satiri ayristir": "Parse line",
     "Whitelist kontrolu": "Whitelist check",
-    "IP hash'le": "Hash IP",
     "ASN bilgisi al": "ASN lookup",
     "Gecmis olay sayisini sorgula": "Query recent events count",
     "Risk skoru hesapla": "Calculate risk score",
@@ -72,11 +71,6 @@ replacements = {
     "Ban kaydedildi": "Ban logged",
     "Sebep": "Reason",
     "Sure": "Duration",
-    
-    # ip_hasher.py
-    "IP hash salt degeri degistirilmemis veya bos! Guvenlik riski — config.yaml'da salt degerini guncelleyin.": "IP hash salt is unchanged or empty! Security risk — please update the salt in config.yaml.",
-    "baslatildi. Algoritma:": "started. Algorithm:",
-    "Salt uzunlugu:": "Salt length:",
     
     # logger.py
     "Loglama sistemi başlatıldı. Seviye:": "Logging system started. Level:",

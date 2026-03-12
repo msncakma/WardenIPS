@@ -48,8 +48,8 @@ class RedisDatabaseManager:
 
     Usage:
         db = await RedisDatabaseManager.create(config)
-        await db.log_event(event, ip_hash="a3f2b8c1...")
-        count = await db.get_event_count_by_ip("a3f2b8c1...", minutes=5)
+        await db.log_event(event, source_ip="203.0.113.7")
+        count = await db.get_event_count_by_ip("203.0.113.7", minutes=5)
         await db.close()
     """
 
@@ -94,7 +94,7 @@ class RedisDatabaseManager:
 
     # ── Event Logging ──
 
-    async def log_event(self, event, ip_hash: str) -> int:
+    async def log_event(self, event, source_ip: str) -> int:
         """Log a connection event to Redis."""
         async with self._lock:
             event_id = await self._redis.incr(self._key("event_id_seq"))
@@ -103,7 +103,7 @@ class RedisDatabaseManager:
             event_data = {
                 "id": event_id,
                 "timestamp": event.timestamp.isoformat(),
-                "ip_hash": ip_hash,
+                "source_ip": source_ip,
                 "player_name": event.player_name or "",
                 "connection_type": event.connection_type.value,
                 "asn_number": event.asn_number or 0,
@@ -120,10 +120,10 @@ class RedisDatabaseManager:
             event_key = self._key("event", str(event_id))
             pipe.hset(event_key, mapping=event_data)
             pipe.expire(event_key, self._event_ttl)
-            # Index by IP hash (sorted set, score = timestamp)
+            # Index by source IP (sorted set, score = timestamp)
             score = event.timestamp.timestamp()
-            pipe.zadd(self._key("ip_events", ip_hash), {str(event_id): score})
-            pipe.expire(self._key("ip_events", ip_hash), self._event_ttl)
+            pipe.zadd(self._key("ip_events", source_ip), {str(event_id): score})
+            pipe.expire(self._key("ip_events", source_ip), self._event_ttl)
             # Global counter
             pipe.incr(self._key("stats", "total_events"))
             await pipe.execute()
@@ -134,7 +134,7 @@ class RedisDatabaseManager:
 
     async def log_ban(
         self,
-        ip_hash: str,
+        source_ip: str,
         reason: str,
         risk_score: int,
         ban_duration: int = 0,
@@ -149,7 +149,7 @@ class RedisDatabaseManager:
 
             ban_data = {
                 "id": ban_id,
-                "ip_hash": ip_hash,
+                "source_ip": source_ip,
                 "reason": reason,
                 "risk_score": risk_score,
                 "ban_duration": ban_duration,
@@ -165,13 +165,13 @@ class RedisDatabaseManager:
                 pipe.expire(ban_key, ban_duration + 60)
             # Track active bans
             pipe.sadd(self._key("active_bans"), str(ban_id))
-            pipe.sadd(self._key("ip_bans", ip_hash), str(ban_id))
+            pipe.sadd(self._key("ip_bans", source_ip), str(ban_id))
             pipe.incr(self._key("stats", "total_bans"))
             await pipe.execute()
 
             logger.info(
-                "Ban logged ID=%d, IP_HASH=%s..., Reason='%s', Duration=%ds",
-                ban_id, ip_hash[:12], reason, ban_duration,
+                "Ban logged ID=%d, IP=%s, Reason='%s', Duration=%ds",
+                ban_id, source_ip, reason, ban_duration,
             )
             return ban_id
 
@@ -179,22 +179,22 @@ class RedisDatabaseManager:
 
     async def get_event_count_by_ip(
         self,
-        ip_hash: str,
+        source_ip: str,
         minutes: int = 5,
         connection_type: str | None = None,
         reset_on_success: bool = False,
         success_event_types: list[str] | None = None,
     ) -> int:
-        """Returns count of events for a hashed IP in the last N minutes."""
+        """Returns count of events for a source IP in the last N minutes."""
         cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).timestamp()
         now = datetime.utcnow().timestamp()
         if not reset_on_success or not success_event_types:
             return await self._redis.zcount(
-                self._key("ip_events", ip_hash), cutoff, now
+                self._key("ip_events", source_ip), cutoff, now
             )
 
         event_ids = await self._redis.zrangebyscore(
-            self._key("ip_events", ip_hash), cutoff, now
+            self._key("ip_events", source_ip), cutoff, now
         )
         filtered_events = []
         for event_id in event_ids:
@@ -227,13 +227,13 @@ class RedisDatabaseManager:
         return count
 
     async def get_recent_events_by_ip(
-        self, ip_hash: str, minutes: int = 5
+        self, source_ip: str, minutes: int = 5
     ) -> List[Dict[str, Any]]:
-        """Returns recent events for a hashed IP."""
+        """Returns recent events for a source IP."""
         cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).timestamp()
         now = datetime.utcnow().timestamp()
         event_ids = await self._redis.zrangebyscore(
-            self._key("ip_events", ip_hash), cutoff, now
+            self._key("ip_events", source_ip), cutoff, now
         )
         events = []
         for eid in event_ids:
@@ -242,9 +242,9 @@ class RedisDatabaseManager:
                 events.append(data)
         return events
 
-    async def is_ip_banned(self, ip_hash: str) -> bool:
-        """Check if a hashed IP has an active ban."""
-        ban_ids = await self._redis.smembers(self._key("ip_bans", ip_hash))
+    async def is_ip_banned(self, source_ip: str) -> bool:
+        """Check if a source IP has an active ban."""
+        ban_ids = await self._redis.smembers(self._key("ip_bans", source_ip))
         for bid in ban_ids:
             ban_key = self._key("ban", str(bid))
             data = await self._redis.hgetall(ban_key)

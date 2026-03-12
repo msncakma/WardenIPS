@@ -25,7 +25,6 @@ from wardenips.core.config import ConfigManager
 from wardenips.core.logger import setup_logging, get_logger
 from wardenips.core.whitelist import WhitelistManager
 from wardenips.core.asn_lookup import ASNLookupEngine
-from wardenips.core.ip_hasher import IPHasher
 from wardenips.core.database import DatabaseManager
 from wardenips.core.firewall import FirewallManager
 from wardenips.core.abuseipdb import AbuseIPDBReporter
@@ -55,7 +54,6 @@ class WardenIPS:
         self._logger = None
         self._whitelist: WhitelistManager = None
         self._asn_engine: ASNLookupEngine = None
-        self._hasher: IPHasher = None
         self._db: DatabaseManager = None
         self._firewall: FirewallManager = None
         self._abuse_reporter: AbuseIPDBReporter = None
@@ -110,8 +108,6 @@ class WardenIPS:
 
         self._asn_engine = ASNLookupEngine(self._config)
         self._logger.info("ASN Engine: %s", self._asn_engine)
-
-        self._hasher = IPHasher.from_config(self._config)
 
         # Select database backend (sqlite or redis)
         db_backend = self._config.get("database.backend", "sqlite")
@@ -239,7 +235,7 @@ class WardenIPS:
                 t for t in ts_list if t > cutoff
             ]
             if len(ts_list) >= self._burst_threshold:
-                ip_hash = self._hasher.hash_ip(event.source_ip)
+                source_ip = event.source_ip
                 ban_duration = self._config.get(
                     "firewall.ipset.default_ban_duration", 3600
                 )
@@ -253,7 +249,7 @@ class WardenIPS:
                 if banned:
                     self._stats_total_bans += 1
                     await self._db.log_ban(
-                        ip_hash, reason, 100, ban_duration
+                        source_ip, reason, 100, ban_duration
                     )
                     self._logger.warning(
                         "BURST DETECTED: IP=%s Events=%d/%ds — AUTO-BANNED "
@@ -271,8 +267,8 @@ class WardenIPS:
                     self._burst_tracker.pop(event.source_ip, None)
                 return  # Skip normal scoring — already handled
 
-            # 3. Hash IP
-            ip_hash = self._hasher.hash_ip(event.source_ip)
+            # 3. Use source IP directly (no anonymization layer)
+            source_ip = event.source_ip
 
             success_logging_enabled = bool(
                 self._config.get("successful_logins.enabled", True)
@@ -299,7 +295,7 @@ class WardenIPS:
             # 5. Query recent events count
             time_window = self._config.get("general.analysis_interval", 5)
             event_count = await self._db.get_event_count_by_ip(
-                ip_hash,
+                source_ip,
                 minutes=time_window,
                 connection_type=event.connection_type.value,
                 reset_on_success=reset_risk_on_success,
@@ -344,7 +340,7 @@ class WardenIPS:
                 raw_log_line=event.raw_log_line,
                 details=event.details,
             )
-            await self._db.log_event(updated_event, ip_hash)
+            await self._db.log_event(updated_event, source_ip)
 
             if is_success_event:
                 self._logger.info(
@@ -383,7 +379,7 @@ class WardenIPS:
                 if banned:
                     self._stats_total_bans += 1
                     await self._db.log_ban(
-                        ip_hash, reason, risk_score, ban_duration
+                        source_ip, reason, risk_score, ban_duration
                     )
                     # Report to AbuseIPDB
                     categories = [18] if event.connection_type.value == "ssh" else [14]
@@ -626,7 +622,7 @@ async def print_status(config_path: str) -> None:
     print(f"  Total events   : {stats.get('total_events', 0)}")
     print(f"  Total bans     : {stats.get('total_bans', 0)}")
     print(f"  Active bans    : {stats.get('active_bans', 0)}")
-    print(f"  Top attackers  : (run 'sqlite3 <db> \"SELECT ip_hash, COUNT(*) c FROM ban_history GROUP BY ip_hash ORDER BY c DESC LIMIT 5;\"')")
+    print(f"  Top attackers  : (run 'sqlite3 <db> \"SELECT source_ip, COUNT(*) c FROM ban_history GROUP BY source_ip ORDER BY c DESC LIMIT 5;\"')")
     print("="*50)
 
 

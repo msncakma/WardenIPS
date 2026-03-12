@@ -31,11 +31,6 @@ database:
     url: "redis://localhost:6379/0"
     prefix: "warden:"
     event_ttl: 86400          # Event retention in Redis (seconds, default 24h)
-  ip_hashing:
-    enabled: true
-    # IMPORTANT: Change this salt to a secure random string for GDPR compliance!
-    salt: "YOUR-RANaDOM-SECURE-SALT-STRING-HERE"
-    algorithm: "sha256"
 
 maxmind:
   # Requires free MaxMind GeoLite2 databases to function.

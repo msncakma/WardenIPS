@@ -417,30 +417,6 @@ configure_defaults() {
         error "config.yaml was not found after deployment."
     fi
 
-    CURRENT_SALT="$(sed -n 's/^[[:space:]]*salt:[[:space:]]*"\([^"]*\)".*/\1/p' "$INSTALL_DIR/config.yaml" | head -n 1)"
-    if [ "$CURRENT_SALT" = "YOUR-RANaDOM-SECURE-SALT-STRING-HERE" ] || \
-       [ "$CURRENT_SALT" = "YOUR-RANDOM-SECURE-SALT-STRING-HERE" ] || \
-       [ -z "$CURRENT_SALT" ]; then
-        NEW_SALT="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-        python3 - "$INSTALL_DIR/config.yaml" "$NEW_SALT" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-salt = sys.argv[2]
-text = path.read_text(encoding='utf-8')
-for old in (
-    'salt: "YOUR-RANaDOM-SECURE-SALT-STRING-HERE"',
-    'salt: "YOUR-RANDOM-SECURE-SALT-STRING-HERE"',
-):
-    text = text.replace(old, f'salt: "{salt}"')
-path.write_text(text, encoding='utf-8')
-PY
-        log "Generated a secure IP hashing salt."
-    else
-        log "Custom IP hashing salt already present, skipping."
-    fi
-
     if [ "$ENABLE_DASHBOARD" = "1" ]; then
         python3 - "$INSTALL_DIR/config.yaml" <<'PY'
 from pathlib import Path
