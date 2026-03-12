@@ -135,7 +135,11 @@ class FirewallManager:
             if not is_linux:
                 reason = "Not Linux"
             else:
-                missing = [t for t, ok in [("ipset", has_ipset), ("iptables", has_iptables)] if not ok]
+                missing = [
+                    tool
+                    for tool, ok in [("ipset", has_ipset), ("iptables", has_iptables)]
+                    if not ok
+                ]
                 reason = f"Missing tools: {', '.join(missing)}"
             logger.warning(
                 "Firewall is in SIMULATION mode! Reason: %s. "
@@ -143,79 +147,118 @@ class FirewallManager:
                 reason,
             )
         else:
-            # Root check — if not root, try passwordless sudo as a fallback.
-            # This is the recommended setup for developers who don't want to run
-            # the whole process as root:
-            #   echo 'YOUR_USER ALL=(root) NOPASSWD: /usr/sbin/ipset, /usr/sbin/iptables' \
-            #     | sudo tee /etc/sudoers.d/wardenips
             import os
+
             if os.geteuid() != 0:
-                sudo_path = shutil.which("sudo")
-                if sudo_path and await self._probe_sudo(sudo_path):
-                    self._use_sudo = True
-                    self._sudo_cmd = sudo_path
+                if await self._probe_direct_privileged():
                     logger.info(
-                        "Not root, but passwordless sudo is available — "
-                        "firewall will run via 'sudo -n'. "
-                        "(Production tip: use systemd with User=root instead.)"
+                        "Not root, but direct firewall access is available "
+                        "(likely via Linux capabilities). Running without sudo."
                     )
                 else:
-                    self._simulation_mode = True
-                    logger.warning(
-                        "Root permissions not found and passwordless sudo is not "
-                        "configured — firewall is in SIMULATION mode!\n"
-                        "  To fix for development/testing, run:\n"
-                        "    echo '%s ALL=(root) NOPASSWD: %s, %s' "
-                        "| sudo tee /etc/sudoers.d/wardenips",
-                        os.environ.get("USER", "YOUR_USER"),
-                        self._ipset_cmd, self._iptables_cmd,
-                    )
+                    sudo_path = shutil.which("sudo")
+                    if sudo_path and await self._probe_sudo(sudo_path):
+                        self._use_sudo = True
+                        self._sudo_cmd = sudo_path
+                        logger.info(
+                            "Not root, but passwordless sudo is available — "
+                            "firewall will run via 'sudo -n'. "
+                            "(Production tip: use systemd with User=root instead.)"
+                        )
+                    else:
+                        self._simulation_mode = True
+                        logger.warning(
+                            "Root permissions not found and usable sudo/direct "
+                            "privileges are not available — firewall is in "
+                            "SIMULATION mode!\n"
+                            "  To fix for development/testing, run:\n"
+                            "    echo '%s ALL=(root) NOPASSWD: %s, %s' "
+                            "| sudo tee /etc/sudoers.d/wardenips",
+                            os.environ.get("USER", "YOUR_USER"),
+                            self._ipset_cmd,
+                            self._iptables_cmd,
+                        )
 
         # ipset setini olustur (IPv4)
         await self._exec_command(
-            self._ipset_cmd, "create", self._set_name,
-            "hash:ip", "timeout", str(self._default_ban_duration),
+            self._ipset_cmd,
+            "create",
+            self._set_name,
+            "hash:ip",
+            "timeout",
+            str(self._default_ban_duration),
             "-exist",
         )
 
         # ipset setini olustur (IPv6) — only if ip6tables is available
         if self._ipv6_supported:
             await self._exec_command(
-                self._ipset_cmd, "create", self._set_name_v6,
-                "hash:ip", "family", "inet6",
-                "timeout", str(self._default_ban_duration),
+                self._ipset_cmd,
+                "create",
+                self._set_name_v6,
+                "hash:ip",
+                "family",
+                "inet6",
+                "timeout",
+                str(self._default_ban_duration),
                 "-exist",
             )
 
         # iptables DROP kuralini ekle — once kontrol et, duplike olmasini onle.
-        # Her restart'ta -I cagrilirsa INPUT chain'e yeni kural eklenir ve
-        # iptables listesi kirlenir.  -C exit 0 = kural zaten var demektir.
         rule_exists = await self._exec_command(
-            self._iptables_cmd, "-C", "INPUT",
-            "-m", "set", "--match-set", self._set_name, "src",
-            "-j", "DROP",
+            self._iptables_cmd,
+            "-C",
+            "INPUT",
+            "-m",
+            "set",
+            "--match-set",
+            self._set_name,
+            "src",
+            "-j",
+            "DROP",
             ignore_errors=True,
         )
         if not rule_exists:
             await self._exec_command(
-                self._iptables_cmd, "-I", "INPUT",
-                "-m", "set", "--match-set", self._set_name, "src",
-                "-j", "DROP",
+                self._iptables_cmd,
+                "-I",
+                "INPUT",
+                "-m",
+                "set",
+                "--match-set",
+                self._set_name,
+                "src",
+                "-j",
+                "DROP",
             )
 
         # ip6tables DROP rule for IPv6 set
         if self._ipv6_supported:
             rule6_exists = await self._exec_command(
-                self._ip6tables_cmd, "-C", "INPUT",
-                "-m", "set", "--match-set", self._set_name_v6, "src",
-                "-j", "DROP",
+                self._ip6tables_cmd,
+                "-C",
+                "INPUT",
+                "-m",
+                "set",
+                "--match-set",
+                self._set_name_v6,
+                "src",
+                "-j",
+                "DROP",
                 ignore_errors=True,
             )
             if not rule6_exists:
                 await self._exec_command(
-                    self._ip6tables_cmd, "-I", "INPUT",
-                    "-m", "set", "--match-set", self._set_name_v6, "src",
-                    "-j", "DROP",
+                    self._ip6tables_cmd,
+                    "-I",
+                    "INPUT",
+                    "-m",
+                    "set",
+                    "--match-set",
+                    self._set_name_v6,
+                    "src",
+                    "-j",
+                    "DROP",
                 )
 
         # Populate in-memory ban set from existing ipset entries so that
@@ -228,8 +271,10 @@ class FirewallManager:
         logger.info(
             "Firewall started. Set: '%s', IPv6: %s, "
             "Default ban duration: %ds, Simulation: %s",
-            self._set_name, ipv6_str,
-            self._default_ban_duration, self._simulation_mode,
+            self._set_name,
+            ipv6_str,
+            self._default_ban_duration,
+            self._simulation_mode,
         )
 
     # ── Helpers ──
@@ -453,6 +498,19 @@ class FirewallManager:
 
     # ── Sudo probe ──
 
+    async def _probe_direct_privileged(self) -> bool:
+        """Returns True if ipset can run directly without sudo."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._ipset_cmd, "list", "-n",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     async def _probe_sudo(self, sudo_path: str) -> bool:
         """Returns True if 'sudo -n <ipset_cmd> list -n' succeeds without a password prompt."""
         try:
@@ -462,14 +520,16 @@ class FirewallManager:
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await proc.communicate()
-            # sudo prints "sudo: a password is required" to stderr on failure
             if proc.returncode == 0:
                 return True
-            err = stderr.decode(errors="replace")
-            if "password" in err.lower():
+            err = stderr.decode(errors="replace").lower()
+            if "password" in err:
                 return False
-            # Any other non-zero exit (e.g. empty set) is still a working sudo
-            return True
+            if "no new privileges" in err:
+                return False
+            if "not permitted" in err or "permission denied" in err:
+                return False
+            return False
         except Exception:
             return False
 

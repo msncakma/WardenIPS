@@ -3,6 +3,8 @@ Description=WardenIPS - Autonomous Intrusion Prevention System
 Documentation=https://github.com/msncakma/WardenIPS
 After=network.target
 Wants=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -17,8 +19,6 @@ ExecStart=__INSTALL_DIR__/venv/bin/python __INSTALL_DIR__/main.py --config __INS
 # Restart policies
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Security hardening — defense in depth even though we run as root.
 # These restrict the process to only what WardenIPS actually needs.
