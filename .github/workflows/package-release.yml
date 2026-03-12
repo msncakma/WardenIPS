@@ -300,7 +300,7 @@ jobs:
           name: WardenIPS v${{ needs.build-deb.outputs.version }}
           body_path: release-notes.md
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(needs.build-deb.outputs.version, '-') }}
           files: |
             ${{ needs.build-deb.outputs.deb-file }}
             ${{ needs.build-snap.outputs.snap-file }}

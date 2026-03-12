@@ -1,5 +1,5 @@
 name: wardenips
-version: '0.2.3'
+version: '0.2.4-beta'
 summary: Autonomous Intrusion Prevention System for Linux
 description: |
   WardenIPS is a Linux-native, asynchronous intrusion prevention platform 
@@ -22,7 +22,7 @@ description: |
   # Dashboard: http://127.0.0.1:7680/
 
 confinement: classic  # Required for firewall/system access
-grade: stable
+grade: devel
 base: core22
 license: MIT
 architectures: [amd64, arm64]
