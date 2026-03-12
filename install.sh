@@ -3,8 +3,6 @@
 # Supports both local execution and curl | sh style remote execution.
 set -eu
 
-trap 'printf "\n%b\n" "${RED}✗ Installation failed at line $LINENO.${NC}"; exit 1' ERR
-
 INSTALL_DIR="${INSTALL_DIR:-/opt/wardenips}"
 DATA_DIR="${DATA_DIR:-/var/lib/wardenips}"
 LOG_DIR="${LOG_DIR:-/var/log/wardenips}"
@@ -661,6 +659,14 @@ case "${1:-help}" in
         ;;
     console)
         print_banner
+        if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+            printf "${YELLOW}[!] Service is running. Stopping it before entering console mode...${NC}\n"
+            if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+                sudo systemctl stop "$SERVICE_NAME"
+            else
+                systemctl stop "$SERVICE_NAME"
+            fi
+        fi
         run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE"
         ;;
     start)

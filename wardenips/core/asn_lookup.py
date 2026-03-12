@@ -402,6 +402,5 @@ class ASNLookupEngine:
         return (
             f"<ASNLookupEngine "
             f"asn_db={'loaded' if self._asn_reader else 'N/A'} "
-            f"country_db={'loaded' if self._country_reader else 'N/A'} "
-            f"dc_asns={len(self._datacenter_asns)}>"
+            f"suspicious_asns={len(self._suspicious_asns)}>"
         )
