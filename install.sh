@@ -659,14 +659,6 @@ case "${1:-help}" in
         ;;
     console)
         print_banner
-        if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-            printf "${YELLOW}[!] Service is running. Stopping it before entering console mode...${NC}\n"
-            if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-                sudo systemctl stop "$SERVICE_NAME"
-            else
-                systemctl stop "$SERVICE_NAME"
-            fi
-        fi
         run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE"
         ;;
     start)
@@ -685,7 +677,7 @@ case "${1:-help}" in
         run_privileged systemctl status "$SERVICE_NAME"
         ;;
     logs)
-        run_privileged journalctl -u "$SERVICE_NAME" -f
+        run_privileged journalctl -u "$SERVICE_NAME" -f -o cat
         ;;
     config)
         printf "%s\n" "$CONFIG_FILE"
