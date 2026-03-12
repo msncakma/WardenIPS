@@ -166,7 +166,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           
           # Build snap package
-          snapcraft --destructive-mode
+          snapcraft pack --destructive-mode
           
           # Find the generated snap file
           SNAP_FILE="${PACKAGE_NAME}_${VERSION}_amd64.snap"

@@ -8,7 +8,7 @@ Maintainer: `msncakma`
 
 If you want a cleaner product-style overview for sharing or presentation, see [docs/index.md](docs/index.md).
 
-[![Version](https://img.shields.io/badge/version-0.2.4--beta-yellow.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-0.2.5-green.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -27,9 +27,9 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 
 ## Transparency
 
-WardenIPS v0.2.4-beta is feature-complete for its intended scope, with professional CLI tooling and robust error handling.
+WardenIPS v0.2.5 is feature-complete for its intended scope, with professional CLI tooling and robust error handling.
 
-- Current state: **v0.2.4-beta** — beta release for active stabilization before the next formal stable tag.
+- Current state: **v0.2.5** — active stable line with packaging and release pipeline fixes.
 - Testing state: core flows are implemented and functional, broad production validation is ongoing.
 - Deployment advice: use in labs, staging, or controlled production pilots first.
 - Operational reality: misconfigured whitelists or aggressive thresholds can still block legitimate traffic.
@@ -287,7 +287,7 @@ WardenIPS uses a staged maturity model:
 - BETA: feature complete with active stabilization.
 - RELEASE: production-oriented stable milestone.
 
-Current version: **v0.2.4-beta**
+Current version: **v0.2.5**
 
 Until a formal RELEASE tag exists for a given build, treat that build as non-final.
 

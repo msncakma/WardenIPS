@@ -1,5 +1,5 @@
 name: wardenips
-version: '0.2.4-beta'
+version: '0.2.5'
 summary: Autonomous Intrusion Prevention System for Linux
 description: |
   WardenIPS is a Linux-native, asynchronous intrusion prevention platform 
@@ -22,7 +22,7 @@ description: |
   # Dashboard: http://127.0.0.1:7680/
 
 confinement: classic  # Required for firewall/system access
-grade: devel
+grade: stable
 base: core22
 license: MIT
 architectures: [amd64, arm64]
@@ -85,7 +85,7 @@ parts:
   wardenips:
     plugin: python
     source: .
-    requirements:
+    python-requirements:
       - requirements.txt
     build-packages:
       - python3-dev
@@ -105,18 +105,19 @@ parts:
       craftctl default
       
       # Create directories
-      mkdir -p $CRAFTCTL_INSTALL/bin
-      mkdir -p $CRAFTCTL_INSTALL/etc/wardenips
-      mkdir -p $CRAFTCTL_INSTALL/systemd
+      mkdir -p "$CRAFT_PART_INSTALL/bin"
+      mkdir -p "$CRAFT_PART_INSTALL/etc/wardenips"
+      mkdir -p "$CRAFT_PART_INSTALL/systemd"
       
       # Copy application files
-      cp -r wardenips $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
-      cp main.py $CRAFTCTL_INSTALL/lib/python3.10/site-packages/
-      cp config_backup.yaml $CRAFTCTL_INSTALL/etc/wardenips/
-      cp whitelist.ips $CRAFTCTL_INSTALL/etc/wardenips/
+      mkdir -p "$CRAFT_PART_INSTALL/lib/python3.10/site-packages"
+      cp -r wardenips "$CRAFT_PART_INSTALL/lib/python3.10/site-packages/"
+      cp main.py "$CRAFT_PART_INSTALL/lib/python3.10/site-packages/"
+      cp config_backup.yaml "$CRAFT_PART_INSTALL/etc/wardenips/"
+      cp whitelist.ips "$CRAFT_PART_INSTALL/etc/wardenips/"
       
       # Create systemd service file for snap
-      cat > $CRAFTCTL_INSTALL/systemd/wardenips.service << 'EOF'
+      cat > "$CRAFT_PART_INSTALL/systemd/wardenips.service" << 'EOF'
       [Unit]
       Description=WardenIPS - Autonomous Intrusion Prevention System (Snap)
       After=network-online.target
