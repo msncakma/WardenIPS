@@ -1,0 +1,39 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+# Uncomment this to turn on verbose mode.
+# export DH_VERBOSE=1
+
+export PYBUILD_NAME=wardenips
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_install:
+	dh_auto_install
+	# Install main application files
+	install -d $(CURDIR)/debian/wardenips/opt/wardenips
+	cp -r $(CURDIR)/wardenips $(CURDIR)/debian/wardenips/opt/wardenips/
+	cp $(CURDIR)/main.py $(CURDIR)/debian/wardenips/opt/wardenips/
+	cp $(CURDIR)/requirements.txt $(CURDIR)/debian/wardenips/opt/wardenips/
+	cp $(CURDIR)/config_backup.yaml $(CURDIR)/debian/wardenips/opt/wardenips/
+	cp $(CURDIR)/whitelist.ips $(CURDIR)/debian/wardenips/opt/wardenips/
+	
+	# Install systemd service
+	install -d $(CURDIR)/debian/wardenips/lib/systemd/system
+	install -m 644 $(CURDIR)/wardenips.service $(CURDIR)/debian/wardenips/lib/systemd/system/
+	
+	# Install CLI wrapper
+	install -d $(CURDIR)/debian/wardenips/usr/local/bin
+	install -m 755 $(CURDIR)/debian/wardenips-wrapper $(CURDIR)/debian/wardenips/usr/local/bin/wardenips
+	
+	# Create directories
+	install -d $(CURDIR)/debian/wardenips/var/lib/wardenips
+	install -d $(CURDIR)/debian/wardenips/var/log/wardenips
+	install -d $(CURDIR)/debian/wardenips/opt/wardenips/assets
+
+override_dh_systemd_enable:
+	dh_systemd_enable --no-enable wardenips.service
+
+override_dh_systemd_start:
+	dh_systemd_start --no-start wardenips.service

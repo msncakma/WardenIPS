@@ -1,0 +1,99 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    configure)
+        # Create wardenips user and group
+        if ! getent group wardenips >/dev/null; then
+            addgroup --system wardenips
+        fi
+        
+        if ! getent passwd wardenips >/dev/null; then
+            adduser --system --ingroup wardenips \
+                --home /opt/wardenips \
+                --shell /usr/sbin/nologin \
+                --gecos "WardenIPS service account" \
+                wardenips
+        fi
+        
+        # Set ownership and permissions
+        chown -R root:wardenips /opt/wardenips
+        chmod -R g=rX,o= /opt/wardenips
+        find /opt/wardenips -type d -exec chmod 750 {} +
+        
+        chown -R wardenips:wardenips /var/lib/wardenips /var/log/wardenips
+        find /var/lib/wardenips /var/log/wardenips -type d -exec chmod 750 {} +
+        
+        # Create Python virtual environment
+        if [ ! -d /opt/wardenips/venv ]; then
+            echo "Creating Python virtual environment..."
+            python3 -m venv /opt/wardenips/venv
+            /opt/wardenips/venv/bin/python -m pip install --upgrade pip
+            /opt/wardenips/venv/bin/python -m pip install -r /opt/wardenips/requirements.txt
+            chown -R root:wardenips /opt/wardenips/venv
+        fi
+        
+        # Copy default config if doesn't exist
+        if [ ! -f /opt/wardenips/config.yaml ]; then
+            cp /opt/wardenips/config_backup.yaml /opt/wardenips/config.yaml
+            chown wardenips:wardenips /opt/wardenips/config.yaml
+            chmod 660 /opt/wardenips/config.yaml
+        fi
+        
+        # Update CLI wrapper with correct paths
+        sed -i 's|__INSTALL_DIR__|/opt/wardenips|g' /usr/local/bin/wardenips
+        
+        # Create log file
+        touch /var/log/wardenips/warden.log
+        chown wardenips:wardenips /var/log/wardenips/warden.log
+        chmod 640 /var/log/wardenips/warden.log
+        
+        # Download GeoLite2 database
+        echo "Downloading GeoLite2-ASN database..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL -o /opt/wardenips/assets/GeoLite2-ASN.mmdb \
+                https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -O /opt/wardenips/assets/GeoLite2-ASN.mmdb \
+                https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb
+        fi
+        
+        if [ -f /opt/wardenips/assets/GeoLite2-ASN.mmdb ]; then
+            chown wardenips:wardenips /opt/wardenips/assets/GeoLite2-ASN.mmdb
+            chmod 640 /opt/wardenips/assets/GeoLite2-ASN.mmdb
+        fi
+        
+        # Grant log access
+        if [ -f /var/log/auth.log ] && command -v setfacl >/dev/null 2>&1; then
+            setfacl -m u:wardenips:r /var/log/auth.log || true
+        fi
+        
+        # Add wardenips to adm group if exists
+        if getent group adm >/dev/null 2>&1; then
+            usermod -a -G adm wardenips || true
+        fi
+        
+        # Enable (but don't start) systemd service
+        systemctl daemon-reload
+        systemctl enable wardenips.service
+        
+        echo ""
+        echo "============================================"
+        echo "   WardenIPS Installation Complete"
+        echo "============================================"
+        echo ""
+        echo "Next steps:"
+        echo "  1. Edit configuration: nano /opt/wardenips/config.yaml"
+        echo "  2. Add trusted IPs to: /opt/wardenips/whitelist.ips"
+        echo "  3. Start service: systemctl start wardenips"
+        echo "  4. View logs: wardenips logs"
+        echo "  5. Dashboard: http://127.0.0.1:7680/"
+        echo ""
+        echo "Commands: wardenips help"
+        echo ""
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,14 @@
+wardenips (0.2.3-1) stable; urgency=medium
+
+  * Initial release of WardenIPS v0.2.3
+  * Professional CLI wrapper with colorized output
+  * ASN-based threat detection with Loyalsoldier/geoip integration
+  * Autonomous weekly GeoLite2 database updates
+  * Full source IP visibility in dashboard (no truncation)
+  * Blocklist protection with AbuseIPDB curated data
+  * Real-time intrusion prevention with ipset/iptables
+  * Live operational dashboard with admin console
+  * Plugin-based detection (SSH, Minecraft, Nginx)
+  * Systemd service integration
+
+ -- msncakma <wardenips@msncakma.dev>  Wed, 12 Mar 2026 23:00:00 +0000

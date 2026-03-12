@@ -1,0 +1,37 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and group
+        if getent passwd wardenips >/dev/null; then
+            deluser --system wardenips || true
+        fi
+        if getent group wardenips >/dev/null; then
+            delgroup --system wardenips || true
+        fi
+        
+        # Remove data directories (only on purge)
+        rm -rf /var/lib/wardenips
+        rm -rf /var/log/wardenips
+        rm -rf /opt/wardenips
+        
+        # Remove ipsets if they exist
+        if command -v ipset >/dev/null 2>&1; then
+            ipset destroy warden_blacklist 2>/dev/null || true
+            ipset destroy wardenips_first_setup 2>/dev/null || true
+            ipset destroy wardenips_active 2>/dev/null || true
+        fi
+        
+        echo "WardenIPS completely removed."
+        ;;
+    
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # Keep data on normal removal
+        systemctl daemon-reload || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

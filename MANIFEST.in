@@ -1,0 +1,17 @@
+include README.md
+include LICENSE
+include requirements.txt
+include config_backup.yaml
+include whitelist.ips
+include main.py
+include wardenips.service
+include install.sh
+include uninstall.sh
+recursive-include wardenips *.py
+recursive-exclude wardenips __pycache__
+recursive-exclude wardenips *.pyc
+recursive-exclude wardenips *.pyo
+global-exclude .git*
+global-exclude *.orig
+global-exclude *.swp
+global-exclude *~

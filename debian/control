@@ -1,0 +1,37 @@
+Source: wardenips
+Section: net
+Priority: optional
+Maintainer: msncakma <wardenips@msncakma.dev>
+Build-Depends: debhelper (>= 9), python3-dev, python3-setuptools, dh-python
+Standards-Version: 4.5.0
+Homepage: https://github.com/msncakma/WardenIPS
+Vcs-Git: https://github.com/msncakma/WardenIPS.git
+Vcs-Browser: https://github.com/msncakma/WardenIPS
+
+Package: wardenips
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, 
+ python3 (>= 3.10), 
+ python3-venv,
+ ipset, 
+ iptables,
+ curl,
+ git,
+ rsync,
+ rsyslog,
+ systemd,
+ acl
+Recommends: nginx, openssh-server
+Description: Autonomous Intrusion Prevention System
+ WardenIPS is a Linux-native, asynchronous intrusion prevention platform 
+ that watches real service logs, scores suspicious behavior, and blocks 
+ attackers at the firewall layer before they become a bigger problem.
+ .
+ Key features:
+  * Real-time prevention with ipset/iptables enforcement
+  * Built-in blocklist protection (AbuseIPDB curated lists)
+  * ASN-based threat detection with weekly GeoLite2 updates
+  * Live operational dashboard
+  * Plugin-based detection (SSH, Minecraft, Nginx)
+  * Systemd service integration
+  * Professional CLI wrapper with colored output

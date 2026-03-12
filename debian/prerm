@@ -1,0 +1,33 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop and disable service
+        if systemctl is-active wardenips >/dev/null 2>&1; then
+            systemctl stop wardenips || true
+        fi
+        if systemctl is-enabled wardenips >/dev/null 2>&1; then
+            systemctl disable wardenips || true
+        fi
+        
+        # Flush firewall rules
+        /opt/wardenips/venv/bin/python -c "
+from wardenips.core.firewall import FirewallManager
+import yaml
+try:
+    with open('/opt/wardenips/config.yaml') as f:
+        config = yaml.safe_load(f)
+    fm = FirewallManager(config)
+    fm.flush_all_bans()
+    print('✓ Firewall rules flushed')
+except Exception as e:
+    print(f'Warning: Could not flush firewall rules: {e}')
+" 2>/dev/null || echo "Warning: Could not flush firewall rules"
+        
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
