@@ -69,6 +69,7 @@ class FirewallManager:
         # In production (daemon via systemd User=root) this stays False.
         self._use_sudo: bool = False
         self._sudo_cmd: str = ""  # resolved once in _initialize
+        self._direct_privileged: bool = False
         # In-memory set of currently banned IPs — prevents duplicate ban calls
         # for the same IP (important in simulation mode where ipset -exist has
         # no effect).
@@ -151,6 +152,7 @@ class FirewallManager:
 
             if os.geteuid() != 0:
                 if await self._probe_direct_privileged():
+                    self._direct_privileged = True
                     logger.info(
                         "Not root, but direct firewall access is available "
                         "(likely via Linux capabilities). Running without sudo."
@@ -651,7 +653,14 @@ class FirewallManager:
         return self._simulation_mode
 
     def __repr__(self) -> str:
-        mode = "simulation" if self._simulation_mode else ("sudo" if self._use_sudo else "root")
+        mode = "simulation"
+        if not self._simulation_mode:
+            if self._use_sudo:
+                mode = "sudo"
+            elif self._direct_privileged:
+                mode = "capabilities"
+            else:
+                mode = "root"
         return (
             f"<FirewallManager "
             f"set='{self._set_name}' "

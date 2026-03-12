@@ -137,7 +137,13 @@ class DashboardAPI:
     return self._enabled and _AIOHTTP_WEB_AVAILABLE
 
   def _get_dashboard_secrets(self) -> set[str]:
+    # Legacy secret set used only for legacy username/password fallback.
     return {value for value in (self._dashboard_password, self._api_key) if value}
+
+  def _get_bearer_secrets(self) -> set[str]:
+    # Bearer auth should not accept dashboard.password.
+    # Keep API key support for scripted clients.
+    return {self._api_key} if self._api_key else set()
 
   def _dashboard_auth_configured(self) -> bool:
     return bool(self._get_dashboard_secrets())
@@ -242,13 +248,14 @@ class DashboardAPI:
   def _check_auth(self, request: web.Request) -> bool:
     if self._is_session_authenticated(request):
       return True
-    if not self._dashboard_auth_configured():
+    bearer_secrets = self._get_bearer_secrets()
+    if not bearer_secrets:
       return False
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
       return False
     token = auth[7:]
-    return token in self._get_dashboard_secrets()
+    return token in bearer_secrets
 
   def _check_public_dashboard_access(self, request: web.Request) -> bool:
     if self._public_dashboard_enabled:
@@ -1106,6 +1113,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#110f18;--bg2:#1d1730;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--yellow:#ffbe5c;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
+html{font-size:clamp(13px,0.32vw + 12px,16px)}
 body{min-height:100vh;display:grid;place-items:center;font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);padding:20px;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 85% 12%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 16%,transparent) 0%,transparent 28%);pointer-events:none}
 .shell{width:min(100%,1120px);display:grid;grid-template-columns:1.1fr .9fr;gap:20px;align-items:stretch}
@@ -1167,6 +1175,8 @@ button[disabled]{opacity:.65;cursor:wait}
     <div class="aux-links">
       <a href="/dashboard">Open Public Dashboard</a>
       <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">Repository</a>
+      <a href="https://github.com/msncakma/WardenIPS/stargazers" target="_blank" rel="noopener">Star on GitHub</a>
+      <a href="https://github.com/msncakma/WardenIPS/issues" target="_blank" rel="noopener">Report an Issue</a>
       <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
     </div>
   </div>
@@ -1350,6 +1360,7 @@ SETUP_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#120f18;--bg2:#211934;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
+html{font-size:clamp(13px,0.32vw + 12px,16px)}
 body{min-height:100vh;display:grid;place-items:center;font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);padding:20px}
 .shell{width:min(100%,1160px);display:grid;grid-template-columns:1fr 1fr;gap:20px}
 .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:24px;padding:28px;box-shadow:var(--shadow)}
@@ -1556,7 +1567,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --cyan:#0f8f92;--cyan-d:#0f8f9220;
   --shadow:0 22px 48px rgba(73,49,19,.12);
 }
-html{font-size:15px;scroll-behavior:smooth}
+html{font-size:clamp(13px,0.28vw + 12px,15px);scroll-behavior:smooth}
 body{font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,color-mix(in srgb,var(--bg) 92%,#000 8%) 100%);color:var(--txt);min-height:100vh;overflow-x:hidden;transition:background .25s ease,color .25s ease}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 82% 14%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 14%,transparent) 0%,transparent 28%);pointer-events:none;z-index:0}
 .sh{max-width:1440px;margin:0 auto;padding:1.5rem;position:relative;z-index:1}
@@ -1780,7 +1791,7 @@ footer a:hover{text-decoration:underline}
     </div>
   </div>
 
-  <footer>WardenIPS v__APP_VERSION__ &mdash; by __APP_AUTHOR__ &middot; Autonomous Intrusion Prevention &middot; <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></footer>
+  <footer>WardenIPS v__APP_VERSION__ &mdash; by __APP_AUTHOR__ &middot; Autonomous Intrusion Prevention &middot; <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a> &middot; <a href="https://github.com/msncakma/WardenIPS/stargazers" target="_blank" rel="noopener">Star</a> &middot; <a href="https://github.com/msncakma/WardenIPS/issues" target="_blank" rel="noopener">Issues</a></footer>
 </div>
 
 <a class="kofi-fab" href="https://ko-fi.com/msncakma" target="_blank" rel="noopener" title="Support WardenIPS on Ko-fi">
@@ -1973,6 +1984,7 @@ DASHBOARD_V2_HTML = r"""<!DOCTYPE html>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#110f18;--bg2:#1d1730;--panel:#1d1a29;--panel2:#171420;--surface:#140f1f;--surface2:#120d1b;--b:#3b3150;--txt:#f5f1ea;--muted:#b8accc;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--yellow:#ffbe5c;--red:#ff6f7e;--accent:#ff875f;--shadow:0 30px 80px #00000045}
 :root[data-theme="light"]{--bg:#f4eee4;--bg2:#e9ddcf;--panel:#fffdf8;--panel2:#f7f1e8;--surface:#f3eadf;--surface2:#f9f4eb;--b:#dac8b2;--txt:#221d17;--muted:#74685b;--blue:#2f6fe4;--cyan:#0f8f92;--green:#1f8b57;--yellow:#c98410;--red:#c84e58;--accent:#c95c2b;--shadow:0 22px 48px rgba(73,49,19,.12)}
+html{font-size:clamp(13px,0.26vw + 12px,16px)}
 body{font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top left,var(--bg2) 0%,var(--bg) 48%,var(--surface) 100%);color:var(--txt);min-height:100vh;transition:background .25s ease,color .25s ease}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 85% 12%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 16%,transparent) 0%,transparent 28%);pointer-events:none}
 .app{max-width:1600px;margin:0 auto;padding:26px;position:relative;z-index:1}.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:18px;margin-bottom:22px}.brand h1{font-size:2rem;font-weight:800;letter-spacing:-.04em}.brand p{font-size:.95rem;color:var(--muted);margin-top:6px;max-width:58ch;line-height:1.5}.utility-strip{display:grid;grid-template-columns:1.45fr .95fr;gap:16px;margin-bottom:16px}.utility-card,.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:20px;padding:18px;box-shadow:var(--shadow)}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.82rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.utility-metrics div{padding:12px;border-radius:14px;background:var(--surface);border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
@@ -1996,6 +2008,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <a href="/dashboard">Open Public Dashboard</a>
         <a href="/admin">Admin Route</a>
         <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">Repository</a>
+        <a href="https://github.com/msncakma/WardenIPS/stargazers" target="_blank" rel="noopener">Star on GitHub</a>
+        <a href="https://github.com/msncakma/WardenIPS/issues" target="_blank" rel="noopener">Issues</a>
         <a href="https://ko-fi.com/msncakma" target="_blank" rel="noopener">Support on Ko-fi</a>
       </div>
     </div>
@@ -2129,7 +2143,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     </div>
   </div>
 
-  <div class="admin-footer">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__ · Authenticated operational console · <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a></div>
+  <div class="admin-footer">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__ · Authenticated operational console · <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">GitHub</a> · <a href="https://github.com/msncakma/WardenIPS/stargazers" target="_blank" rel="noopener">Star</a> · <a href="https://github.com/msncakma/WardenIPS/issues" target="_blank" rel="noopener">Issues</a></div>
 </div>
 
 <div id="configModal" class="modal-backdrop" hidden>
