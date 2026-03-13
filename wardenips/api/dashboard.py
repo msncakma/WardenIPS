@@ -2293,13 +2293,19 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .modal-body{padding:14px 16px 18px;overflow:auto}
 .modal-header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .config-filter{min-width:260px;background:var(--surface);border-color:color-mix(in srgb,var(--blue) 35%,var(--b))}
-.config-sections{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.config-sections{grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
 .config-section{position:relative;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+.config-section{overflow:hidden}
 .config-section:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--accent) 45%,var(--b));box-shadow:0 14px 28px #00000022}
 .config-section h3{display:flex;align-items:center;justify-content:space-between}
 .config-section h3::after{content:'Section';font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:3px 7px;border:1px solid var(--b);border-radius:999px;background:var(--surface2)}
+.config-grid{grid-template-columns:repeat(2,minmax(150px,1fr))}
+.config-field{min-width:0}
+.config-field label{white-space:normal;line-height:1.3}
+.config-input,.config-select{width:100%;min-width:0}
 .primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
 .advanced-wrap{margin-top:2px}
+@media(max-width:1280px){.config-sections{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}}
 </style>
 </head>
