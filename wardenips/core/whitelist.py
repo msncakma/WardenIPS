@@ -179,6 +179,27 @@ class WhitelistManager:
             await self._load_from_config(config)
             logger.info("Whitelist reloaded.")
 
+    async def add_runtime_ips(self, ips: List[str]) -> int:
+        """Adds runtime-only safety IPs to the in-memory whitelist."""
+        added = 0
+        async with self._lock:
+            for raw_ip in ips:
+                value = str(raw_ip or "").strip()
+                if not value:
+                    continue
+                try:
+                    parsed = ipaddress.ip_address(value)
+                except ValueError:
+                    logger.debug("Runtime whitelist skipped invalid IP: %s", value)
+                    continue
+                if parsed in self._whitelisted_ips:
+                    continue
+                self._whitelisted_ips.add(parsed)
+                added += 1
+        if added:
+            logger.info("Runtime whitelist applied: %d IP(s).", added)
+        return added
+
     # ── Information ──
 
     @property

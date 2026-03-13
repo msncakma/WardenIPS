@@ -501,6 +501,45 @@ class DatabaseManager:
             logger.error("Event count query failed: %s", exc)
             return 0
 
+    async def get_recent_connection_types_by_ip(
+        self,
+        source_ip: str,
+        minutes: int = 15,
+    ) -> List[str]:
+        """Returns distinct recent connection types observed for a source IP."""
+        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+        try:
+            async with self._db.execute(
+                """
+                SELECT DISTINCT connection_type
+                FROM connection_events
+                WHERE source_ip = ? AND timestamp >= ?
+                """,
+                (source_ip, cutoff),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [str(row[0]) for row in rows if row and row[0]]
+        except Exception as exc:
+            logger.error("Connection type query failed: %s", exc)
+            return []
+
+    async def get_total_ban_count_by_ip(self, source_ip: str) -> int:
+        """Returns historical ban count for a source IP."""
+        try:
+            async with self._db.execute(
+                """
+                SELECT COUNT(*)
+                FROM ban_history
+                WHERE source_ip = ?
+                """,
+                (source_ip,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as exc:
+            logger.error("Ban count query failed: %s", exc)
+            return 0
+
     async def is_ip_banned(self, source_ip: str) -> bool:
         """
         Checks if a source IP has an active ban.

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
+import os
 import signal
 import sys
 import time
@@ -25,6 +27,7 @@ from wardenips.core.config import ConfigManager
 from wardenips.core.logger import setup_logging, get_logger
 from wardenips.core.whitelist import WhitelistManager
 from wardenips.core.asn_lookup import ASNLookupEngine
+from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.database import DatabaseManager
 from wardenips.core.firewall import FirewallManager
 from wardenips.core.abuseipdb import AbuseIPDBReporter
@@ -32,6 +35,7 @@ from wardenips.core.notifications import NotificationManager
 from wardenips.core.blocklist import BlocklistManager
 from wardenips.core.log_tailer import LogTailer
 from wardenips.core.models import ConnectionEvent, ThreatLevel
+from wardenips.core.scoring import SmartScoringEngine
 from wardenips.core.updater import UpdateChecker
 from wardenips.api.dashboard import DashboardAPI
 from wardenips.plugins.base_plugin import PluginManager
@@ -56,6 +60,7 @@ class WardenIPS:
         self._whitelist: WhitelistManager = None
         self._asn_engine: ASNLookupEngine = None
         self._asn_update_task: asyncio.Task = None
+        self._country_engine: CountryLookupEngine = None
         self._db: DatabaseManager = None
         self._firewall: FirewallManager = None
         self._abuse_reporter: AbuseIPDBReporter = None
@@ -76,6 +81,7 @@ class WardenIPS:
         self._stats_total_events: int = 0
         self._stats_total_bans: int = 0
         self._start_time: float = 0.0
+        self._smart_scoring: SmartScoringEngine = SmartScoringEngine()
 
     async def start(self) -> None:
         """Starts WardenIPS and loads all components."""
@@ -107,9 +113,11 @@ class WardenIPS:
         # ── 4. Core Components ──
         self._whitelist = await WhitelistManager.create(self._config)
         self._logger.info("Whitelist: %s", self._whitelist.stats)
+        await self._apply_runtime_safety_whitelist()
 
         # ── 4.1 ASN Protection (GitHub'dan otomatik indirme) ──
         self._asn_engine = ASNLookupEngine(self._config)
+        self._country_engine = CountryLookupEngine(self._config)
         # GeoLite2-ASN.mmdb yoksa GitHub'dan indir
         asn_ready = await self._asn_engine.ensure_asn_database(self._config)
         if asn_ready and self._asn_engine._asn_reader is None:
@@ -136,6 +144,9 @@ class WardenIPS:
             self._config, self._whitelist
         )
         self._logger.info("Firewall: %s", self._firewall)
+        self._smart_scoring = SmartScoringEngine(
+            self._config.get("firewall.ipset.default_ban_duration", 3600)
+        )
 
         self._abuse_reporter = await AbuseIPDBReporter.create(self._config)
         self._logger.info("AbuseIPDB: %s", self._abuse_reporter)
@@ -255,13 +266,20 @@ class WardenIPS:
             ]
             if len(ts_list) >= self._burst_threshold:
                 source_ip = event.source_ip
-                ban_duration = self._config.get(
-                    "firewall.ipset.default_ban_duration", 3600
-                )
+                prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
+                ban_duration = self._smart_scoring.recidivist_ban_duration(prior_ban_count)
                 reason = (
                     f"[{plugin.name}] BURST FLOOD — "
                     f"{len(ts_list)} events in {self._burst_window}s"
                 )
+                protected = await self._is_critical_protected_ip(source_ip)
+                if protected:
+                    self._logger.critical(
+                        "CRITICAL: Lockout prevented for protected IP during burst handling: %s",
+                        source_ip,
+                    )
+                    self._burst_tracker.pop(source_ip, None)
+                    return
                 banned = await self._firewall.ban_ip(
                     event.source_ip, duration=ban_duration, reason=reason,
                 )
@@ -329,6 +347,18 @@ class WardenIPS:
             }
             risk_score = await plugin.calculate_risk(event, context)
 
+            recent_types = await self._db.get_recent_connection_types_by_ip(
+                source_ip,
+                minutes=time_window,
+            )
+            if event.connection_type.value not in recent_types:
+                recent_types.append(event.connection_type.value)
+            smart_result = self._smart_scoring.apply_multi_vector_bonus(
+                risk_score,
+                recent_types,
+            )
+            risk_score = smart_result.score
+
             if is_success_event and reset_risk_on_success:
                 risk_score = 0
 
@@ -345,6 +375,9 @@ class WardenIPS:
                 threat = ThreatLevel.NONE
 
             # 8. Log updated event to database
+            country_code = None
+            if self._country_engine:
+                country_code = self._country_engine.lookup_country_code(event.source_ip)
             updated_event = ConnectionEvent(
                 timestamp=event.timestamp,
                 source_ip=event.source_ip,
@@ -356,7 +389,10 @@ class WardenIPS:
                 threat_level=threat,
                 risk_score=risk_score,
                 raw_log_line=event.raw_log_line,
-                details=event.details,
+                details={
+                    **event.details,
+                    **({"country_code": country_code} if country_code else {}),
+                },
             )
             await self._db.log_event(updated_event, source_ip)
 
@@ -374,14 +410,24 @@ class WardenIPS:
 
             if action == "BAN":
                 ban_threshold = self._config.get("firewall.ban_threshold", 70)
-                ban_duration = self._config.get(
-                    "firewall.ipset.default_ban_duration", 3600
-                )
+                prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
+                ban_duration = self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                protected = await self._is_critical_protected_ip(source_ip)
+                if protected:
+                    self._logger.critical(
+                        "CRITICAL: Lockout prevented for protected IP: %s",
+                        source_ip,
+                    )
+                    return
                 reason = (
                     f"[{plugin.name}] Risk={risk_score} "
                     f"ASN={asn_result.asn_number} "
                     f"({event.details.get('event_type', 'unknown')})"
                 )
+                if smart_result.multi_vector:
+                    reason += f" MultiVector+{smart_result.bonus_applied}"
+                if prior_ban_count > 0:
+                    reason += f" Recidivist#{prior_ban_count + 1}"
 
                 banned = await self._firewall.ban_ip(
                     event.source_ip,
@@ -422,6 +468,82 @@ class WardenIPS:
                 )
 
         return handler
+
+    async def _apply_runtime_safety_whitelist(self) -> None:
+        """Add runtime-only safety IPs to reduce accidental operator lockout."""
+        safety_ips = await self._collect_runtime_safety_ips()
+        if not safety_ips:
+            return
+        added = await self._whitelist.add_runtime_ips(sorted(safety_ips))
+        if added:
+            self._logger.info("Anti-lockout: %d runtime safety IP(s) whitelisted.", added)
+
+    async def _collect_runtime_safety_ips(self) -> set[str]:
+        values: set[str] = {"127.0.0.1", "::1"}
+
+        # Include client source of this SSH session when available.
+        ssh_client = str((os.environ.get("SSH_CLIENT") or "")).split()
+        if ssh_client:
+            ip_value = ssh_client[0].strip()
+            if self._is_valid_ip(ip_value):
+                values.add(ip_value)
+
+        # Parse active SSH sessions from `who` output (host appears in parentheses).
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "who",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            for line in stdout.decode("utf-8", errors="replace").splitlines():
+                if "(" not in line or ")" not in line:
+                    continue
+                host = line.rsplit("(", 1)[-1].split(")", 1)[0].strip()
+                if self._is_valid_ip(host):
+                    values.add(host)
+        except Exception:
+            pass
+
+        # Linux default gateway parsed from /proc/net/route.
+        try:
+            route_path = Path("/proc/net/route")
+            if route_path.exists():
+                for line in route_path.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    destination, gateway_hex = parts[1], parts[2]
+                    if destination != "00000000":
+                        continue
+                    gateway_int = int(gateway_hex, 16)
+                    ip_value = str(ipaddress.IPv4Address(gateway_int.to_bytes(4, byteorder="little")))
+                    if self._is_valid_ip(ip_value):
+                        values.add(ip_value)
+                        break
+        except Exception:
+            pass
+
+        return values
+
+    async def _is_critical_protected_ip(self, ip_value: str) -> bool:
+        if not self._is_valid_ip(ip_value):
+            return False
+        if await self._whitelist.is_whitelisted(ip_value):
+            return True
+        if self._dashboard:
+            if ip_value in self._dashboard.get_recent_client_ips(max_age_seconds=3600):
+                await self._whitelist.add_runtime_ips([ip_value])
+                return True
+        return False
+
+    @staticmethod
+    def _is_valid_ip(ip_value: str) -> bool:
+        try:
+            ipaddress.ip_address(str(ip_value).strip())
+            return True
+        except Exception:
+            return False
 
     async def run_forever(self) -> None:
         """Run the main loop — wait until a signal is received."""
@@ -599,6 +721,8 @@ class WardenIPS:
         
         if self._asn_engine:
             self._asn_engine.close()
+        if self._country_engine:
+            self._country_engine.close()
 
         self._logger.info("=" * 60)
         self._logger.info("  WardenIPS shut down safely.")

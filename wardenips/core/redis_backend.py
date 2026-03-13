@@ -242,6 +242,29 @@ class RedisDatabaseManager:
                 events.append(data)
         return events
 
+    async def get_recent_connection_types_by_ip(
+        self,
+        source_ip: str,
+        minutes: int = 15,
+    ) -> List[str]:
+        """Returns distinct recent connection types observed for a source IP."""
+        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).timestamp()
+        now = datetime.utcnow().timestamp()
+        event_ids = await self._redis.zrangebyscore(
+            self._key("ip_events", source_ip), cutoff, now
+        )
+        values = set()
+        for eid in event_ids:
+            data = await self._redis.hgetall(self._key("event", str(eid)))
+            connection_type = (data or {}).get("connection_type")
+            if connection_type:
+                values.add(connection_type)
+        return sorted(values)
+
+    async def get_total_ban_count_by_ip(self, source_ip: str) -> int:
+        """Returns historical ban count for a source IP."""
+        return int(await self._redis.scard(self._key("ip_bans", source_ip)))
+
     async def is_ip_banned(self, source_ip: str) -> bool:
         """Check if a source IP has an active ban."""
         ban_ids = await self._redis.smembers(self._key("ip_bans", source_ip))

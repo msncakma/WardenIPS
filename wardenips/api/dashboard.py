@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -101,6 +102,7 @@ class DashboardAPI:
     self._pending_setups: dict[str, dict[str, object]] = {}
     self._login_attempts: dict[str, list[float]] = {}
     self._activity_touches: dict[str, list[float]] = {}
+    self._recent_client_ips: dict[str, float] = {}
     self._activity_touch_interval_seconds: int = 15
     self._bootstrap_setup_required: bool = False
     self._bootstrap_token_hash: str = ""
@@ -191,7 +193,37 @@ class DashboardAPI:
 
   def _client_ip(self, request: web.Request) -> str:
     forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-    return forwarded_for or request.remote or "unknown"
+    ip_value = forwarded_for or request.remote or "unknown"
+    self._track_client_ip(ip_value)
+    return ip_value
+
+  def _track_client_ip(self, ip_value: str) -> None:
+    if not self._is_valid_ip(ip_value):
+      return
+    now = time.time()
+    self._recent_client_ips[ip_value] = now
+    cutoff = now - 3600
+    stale = [ip for ip, ts in self._recent_client_ips.items() if ts < cutoff]
+    for ip in stale:
+      self._recent_client_ips.pop(ip, None)
+
+  @staticmethod
+  def _is_valid_ip(value: str) -> bool:
+    try:
+      ipaddress.ip_address(str(value).strip())
+      return True
+    except Exception:
+      return False
+
+  def get_recent_client_ips(self, max_age_seconds: int = 1800) -> set[str]:
+    """Returns recently seen dashboard client IPs for anti-lockout checks."""
+    now = time.time()
+    cutoff = now - max(int(max_age_seconds), 60)
+    return {
+      ip
+      for ip, seen_at in self._recent_client_ips.items()
+      if seen_at >= cutoff and self._is_valid_ip(ip)
+    }
 
   def _consume_rate_limit(
     self,
@@ -256,9 +288,29 @@ class DashboardAPI:
     return token in bearer_secrets
 
   def _check_public_dashboard_access(self, request: web.Request) -> bool:
+    self._client_ip(request)
     if self._public_dashboard_enabled:
       return True
     return self._check_auth(request)
+
+  @staticmethod
+  def _build_operator_advice(event: dict) -> str:
+    details_raw = event.get("details")
+    details_text = str(details_raw or "").lower()
+    event_type = str(event.get("event_type") or "").lower()
+    risk_score = int(event.get("risk_score") or 0)
+
+    if "wp-login.php" in details_text or "admin-ajax.php" in details_text or event_type in {"suspicious_path", "scanner"}:
+      return "WordPress brute-force probe detected. Restrict wp-admin/wp-login access and enable MFA."
+    if "union select" in details_text or "sql syntax" in details_text or event_type == "sqli_probe":
+      return "SQL injection attempt observed. Enforce input sanitization and prepared statements."
+    if "../" in details_text or event_type in {"dir_traversal", "shell_injection"}:
+      return "Traversal or command-injection pattern detected. Tighten WAF rules and review exposed endpoints."
+    if event_type == "portscan" or "port_" in details_text:
+      return "Port scanning activity detected. Keep unused ports closed and monitor repeated probes."
+    if risk_score >= 80:
+      return "High-intensity activity detected. Consider stricter ban thresholds and upstream rate limiting."
+    return "No immediate action required; continue monitoring this source for repeated behavior."
 
   def _normalize_next_path(self, candidate: str, default: str = "/dashboard") -> str:
     value = str(candidate or "").strip()
@@ -405,6 +457,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
     self._app.router.add_get("/api/events-timeline", self._handle_events_timeline)
     self._app.router.add_get("/api/asn-stats", self._handle_asn_stats)
+    self._app.router.add_get("/api/geo-heatmap", self._handle_geo_heatmap)
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
@@ -495,6 +548,19 @@ class DashboardAPI:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
           events = [dict(zip(columns, row)) for row in rows]
+      for event in events:
+        details_obj = {}
+        details_value = event.get("details")
+        if isinstance(details_value, str) and details_value:
+          try:
+            details_obj = json.loads(details_value)
+          except Exception:
+            details_obj = {}
+        elif isinstance(details_value, dict):
+          details_obj = details_value
+        event["event_type"] = str(details_obj.get("event_type") or "")
+        event["country_code"] = str(details_obj.get("country_code") or "").upper()
+        event["operator_advice"] = self._build_operator_advice(event)
       return web.json_response({"events": events, "count": len(events)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -571,7 +637,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_asn_stats(self, request: web.Request) -> web.Response:
-    """Top ASN organizations by attack count and suspicious flag."""
+    """Top countries (if present in event details) and ASN organizations."""
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     try:
@@ -590,7 +656,47 @@ class DashboardAPI:
         ) as cursor:
           rows = await cursor.fetchall()
           orgs = [{"org": r[0], "count": r[1], "suspicious": r[2]} for r in rows]
-      return web.json_response({"asn_orgs": orgs})
+
+      # Country values are optional and inferred from event details JSON.
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT COALESCE(json_extract(details, '$.country_code'), 'ZZ') as country,
+                 COUNT(*) as count
+          FROM connection_events
+          GROUP BY country
+          ORDER BY count DESC
+          LIMIT 30
+          """
+        ) as cursor:
+          rows = await cursor.fetchall()
+          countries = [{"country": (r[0] or "ZZ").upper(), "count": r[1]} for r in rows]
+
+      return web.json_response({"asn_orgs": orgs, "countries": countries})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_geo_heatmap(self, request: web.Request) -> web.Response:
+    if not self._check_public_dashboard_access(request):
+      return self._json_auth_error()
+    hours = min(int(request.query.get("hours", "24")), 168)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT COALESCE(json_extract(details, '$.country_code'), 'ZZ') as country,
+                 COUNT(*) as count
+          FROM connection_events
+          WHERE timestamp >= datetime('now', ? || ' hours')
+          GROUP BY country
+          ORDER BY count DESC
+          LIMIT 150
+          """,
+          (f"-{hours}",),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          points = [{"country": (row[0] or "ZZ").upper(), "count": row[1]} for row in rows]
+      return web.json_response({"points": points, "hours": hours})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -1679,6 +1785,13 @@ button.admin-link{font:inherit;cursor:pointer}
 .st.ok{background:var(--grn-d);color:var(--grn)}
 .st.bad{background:var(--red-d);color:var(--red)}
 .desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
+.geo-map{position:relative;min-height:240px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
+.geo-grid{position:absolute;inset:0;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
+.geo-point{position:absolute;transform:translate(-50%,-50%);border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 65%,white);background:color-mix(in srgb,var(--red) 42%,transparent);cursor:pointer;box-shadow:0 0 0 1px #00000033,0 0 18px color-mix(in srgb,var(--red) 45%,transparent)}
+.geo-legend{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.75rem;font-size:.72rem;color:var(--dim)}
+.geo-legend .bar{flex:1;height:8px;border-radius:999px;background:linear-gradient(90deg,color-mix(in srgb,var(--red) 18%,transparent),color-mix(in srgb,var(--red) 75%,white))}
+.geo-meta{margin-top:.55rem;font-size:.76rem;color:var(--dim)}
+.advice-tip{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;border:1px solid var(--bdr);background:var(--card-h);font-size:.72rem;font-weight:800;cursor:help}
 footer{text-align:center;padding:2rem 0 1rem;color:var(--dim2);font-size:.75rem}
 footer a{color:var(--accent);text-decoration:none}
 footer a:hover{text-decoration:underline}
@@ -1741,7 +1854,7 @@ footer a:hover{text-decoration:underline}
     <div class="pl fw ai d2">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Recent Events</h2><span class="pill" id="ec">0</span></div>
       <div class="pb" style="max-height:400px">
-        <table class="t" id="evt"><thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>User</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th></tr></thead><tbody id="evb"></tbody></table>
+        <table class="t" id="evt"><thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>User</th><th>Origin</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead><tbody id="evb"></tbody></table>
         <div class="em" id="eve" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><div>No events recorded yet</div></div>
       </div>
     </div>
@@ -1760,6 +1873,14 @@ footer a:hover{text-decoration:underline}
     <div class="pl ai d4">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/></svg>Plugins</h2></div>
       <div class="pb"><div class="cb" id="plc"></div></div>
+    </div>
+    <div class="pl ai d3">
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2c3 3 4.5 6.5 4.5 10S15 19 12 22c-3-3-4.5-6.5-4.5-10S9 5 12 2z"/></svg>Attack Heatmap (Public)</h2></div>
+      <div class="pb">
+        <div id="geoMap" class="geo-map"><div class="geo-grid"></div></div>
+        <div class="geo-legend"><span>Low</span><div class="bar"></div><span>High</span></div>
+        <div id="geoMeta" class="geo-meta">No country telemetry available yet.</div>
+      </div>
     </div>
   </div>
 
@@ -1822,6 +1943,7 @@ function CF(c){
   return String.fromCodePoint(...[...c.toUpperCase()].map(x=>x.charCodeAt(0)+127397));
 }
 var CC=['c0','c1','c2','c3','c4','c5'];
+var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
   var next=theme==='light'?'light':'dark';
   document.documentElement.setAttribute('data-theme',next);
@@ -1864,6 +1986,50 @@ function renderBlocklist(ti){
   $('#tid').textContent = ti&&ti.description ? ti.description : 'Blocklist protection is disabled.';
 }
 
+function geoToXY(lat,lon,w,h){
+  var x=((lon+180)/360)*w;
+  var y=((90-lat)/180)*h;
+  return [x,y];
+}
+
+function renderGeoHeatmap(payload){
+  var wrap=$('#geoMap');
+  var meta=$('#geoMeta');
+  if(!wrap||!meta){ return; }
+  wrap.querySelectorAll('.geo-point').forEach(function(node){ node.remove(); });
+  var points=(payload&&payload.points)?payload.points:[];
+  if(!points.length){
+    meta.textContent='No country telemetry available yet.';
+    return;
+  }
+  var valid=points.filter(function(item){ return CENTROIDS[item.country]; });
+  if(!valid.length){
+    meta.textContent='Country heatmap data exists but no centroid mapping matched yet.';
+    return;
+  }
+  var max=Math.max.apply(null, valid.map(function(item){ return item.count||0; })) || 1;
+  var rect=wrap.getBoundingClientRect();
+  valid.forEach(function(item){
+    var c=CENTROIDS[item.country];
+    var xy=geoToXY(c[0],c[1],rect.width,rect.height);
+    var intensity=(item.count||0)/max;
+    var size=8 + Math.round(intensity*22);
+    var point=document.createElement('button');
+    point.type='button';
+    point.className='geo-point';
+    point.style.left=xy[0]+'px';
+    point.style.top=xy[1]+'px';
+    point.style.width=size+'px';
+    point.style.height=size+'px';
+    point.title=item.country+': '+N(item.count)+' events';
+    point.addEventListener('click', function(){
+      meta.textContent='Country '+item.country+' generated '+N(item.count)+' events in the last '+(payload.hours||24)+'h.';
+    });
+    wrap.appendChild(point);
+  });
+  meta.textContent='Showing '+valid.length+' countries from the last '+(payload.hours||24)+'h. Click a point for details.';
+}
+
 async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
@@ -1875,6 +2041,7 @@ async function refresh(){
   var pg=await A('/api/plugin-stats');
   var at=await A('/api/top-attackers?limit=10');
   var ti=await A('/api/blocklist');
+  var gh=await A('/api/geo-heatmap?hours=24');
 
   // Health
   if(h){
@@ -1913,7 +2080,10 @@ async function refresh(){
       var pl=(e.connection_type||'unknown').toUpperCase();
       var tc=e.threat_level;
       var tcl=tc==='HIGH'||tc==='CRITICAL'?'tg-H':tc==='MEDIUM'?'tg-M':tc==='LOW'?'tg-L':'tg-N';
-      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td></tr>';
+      var advice=e.operator_advice||'No specific operator advice for this event.';
+      var cc=(e.country_code||'').toUpperCase();
+      var origin=cc?CF(cc)+' '+cc:'-';
+      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
     }).join('')}
 
   // Timeline
@@ -1957,6 +2127,7 @@ async function refresh(){
   else{ap.textContent='0';bars('atc',[],'label','count',1)}
 
   renderBlocklist(ti);
+  renderGeoHeatmap(gh);
 }
 
 initTheme();
@@ -1989,6 +2160,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
 .layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--b);font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:color-mix(in srgb,var(--red) 20%,transparent);color:#ffd3d7}.t-green{background:color-mix(in srgb,var(--green) 18%,transparent);color:#b8ffe0}.t-yellow{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:#ffe1a7}.t-blue{background:color-mix(in srgb,var(--blue) 18%,transparent);color:#c9deff}
+.advice-tip{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;border:1px solid var(--b);background:var(--surface2);font-size:.72rem;font-weight:800;cursor:help}
 .list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:13px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:color-mix(in srgb,var(--green) 14%,var(--surface))}.status.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:color-mix(in srgb,var(--red) 14%,var(--surface))}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.linkbar a{color:var(--blue);text-decoration:none;font-size:.82rem}.linkbar a:hover{text-decoration:underline}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:var(--blue);text-decoration:none}.notification-grid{margin-top:4px}.theme-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);font-size:.76rem;color:var(--muted)}.toast-stack{position:fixed;top:22px;right:22px;display:grid;gap:10px;z-index:45;max-width:min(420px,calc(100vw - 28px))}.toast{padding:14px 16px;border-radius:16px;border:1px solid var(--b);background:linear-gradient(180deg,var(--panel),var(--surface));box-shadow:var(--shadow);backdrop-filter:blur(10px);transform:translateY(-6px);opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease}.toast.show{opacity:1;transform:translateY(0);pointer-events:auto}.toast.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--green) 16%,var(--panel)),var(--surface))}.toast.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--red) 18%,var(--panel)),var(--surface))}.toast.info{border-color:color-mix(in srgb,var(--blue) 45%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--blue) 10%,var(--panel)),var(--surface))}.toast-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:4px}.toast-close{appearance:none;border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:1rem;line-height:1}.update-banner{margin-bottom:16px;padding:16px 18px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--panel),var(--surface));box-shadow:var(--shadow)}.update-banner[hidden]{display:none}.update-banner.warn{border-color:color-mix(in srgb,var(--accent) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 16%,var(--panel)),var(--surface))}.update-banner.info{border-color:color-mix(in srgb,var(--cyan) 45%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--cyan) 10%,var(--panel)),var(--surface))}.update-banner-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}.update-banner-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.update-banner-list{display:grid;gap:6px;margin-top:10px;padding-left:18px;color:var(--txt)}.config-editor{width:100%;min-height:280px;resize:vertical;font-family:Cascadia Code,Fira Code,monospace;line-height:1.55}.field-switch{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.field-switch strong{display:block;font-size:.84rem;margin-bottom:4px}.field-switch span{display:block}.field-switch input{width:18px;height:18px;accent-color:var(--accent)}.toolbar-note{margin-bottom:12px;color:var(--muted);font-size:.8rem}.config-actions{margin-top:12px}.utility-note{display:flex;align-items:center;justify-content:space-between;gap:14px}.utility-note .sub{max-width:58ch}.modal-backdrop{position:fixed;inset:0;background:#09060f88;backdrop-filter:blur(8px);display:grid;place-items:center;padding:22px;z-index:30}.modal-backdrop[hidden]{display:none}.modal-card{width:min(100%,1080px);max-height:min(88vh,920px);overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:20px;box-shadow:var(--shadow)}.modal-header{align-items:center;justify-content:space-between;margin-bottom:12px}.modal-header p{margin:0;color:var(--muted);font-size:.84rem;line-height:1.5}.modal-body{display:grid;gap:14px}.config-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.config-section{padding:16px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.config-section h3{font-size:.92rem;margin-bottom:6px}.config-section p{color:var(--muted);font-size:.78rem;line-height:1.5;margin-bottom:12px}.config-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}.config-field{display:grid;gap:6px}.config-field label{font-size:.76rem;color:var(--muted);font-weight:700}.config-field.full,.config-toggle.full{grid-column:1/-1}.config-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--b);border-radius:14px;background:var(--surface2)}.config-toggle span{font-size:.8rem}.advanced-wrap{border-top:1px solid var(--b);padding-top:14px}.advanced-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.advanced-body[hidden]{display:none}.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,var(--surface2),var(--surface));border:1px solid var(--b);color:var(--txt);text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}.kofi-fab .heart{font-size:.9rem;line-height:1;color:#fb7185}.kofi-fab .sub{font-size:.68rem;color:var(--muted);font-weight:600}.kofi-fab:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 14px 34px #00000070;text-decoration:none}
 @media(max-width:1100px){.top,.utility-strip,.hero,.layout,.split,.toolbar-grid{grid-template-columns:1fr}.hero-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.utility-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.actions{justify-content:flex-start}}
 @media(max-width:900px){.config-sections,.config-grid{grid-template-columns:1fr}}
@@ -2103,7 +2275,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Time</th><th>Hash</th><th>Plugin</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th></tr></thead>
+            <thead><tr><th>Time</th><th>Hash</th><th>Plugin</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead>
             <tbody id="eventsRows"></tbody>
           </table>
         </div>
@@ -2391,7 +2563,7 @@ function renderEvents(){
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
   rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
   rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.timestamp||'').localeCompare(String(a.timestamp||'')); });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td></tr>'; }).join('') : '<tr><td colspan="7" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
   var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;

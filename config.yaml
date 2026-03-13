@@ -31,6 +31,7 @@ asn_protection:
   # Üyelik gerektirmez — tamamen ücretsiz ve açık kaynak.
   enabled: true
   db_path: "/opt/wardenips/assets/GeoLite2-ASN.mmdb"
+  country_db_path: "/var/lib/wardenips/GeoLite2-Country.mmdb"  # Optional; enables dashboard country heatmap enrichment
   auto_update_enabled: true     # Weekly automatic updates from GitHub (Thursdays)
   # Suslu ASN'lerden gelen trafiği high-risk olarak işaretleme (risk puanını artır)
   # Format: "AS<NUMBER>" (örn: AS16509 = Amazon) veya sadece numara (16509)
