@@ -2287,6 +2287,21 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 @media(max-width:900px){.config-sections,.config-grid{grid-template-columns:1fr}}
 @media(max-width:680px){.app{padding:14px}.hero-meta,.utility-metrics{grid-template-columns:1fr}.actions,.toolbar,.action-grid,.notification-grid,.config-actions,.quick-toggle-grid,.modal-header{width:100%}.ctrl,.btn,.config-input,.config-select{width:100%}}
 </style>
+<style>
+.modal-card{padding:0;max-height:min(92vh,980px);display:flex;flex-direction:column;overflow:hidden}
+.modal-header{position:sticky;top:0;z-index:4;margin:0;padding:16px 18px;border-bottom:1px solid var(--b);background:linear-gradient(180deg,var(--panel),color-mix(in srgb,var(--panel2) 85%,var(--surface) 15%))}
+.modal-body{padding:14px 16px 18px;overflow:auto}
+.modal-header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.config-filter{min-width:260px;background:var(--surface);border-color:color-mix(in srgb,var(--blue) 35%,var(--b))}
+.config-sections{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.config-section{position:relative;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+.config-section:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--accent) 45%,var(--b));box-shadow:0 14px 28px #00000022}
+.config-section h3{display:flex;align-items:center;justify-content:space-between}
+.config-section h3::after{content:'Section';font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:3px 7px;border:1px solid var(--b);border-radius:999px;background:var(--surface2)}
+.primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
+.advanced-wrap{margin-top:2px}
+@media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}}
+</style>
 </head>
 <body>
 <div class="app">
@@ -2403,7 +2418,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Time</th><th>Hash</th><th>Plugin</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead>
+            <thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>Country</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead>
             <tbody id="eventsRows"></tbody>
           </table>
         </div>
@@ -2450,9 +2465,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <h2 id="configModalTitle">Config Studio</h2>
         <p>Use the section cards for normal operations. Advanced YAML stays available, but out of the way.</p>
       </div>
-      <button id="closeConfigBtn" class="btn ghost">Close</button>
+      <div class="modal-header-actions">
+        <input id="configSectionSearch" class="ctrl config-filter" placeholder="Filter sections and settings...">
+        <button id="closeConfigBtn" class="btn ghost">Close</button>
+      </div>
     </div>
     <div class="modal-body">
+      <div class="toolbar-note" id="configFilterHint">Quick filter by section name or setting label.</div>
       <div class="config-sections">
         <section class="config-section">
           <h3>Monitoring</h3>
@@ -2549,7 +2568,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           </div>
         </section>
       </div>
-      <div class="config-actions">
+      <div class="config-actions primary-actions">
         <button id="reloadConfigBtn" class="btn ghost">Reload From Disk</button>
         <button id="saveFormConfigBtn" class="btn primary">Save Form</button>
       </div>
@@ -2612,7 +2631,25 @@ function getConfigValue(path, fallback){ var value=state.config||{}; String(path
 function getDismissKey(info){ return info&&info.update_available&&info.latest_version ? 'wardenips_update_dismissed_'+info.latest_version : info&&info.current_version ? 'wardenips_whatsnew_seen_'+info.current_version : ''; }
 function applyTheme(theme){ state.theme = theme==='light' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', state.theme); try{ localStorage.setItem('wardenips_admin_theme', state.theme); }catch(error){} $('#themeToggle').textContent = state.theme==='light' ? 'Dark Mode' : 'Light Mode'; $('#themeChip').textContent = 'Theme: ' + (state.theme==='light' ? 'Light' : 'Dark'); }
 function initTheme(){ var saved='dark'; try{ saved = localStorage.getItem('wardenips_admin_theme') || 'dark'; }catch(error){} applyTheme(saved); }
-function openConfigModal(){ $('#configModal').hidden=false; document.body.style.overflow='hidden'; }
+function filterConfigSections(){
+  var input=$('#configSectionSearch');
+  var hint=$('#configFilterHint');
+  var query=input?(input.value||'').trim().toLowerCase():'';
+  var sections=Array.from(document.querySelectorAll('.config-section'));
+  if(!sections.length){ return; }
+  var visible=0;
+  sections.forEach(function(section){
+    var ok=!query || section.textContent.toLowerCase().indexOf(query)!==-1;
+    section.style.display=ok?'':'none';
+    if(ok){ visible+=1; }
+  });
+  if(hint){
+    hint.textContent=query
+      ? ('Showing '+visible+' section(s) for "'+query+'".')
+      : 'Quick filter by section name or setting label.';
+  }
+}
+function openConfigModal(){ $('#configModal').hidden=false; document.body.style.overflow='hidden'; filterConfigSections(); var input=$('#configSectionSearch'); if(input){ setTimeout(function(){ input.focus(); }, 0); } }
 function closeConfigModal(){ $('#configModal').hidden=true; document.body.style.overflow=''; }
 function syncAdvancedYaml(){ $('#advancedYamlBody').hidden=!state.advancedYamlOpen; $('#toggleAdvancedYamlBtn').textContent=state.advancedYamlOpen?'Hide YAML':'Show YAML'; }
 function renderUpdateNotice(){
@@ -2732,6 +2769,7 @@ function renderConfigStudio(){
   $('#cfgMinecraftBurstWindow').value=String(getConfigValue('plugins.minecraft.global_connection_burst_window_seconds',15));
   $('#configEditor').value=state.configYaml||'';
   syncAdvancedYaml();
+  filterConfigSections();
 }
 async function loadConfig(){
   var payload=await api('/api/admin/config');
@@ -2817,6 +2855,7 @@ function bind(){
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
+  $('#configSectionSearch').addEventListener('input', function(){ debounce('config-search', filterConfigSections, 120); });
   $('#closeConfigBtn').addEventListener('click', function(){ closeConfigModal(); });
   $('#configModal').addEventListener('click', function(ev){ if(ev.target===this){ closeConfigModal(); } });
   document.addEventListener('keydown', function(ev){ if(ev.key==='Escape' && !$('#configModal').hidden){ closeConfigModal(); } });
