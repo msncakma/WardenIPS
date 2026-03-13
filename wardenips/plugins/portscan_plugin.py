@@ -32,6 +32,9 @@ _RE_PORTSCAN = re.compile(
     r"(?:\[UFW BLOCK\]|Warden-PortScan:).*?SRC=([0-9a-fA-F:\.]+).*?DPT=(\d+)"
 )
 
+# Syslog style prefix: Mar 13 14:30:22
+_RE_SYSLOG_DATE = re.compile(r"^(\w{3}\s+\d+\s+\d+:\d+:\d+)")
+
 # Common scanner target ports. Connecting to these is instant BAN.
 TRAP_PORTS = {23, 2323, 135, 139, 445, 1433, 3389, 5900}
 
@@ -130,15 +133,29 @@ class PortscanPlugin(BasePlugin):
 
         ip = match.group(1)
         port = match.group(2)
+        timestamp = self._parse_timestamp(line)
 
         return ConnectionEvent(
-            timestamp=datetime.now(),
+            timestamp=timestamp,
             source_ip=ip,
             connection_type=ConnectionType.PORTSCAN,
             player_name=f"port_{port}",  # Store the scanned port in player_name for telemetry
             asn_number="",
-            asn_org=""
+            asn_org="",
+            raw_log_line=line,
+            details={"event_type": "portscan"},
         )
+
+    def _parse_timestamp(self, line: str) -> datetime:
+        """Parse syslog timestamp. Fallback to current UTC time."""
+        match = _RE_SYSLOG_DATE.match(line)
+        if match:
+            try:
+                parsed = datetime.strptime(match.group(1), "%b %d %H:%M:%S")
+                return parsed.replace(year=datetime.utcnow().year)
+            except ValueError:
+                pass
+        return datetime.utcnow()
 
     async def calculate_risk(self, event: ConnectionEvent, context: dict) -> int:
         port_str = event.player_name.replace("port_", "")

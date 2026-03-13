@@ -2577,7 +2577,12 @@ function renderSummary(){
 function renderEvents(){
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
   rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
-  rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.timestamp||'').localeCompare(String(a.timestamp||'')); });
+  rows.sort(function(a,b){
+    if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); }
+    var ta=Date.parse(String(a.timestamp||'')); var tb=Date.parse(String(b.timestamp||''));
+    if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
+    return (Number(b.id)||0)-(Number(a.id)||0);
+  });
   $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
