@@ -1,3 +1,11 @@
+wardenips (0.2.7~beta3-1) stable; urgency=medium
+
+  * Add dashboard simulation warnings and labels for event/ban visibility
+  * Add firewall.simulation_mode toggle to Admin Config Studio
+  * Bump version to 0.2.7-beta-3
+
+ -- msncakma <wardenips@msncakma.dev>  Fri, 13 Mar 2026 22:15:00 +0000
+
 wardenips (0.2.7~beta2-1) stable; urgency=medium
 
   * Add manual no-action mode via firewall.simulation_mode config toggle

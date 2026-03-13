@@ -2296,7 +2296,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <strong>Operations Overview</strong>
           <p class="sub">Everything sensitive stays here: firewall actions, cleanup tools, and live configuration control.</p>
         </div>
-        <div class="theme-chip" id="themeChip">Theme: Dark</div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+          <div id="simulationTopNotice" class="theme-chip" hidden style="border-color:color-mix(in srgb,var(--red) 55%,var(--b));color:#ffd6db;background:color-mix(in srgb,var(--red) 16%,var(--surface));">Warning: Simulation mode is enabled. No blocking actions will be applied.</div>
+          <div class="theme-chip" id="themeChip">Theme: Dark</div>
+        </div>
       </div>
     </div>
     <div class="utility-card">
@@ -2470,6 +2473,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <h3>Firewall Policy</h3>
           <p>Ban thresholding and default ban duration for enforced actions.</p>
           <div class="config-grid">
+            <label class="config-toggle full"><span>Simulation Mode (No Action)</span><input id="cfgSimulationMode" type="checkbox"></label>
             <div class="config-field">
               <label for="cfgBanThreshold">Ban Threshold</label>
               <input id="cfgBanThreshold" class="config-input" type="number" min="0" max="100">
@@ -2669,15 +2673,18 @@ function handleUserActivity(){
   sendActivityPing();
 }
 function renderSummary(){
+  var simulation = !!(state.stats&&state.stats.simulation_mode);
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
   $('#mFwBans').textContent = N(state.firewall.length);
   $('#mPeers').textContent = state.blocklist&&state.blocklist.enabled ? (state.blocklist.first_setup&&state.blocklist.first_setup.completed?'Active Only':'First Setup + Active') : 'Disabled';
-  $('#runtimeMode').textContent = 'Mode: '+((state.stats&&state.stats.simulation_mode)?'Simulation':'Live');
+  $('#runtimeMode').textContent = 'Mode: '+(simulation?'Simulation':'Live');
   $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
+  $('#simulationTopNotice').hidden = !simulation;
 }
 function renderEvents(){
+  var simulation = !!(state.stats&&state.stats.simulation_mode);
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
   rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
   rows.sort(function(a,b){
@@ -2686,13 +2693,14 @@ function renderEvents(){
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
+  var simulation = !!(state.stats&&state.stats.simulation_mode);
   var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;
   rows=rows.filter(function(b){ return !q || [b.source_ip,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
   rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.banned_at||'').localeCompare(String(a.banned_at||'')); });
-  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ return '<tr><td class="mono">'+E(b.source_ip||'-')+'</td><td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td><td>'+E(b.reason||'-')+'</td><td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td><td><button class="btn small ghost ban-action" data-ip="'+E(b.source_ip)+'">Deactivate</button></td></tr>'; }).join('') : '<tr><td colspan="5" class="empty">No active bans match the current filters.</td></tr>';
+  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ var reason=(b.reason||'-'); if(simulation){ reason += ' [Simulated: not blocked in firewall]'; } return '<tr><td class="mono">'+E(b.source_ip||'-')+'</td><td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td><td>'+E(reason)+'</td><td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td><td><button class="btn small ghost ban-action" data-ip="'+E(b.source_ip)+'">Deactivate</button></td></tr>'; }).join('') : '<tr><td colspan="5" class="empty">'+(simulation?'No simulated ban records match the current filters.':'No active bans match the current filters.')+'</td></tr>';
 }
 function renderFirewall(){
   var rows=state.firewall.slice(); var q=filterText(); var family=$('#ipFamilyFilter').value;
@@ -2709,6 +2717,7 @@ function renderConfigStudio(){
   $('#cfgPublicDashboard').checked=!!getConfigValue('dashboard.public_dashboard',true);
   $('#cfgSessionTtl').value=String(getConfigValue('dashboard.session_ttl',600));
   $('#cfgLoginRate').value=String(getConfigValue('dashboard.login_rate_limit_per_minute',10));
+  $('#cfgSimulationMode').checked=!!getConfigValue('firewall.simulation_mode',false);
   $('#cfgBanThreshold').value=String(getConfigValue('firewall.ban_threshold',70));
   $('#cfgBanDuration').value=String(getConfigValue('firewall.ipset.default_ban_duration',3600));
   $('#cfgTelegramEnabled').checked=!!getConfigValue('notifications.telegram.enabled',false);
@@ -2753,6 +2762,7 @@ async function saveConfigForm(){
     'dashboard.public_dashboard': $('#cfgPublicDashboard').checked,
     'dashboard.session_ttl': parseInt($('#cfgSessionTtl').value,10)||600,
     'dashboard.login_rate_limit_per_minute': parseInt($('#cfgLoginRate').value,10)||10,
+    'firewall.simulation_mode': $('#cfgSimulationMode').checked,
     'firewall.ban_threshold': parseInt($('#cfgBanThreshold').value,10)||70,
     'firewall.ipset.default_ban_duration': parseInt($('#cfgBanDuration').value,10)||3600,
     'notifications.telegram.enabled': $('#cfgTelegramEnabled').checked,
@@ -2784,8 +2794,8 @@ async function saveConfigYaml(){
 }
 function renderAdvice(){
   var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length;
-  if(stats.simulation_mode){ items.push({title:'Simulation mode is still enabled', body:'Useful for validation, but no real firewall action happens until you switch to live enforcement.'}); }
-  if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'Check firewall permissions or service startup ordering because active ban state appears to be drifting.'}); }
+  if(stats.simulation_mode){ items.push({title:'Simulation mode is enabled', body:'Events and risk scoring continue, but no firewall blocking is applied while simulation mode is active.'}); }
+  if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'This can be expected in simulation mode. In live mode, check firewall permissions or service startup ordering.'}); }
   if(highRiskEvents>=10){ items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'}); }
   if(state.blocklist&&state.blocklist.last_error){ items.push({title:'Blocklist fetch encountered an error', body:'Check the configured URLs and network connectivity. Error: '+(state.blocklist.last_error||'unknown')}); }
   if(!items.length){ items.push({title:'No immediate operator action suggested', body:'The current snapshot looks stable. Continue monitoring the live event stream.'}); }
