@@ -2226,7 +2226,7 @@ footer a:hover{text-decoration:underline}
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/></svg>Plugins</h2></div>
       <div class="pb"><div class="cb" id="plc"></div></div>
     </div>
-    <div class="pl ai d3">
+    <div class="pl fw ai d3" hidden aria-hidden="true">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2c3 3 4.5 6.5 4.5 10S15 19 12 22c-3-3-4.5-6.5-4.5-10S9 5 12 2z"/></svg>Attack Heatmap (Public)</h2></div>
       <div class="pb">
         <div id="geoMap" class="geo-map">
@@ -2570,8 +2570,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .modal-body{padding:14px 16px 18px;overflow:auto}
 .modal-header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .config-filter{min-width:260px;background:var(--surface);border-color:color-mix(in srgb,var(--blue) 35%,var(--b))}
-.config-sections{grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
-.config-section{position:relative;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+.config-sections{display:block;column-count:2;column-gap:14px}
+.config-section{position:relative;display:inline-block;width:100%;margin:0 0 14px;break-inside:avoid;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
 .config-section{overflow:hidden}
 .config-section:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--accent) 45%,var(--b));box-shadow:0 14px 28px #00000022}
 .config-section h3{display:flex;align-items:center;justify-content:space-between}
@@ -2590,7 +2590,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .chip button:hover{color:var(--txt)}
 .primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
 .advanced-wrap{margin-top:2px}
-@media(max-width:1280px){.config-sections{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:1280px){.config-sections{column-count:2}}
+@media(max-width:900px){.config-sections{column-count:1}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
 </style>
 </head>
@@ -2724,7 +2725,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div class="toolbar">
           <select id="eventPluginFilter" class="ctrl"><option value="">All Plugins</option></select>
           <select id="eventThreatFilter" class="ctrl"><option value="">All Threats</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="SUCCESS">Successful Login</option><option value="NONE">None</option></select>
-          <select id="eventSort" class="ctrl"><option value="time">Sort: Newest</option><option value="risk">Sort: Highest Risk</option></select>
+          <select id="eventCountryFilter" class="ctrl"><option value="">All Countries</option></select>
         </div>
         <div class="table-wrap">
           <table>
@@ -3116,10 +3117,9 @@ function renderSummary(){
 }
 function renderEvents(){
   var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
-  var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
-  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.asn_number,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat); });
+  var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var country=$('#eventCountryFilter').value;
+  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var eventCountry=String(e.country_code||'').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.asn_number,e.player_name,eventCountry].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat)&&(!country||eventCountry===country); });
   rows.sort(function(a,b){
-    if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); }
     var ta=Date.parse(String(a.timestamp||'')); var tb=Date.parse(String(b.timestamp||''));
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
@@ -3244,17 +3244,18 @@ function renderAdvice(){
   $('#adviceList').innerHTML=items.map(function(item){ return '<div class="advice-item"><strong>'+E(item.title)+'</strong><div class="sub">'+E(item.body)+'</div></div>'; }).join('');
 }
 function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort(); select.innerHTML='<option value="">All Plugins</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
+function syncCountryFilter(){ var select=$('#eventCountryFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return String(e.country_code||'').toUpperCase(); }).filter(function(v){ return v && v!=='ZZ'; }))).sort(); select.innerHTML='<option value="">All Countries</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v)+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 async function refresh(){
   var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-attackers?limit=12'),api('/api/blocklist')]);
   if(results.some(function(item){ return item===null; })){ return; }
   state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.attackers=results[5]&&results[5].attackers?results[5].attackers:[]; state.blocklist=results[6]||null;
-  syncPluginFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderBlocklistAdmin(); renderAdvice();
+  syncPluginFilter(); syncCountryFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderBlocklistAdmin(); renderAdvice();
 }
 async function performAction(path, body, successTitle, successMessage){ var payload = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); if(!payload){ return false; } setStatus('ok', successTitle, successMessage(payload)); await refresh(); return true; }
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
-  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventCountryFilter','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
