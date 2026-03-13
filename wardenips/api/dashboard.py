@@ -488,6 +488,7 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/whitelist/remove", self._handle_admin_remove_whitelist)
     self._app.router.add_post("/api/admin/deactivate-ban", self._handle_admin_deactivate_ban)
     self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
+    self._app.router.add_post("/api/admin/enforce-simulated-bans", self._handle_admin_enforce_simulated_bans)
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
     self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
@@ -1209,6 +1210,89 @@ class DashboardAPI:
     updated = await self._db.deactivate_all_bans()
     await self._log_audit(request, "admin.deactivate_all_bans", actor_username=actor, details={"updated": updated})
     return web.json_response({"ok": True, "updated": updated})
+
+  async def _handle_admin_enforce_simulated_bans(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+
+    if not self._firewall.simulation_mode:
+      return web.json_response(
+        {
+          "error": "simulation_not_enabled",
+          "message": "Simulation mode is not enabled. This action is only available while simulation mode is active.",
+        },
+        status=400,
+      )
+
+    now_unix = int(time.time())
+    candidates: list[dict[str, object]] = []
+    expired_ips: set[str] = set()
+
+    async with self._db._lock:
+      async with self._db._db.execute(
+        """
+        SELECT source_ip, reason, ban_duration, expires_at
+        FROM ban_history
+        WHERE is_active = 1
+        ORDER BY banned_at DESC
+        LIMIT 5000
+        """
+      ) as cursor:
+        rows = await cursor.fetchall()
+
+    seen_ips: set[str] = set()
+    for source_ip, reason, ban_duration, expires_at in rows:
+      ip_value = str(source_ip or "").strip()
+      if not ip_value or ip_value in seen_ips:
+        continue
+      seen_ips.add(ip_value)
+
+      duration = int(ban_duration or 0)
+      expires_unix = self._parse_timestamp_unix(expires_at)
+      if expires_unix is not None:
+        remaining = expires_unix - now_unix
+        if remaining <= 0:
+          expired_ips.add(ip_value)
+          continue
+        duration = remaining
+
+      candidates.append(
+        {
+          "ip": ip_value,
+          "duration": duration,
+          "reason": str(reason or "simulation replay"),
+        }
+      )
+
+    deactivated_expired = 0
+    for ip_value in expired_ips:
+      deactivated_expired += await self._db.deactivate_ban_by_ip(ip_value)
+
+    result = await self._firewall.enforce_db_bans(candidates)
+    await self._log_audit(
+      request,
+      "admin.enforce_simulated_bans",
+      actor_username=actor,
+      details={
+        "requested": result.get("requested", 0),
+        "applied": result.get("applied", 0),
+        "failed": result.get("failed", 0),
+        "skipped": result.get("skipped", 0),
+        "expired_deactivated": deactivated_expired,
+      },
+    )
+    return web.json_response(
+      {
+        "ok": True,
+        "requested": result.get("requested", 0),
+        "applied": result.get("applied", 0),
+        "failed": result.get("failed", 0),
+        "skipped": result.get("skipped", 0),
+        "expired_deactivated": deactivated_expired,
+      }
+    )
 
   async def _handle_admin_flush_firewall(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
@@ -1958,8 +2042,12 @@ button.admin-link{font:inherit;cursor:pointer}
 .st.bad{background:var(--red-d);color:var(--red)}
 .desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
 .geo-map{position:relative;min-height:240px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
-.geo-grid{position:absolute;inset:0;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
-.geo-point{position:absolute;transform:translate(-50%,-50%);border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 65%,white);background:color-mix(in srgb,var(--red) 42%,transparent);cursor:pointer;box-shadow:0 0 0 1px #00000033,0 0 18px color-mix(in srgb,var(--red) 45%,transparent)}
+.geo-grid{position:absolute;inset:0;z-index:1;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
+.geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.42}
+.geo-world path{fill:color-mix(in srgb,var(--cyan) 20%,transparent);stroke:color-mix(in srgb,var(--cyan) 44%,var(--bdr));stroke-width:1.2}
+.geo-point{position:absolute;z-index:3;transform:translate(-50%,-50%);border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 65%,white);background:color-mix(in srgb,var(--red) 42%,transparent);cursor:pointer;box-shadow:0 0 0 1px #00000033,0 0 18px color-mix(in srgb,var(--red) 45%,transparent)}
+.geo-point.is-new::after{content:'';position:absolute;inset:-6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 72%,white);opacity:.8;animation:geoPulse 1.2s ease-out}
+@keyframes geoPulse{0%{transform:scale(.65);opacity:.9}100%{transform:scale(2.1);opacity:0}}
 .geo-legend{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.75rem;font-size:.72rem;color:var(--dim)}
 .geo-legend .bar{flex:1;height:8px;border-radius:999px;background:linear-gradient(90deg,color-mix(in srgb,var(--red) 18%,transparent),color-mix(in srgb,var(--red) 75%,white))}
 .geo-meta{margin-top:.55rem;font-size:.76rem;color:var(--dim)}
@@ -2049,7 +2137,18 @@ footer a:hover{text-decoration:underline}
     <div class="pl ai d3">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2c3 3 4.5 6.5 4.5 10S15 19 12 22c-3-3-4.5-6.5-4.5-10S9 5 12 2z"/></svg>Attack Heatmap (Public)</h2></div>
       <div class="pb">
-        <div id="geoMap" class="geo-map"><div class="geo-grid"></div></div>
+        <div id="geoMap" class="geo-map">
+          <div class="geo-grid"></div>
+          <svg class="geo-world" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M108 206l24-34 46-23 34 5 25 33-14 40-50 17-22 31-36-6-20-28z"/>
+            <path d="M265 278l34-20 28 18 8 29-26 20-30-10-17-19z"/>
+            <path d="M400 166l38-42 67-7 47 14 40 34 57 4 46 24 23 30-13 28-44 5-56-11-44 12-59-12-53 8-42-26z"/>
+            <path d="M520 261l41 3 23 18-10 26-40 12-34-8-11-26z"/>
+            <path d="M715 184l56-31 60 8 45 30-8 34-39 14-54-12-40 10-30-20z"/>
+            <path d="M802 261l38-12 35 18-6 29-34 18-41-10-12-24z"/>
+            <path d="M846 355l40-10 27 20-17 31-43 8-23-19z"/>
+          </svg>
+        </div>
         <div class="geo-legend"><span>Low</span><div class="bar"></div><span>High</span></div>
         <div id="geoMeta" class="geo-meta">No country telemetry available yet.</div>
       </div>
@@ -2127,6 +2226,8 @@ function CF(c){
   return String.fromCodePoint(...[...c.toUpperCase()].map(x=>x.charCodeAt(0)+127397));
 }
 var CC=['c0','c1','c2','c3','c4','c5'];
+var GEO_COUNTS={};
+var GEO_SEEN=false;
 var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
   var next=theme==='light'?'light':'dark';
@@ -2198,14 +2299,19 @@ function renderGeoHeatmap(payload){
   }
   var max=Math.max.apply(null, valid.map(function(item){ return item.count||0; })) || 1;
   var rect=wrap.getBoundingClientRect();
+  var hasBaseline=GEO_SEEN;
+  var nextCounts={};
   valid.forEach(function(item){
+    var prevCount=GEO_COUNTS[item.country]||0;
+    var isNewPoint=hasBaseline && (item.count||0) > prevCount;
+    nextCounts[item.country]=item.count||0;
     var c=CENTROIDS[item.country];
     var xy=geoToXY(c[0],c[1],rect.width,rect.height);
     var intensity=(item.count||0)/max;
     var size=8 + Math.round(intensity*22);
     var point=document.createElement('button');
     point.type='button';
-    point.className='geo-point';
+    point.className='geo-point'+(isNewPoint?' is-new':'');
     point.style.left=xy[0]+'px';
     point.style.top=xy[1]+'px';
     point.style.width=size+'px';
@@ -2216,6 +2322,8 @@ function renderGeoHeatmap(payload){
     });
     wrap.appendChild(point);
   });
+  GEO_COUNTS=nextCounts;
+  GEO_SEEN=true;
   meta.textContent='Showing '+valid.length+' countries from the last '+(payload.hours||24)+'h. Click a point for details.';
 }
 
@@ -2483,6 +2591,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <button id="removeWhitelistBtn" class="btn ghost">Remove Whitelist Entry</button>
         </div>
         <div class="action-grid">
+          <button id="enforceSimBansBtn" class="btn primary" hidden>Apply Simulated Bans To Firewall</button>
           <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
           <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
           <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
@@ -2822,6 +2931,7 @@ function renderSummary(){
   $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
   $('#simulationTopNotice').hidden = !simulation;
+  $('#enforceSimBansBtn').hidden = !simulation;
 }
 function renderEvents(){
   var simulation = !!(state.stats&&state.stats.simulation_mode);
@@ -2967,6 +3077,7 @@ function bind(){
   $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); });
   $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
   $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
+  $('#enforceSimBansBtn').addEventListener('click', async function(){ if(!confirm('Apply current simulated ban records to the real firewall now?')){ return; } handleUserActivity(); await performAction('/api/admin/enforce-simulated-bans', {}, 'Simulated bans applied', function(payload){ return 'Applied '+N(payload.applied||0)+' ban(s) to firewall. Failed: '+N(payload.failed||0)+', skipped: '+N(payload.skipped||0)+'.'; }); });
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
   $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });

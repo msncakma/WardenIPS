@@ -311,6 +311,7 @@ class FirewallManager:
         ip_str: str,
         duration: Optional[int] = None,
         reason: str = "",
+        force_reapply: bool = False,
     ) -> bool:
         """
         Bans an IP address (adds it to the ipset).
@@ -337,9 +338,9 @@ class FirewallManager:
                 )
                 return False
 
-        # Skip if already banned (prevents duplicate log spam, critical in
-        # simulation mode where ipset -exist has no real effect).
-        if ip_str in self._banned_ips:
+        # Skip if already banned unless a forced replay was requested.
+        # Forced replay is used when applying bans collected during simulation.
+        if ip_str in self._banned_ips and not force_reapply:
             return True
 
         ban_duration = duration if duration is not None else self._default_ban_duration
@@ -373,6 +374,43 @@ class FirewallManager:
                 ip_str, dur_str, reason,
             )
         return success
+
+    async def enforce_db_bans(self, items: list[dict[str, object]]) -> dict[str, int]:
+        """Apply ban records to the real firewall even when simulation mode is enabled."""
+        stats = {"requested": len(items), "applied": 0, "failed": 0, "skipped": 0}
+        if not items:
+            return stats
+
+        previous_simulation = self._simulation_mode
+        self._simulation_mode = False
+        try:
+            for item in items:
+                ip_value = str(item.get("ip") or "").strip()
+                if not ip_value:
+                    stats["skipped"] += 1
+                    continue
+
+                duration_value = item.get("duration")
+                try:
+                    duration = int(duration_value) if duration_value is not None else 0
+                except (TypeError, ValueError):
+                    duration = 0
+
+                reason = str(item.get("reason") or "simulation replay")
+                success = await self.ban_ip(
+                    ip_value,
+                    duration=duration,
+                    reason=f"{reason} [SimulationReplay]",
+                    force_reapply=True,
+                )
+                if success:
+                    stats["applied"] += 1
+                else:
+                    stats["failed"] += 1
+        finally:
+            self._simulation_mode = previous_simulation
+
+        return stats
 
     async def unban_ip(self, ip_str: str) -> bool:
         """
