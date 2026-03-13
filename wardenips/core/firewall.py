@@ -384,6 +384,13 @@ class FirewallManager:
         previous_simulation = self._simulation_mode
         self._simulation_mode = False
         try:
+            # In simulation mode startup, sets/rules are only "pretended" and may not
+            # exist in the real kernel. Bootstrap them before replaying bans.
+            ready = await self._ensure_enforcement_ready()
+            if not ready:
+                stats["failed"] = stats["requested"] - stats["skipped"]
+                return stats
+
             for item in items:
                 ip_value = str(item.get("ip") or "").strip()
                 if not ip_value:
@@ -411,6 +418,96 @@ class FirewallManager:
             self._simulation_mode = previous_simulation
 
         return stats
+
+    async def _ensure_enforcement_ready(self) -> bool:
+        """Create required ipset sets and attach DROP rules if missing."""
+        set_created = await self._exec_command(
+            self._ipset_cmd,
+            "create",
+            self._set_name,
+            "hash:ip",
+            "timeout",
+            str(self._default_ban_duration),
+            "-exist",
+        )
+        if not set_created:
+            return False
+
+        if self._ipv6_supported:
+            set6_created = await self._exec_command(
+                self._ipset_cmd,
+                "create",
+                self._set_name_v6,
+                "hash:ip",
+                "family",
+                "inet6",
+                "timeout",
+                str(self._default_ban_duration),
+                "-exist",
+            )
+            if not set6_created:
+                return False
+
+        rule_exists = await self._exec_command(
+            self._iptables_cmd,
+            "-C",
+            "INPUT",
+            "-m",
+            "set",
+            "--match-set",
+            self._set_name,
+            "src",
+            "-j",
+            "DROP",
+            ignore_errors=True,
+        )
+        if not rule_exists:
+            rule_added = await self._exec_command(
+                self._iptables_cmd,
+                "-I",
+                "INPUT",
+                "-m",
+                "set",
+                "--match-set",
+                self._set_name,
+                "src",
+                "-j",
+                "DROP",
+            )
+            if not rule_added:
+                return False
+
+        if self._ipv6_supported:
+            rule6_exists = await self._exec_command(
+                self._ip6tables_cmd,
+                "-C",
+                "INPUT",
+                "-m",
+                "set",
+                "--match-set",
+                self._set_name_v6,
+                "src",
+                "-j",
+                "DROP",
+                ignore_errors=True,
+            )
+            if not rule6_exists:
+                rule6_added = await self._exec_command(
+                    self._ip6tables_cmd,
+                    "-I",
+                    "INPUT",
+                    "-m",
+                    "set",
+                    "--match-set",
+                    self._set_name_v6,
+                    "src",
+                    "-j",
+                    "DROP",
+                )
+                if not rule6_added:
+                    return False
+
+        return True
 
     async def unban_ip(self, ip_str: str) -> bool:
         """
