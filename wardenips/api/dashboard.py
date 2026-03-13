@@ -941,12 +941,27 @@ class DashboardAPI:
       return web.json_response({"error": "setup_completed", "message": "An admin user already exists."}, status=409)
 
     username = str(pending.get("username", ""))
-    await self._db.create_admin_user(
-      username=username,
-      password_hash=str(pending.get("password_hash", "")),
-      totp_secret=str(pending.get("totp_secret", "")),
-      totp_enabled=True,
-    )
+    try:
+      await self._db.create_admin_user(
+        username=username,
+        password_hash=str(pending.get("password_hash", "")),
+        totp_secret=str(pending.get("totp_secret", "")),
+        totp_enabled=True,
+      )
+    except Exception as exc:
+      message = str(exc)
+      if "readonly" in message.lower():
+        return web.json_response(
+          {
+            "error": "database_readonly",
+            "message": "Database is not writable by the service account. Repair ownership/permissions for /var/lib/wardenips and retry.",
+          },
+          status=500,
+        )
+      return web.json_response(
+        {"error": "setup_failed", "message": message or "Admin setup failed."},
+        status=500,
+      )
     self._pending_setups.pop(pending_token, None)
     await self._clear_bootstrap_config()
     response = web.json_response({"ok": True, "redirect_to": "/admin", "message": "Initial admin setup completed."})

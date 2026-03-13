@@ -23,6 +23,21 @@ case "$1" in
         
         chown -R wardenips:wardenips /var/lib/wardenips /var/log/wardenips
         find /var/lib/wardenips /var/log/wardenips -type d -exec chmod 750 {} +
+        find /var/lib/wardenips /var/log/wardenips -type f -exec chmod 640 {} +
+
+        # Always repair writable config ownership (covers upgrade scenarios)
+        if [ -f /opt/wardenips/config.yaml ]; then
+            chown wardenips:wardenips /opt/wardenips/config.yaml
+            chmod 660 /opt/wardenips/config.yaml
+        fi
+        if [ -f /opt/wardenips/config_backup.yaml ]; then
+            chown wardenips:wardenips /opt/wardenips/config_backup.yaml
+            chmod 660 /opt/wardenips/config_backup.yaml
+        fi
+        if [ -f /opt/wardenips/config.yaml.backup ]; then
+            chown wardenips:wardenips /opt/wardenips/config.yaml.backup
+            chmod 660 /opt/wardenips/config.yaml.backup
+        fi
         
         # Create Python virtual environment
         if [ ! -d /opt/wardenips/venv ]; then

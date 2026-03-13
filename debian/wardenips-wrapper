@@ -6,6 +6,10 @@ CONFIG_FILE="$INSTALL_DIR/config.yaml"
 PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
 MAIN_FILE="$INSTALL_DIR/main.py"
 SERVICE_NAME="wardenips"
+SERVICE_USER="wardenips"
+SERVICE_GROUP="wardenips"
+DATA_DIR="/var/lib/wardenips"
+LOG_DIR="/var/log/wardenips"
 
 # Renkler (ANSI kod)
 RED='\033[0;31m'
@@ -42,6 +46,36 @@ run_privileged() {
     exit 1
 }
 
+run_as_service_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        if command -v runuser >/dev/null 2>&1; then
+            exec runuser -u "$SERVICE_USER" -- "$@"
+        fi
+        if command -v su >/dev/null 2>&1; then
+            exec su -s /bin/sh -c "exec \"$1\" \"$2\" --config \"$3\"" "$SERVICE_USER"
+        fi
+        printf "${RED}✗ Neither runuser nor su is available to drop privileges.${NC}\n" >&2
+        exit 1
+    fi
+
+    exec "$@"
+}
+
+repair_permissions() {
+    chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
+    find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +
+    find "$DATA_DIR" "$LOG_DIR" -type f -exec chmod 640 {} +
+    if [ -f "$CONFIG_FILE" ]; then
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$CONFIG_FILE"
+        chmod 660 "$CONFIG_FILE"
+    fi
+    if [ -f "$INSTALL_DIR/config_backup.yaml" ]; then
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/config_backup.yaml"
+        chmod 660 "$INSTALL_DIR/config_backup.yaml"
+    fi
+    printf "${GREEN}✓ Ownership and permissions repaired for database, logs, and config${NC}\n"
+}
+
 usage() {
     print_banner
     printf "${GREEN}${BOLD}Usage:${NC} wardenips <command> [args]\n\n"
@@ -58,6 +92,8 @@ usage() {
     printf "  ${CYAN}config${NC}          Print configuration file path\n"
     printf "  ${CYAN}path${NC}            Print installation directory\n"
     printf "  ${CYAN}edit${NC}            Edit configuration (requires sudo)\n\n"
+    printf "${BOLD}Maintenance:${NC}\n"
+    printf "  ${CYAN}repair-perms${NC}    Fix ownership/permissions for DB, logs, and config\n\n"
     printf "${BOLD}Utilities:${NC}\n"
     printf "  ${CYAN}version${NC}         Show WardenIPS version\n"
     printf "  ${CYAN}help${NC}            Show this help message\n\n"
@@ -75,7 +111,10 @@ case "${1:-help}" in
         ;;
     console)
         print_banner
-        run_privileged "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE"
+        if [ "$(id -u)" -ne 0 ]; then
+            run_privileged "$0" console
+        fi
+        run_as_service_user "$PYTHON_BIN" "$MAIN_FILE" "$CONFIG_FILE"
         ;;
     start)
         run_privileged systemctl start "$SERVICE_NAME"
@@ -103,6 +142,17 @@ case "${1:-help}" in
         ;;
     edit)
         run_privileged env EDITOR="${EDITOR:-nano}" sh -c "exec \"\$EDITOR\" \"$CONFIG_FILE\""
+        ;;
+    repair-perms)
+        run_privileged sh -c '
+            SERVICE_USER="$1" SERVICE_GROUP="$2" DATA_DIR="$3" LOG_DIR="$4" CONFIG_FILE="$5" INSTALL_DIR="$6"
+            chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
+            find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +
+            find "$DATA_DIR" "$LOG_DIR" -type f -exec chmod 640 {} +
+            if [ -f "$CONFIG_FILE" ]; then chown "$SERVICE_USER":"$SERVICE_GROUP" "$CONFIG_FILE"; chmod 660 "$CONFIG_FILE"; fi
+            if [ -f "$INSTALL_DIR/config_backup.yaml" ]; then chown "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_DIR/config_backup.yaml"; chmod 660 "$INSTALL_DIR/config_backup.yaml"; fi
+        ' _ "$SERVICE_USER" "$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR" "$CONFIG_FILE" "$INSTALL_DIR"
+        repair_permissions
         ;;
     *)
         printf "${RED}✗ Unknown command: ${BOLD}$1${NC}\n" >&2
