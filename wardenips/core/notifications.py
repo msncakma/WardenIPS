@@ -126,13 +126,22 @@ class NotificationManager:
             return
 
         dur_str = f"{duration}s" if duration > 0 else "permanent"
+        reason_text = str(reason or "No additional details provided.")
+        plugin_name = str(plugin or "unknown")
+        is_honeypot = plugin_name.lower() == "portscan" and (
+            "honeypot" in reason_text.lower() or "trap" in reason_text.lower()
+        )
+        trigger = "Honeypot trap port was touched" if is_honeypot else "Threat score crossed enforcement threshold"
         title = f"🚨 WardenIPS v{__version__} — IP Banned"
         body = (
             f"**IP:** `{ip}`\n"
+            f"**Detection Source:** {plugin_name}\n"
+            f"**Trigger:** {trigger}\n"
             f"**Risk Score:** {risk}\n"
             f"**Duration:** {dur_str}\n"
-            f"**Plugin:** {plugin}\n"
-            f"**Reason:** {reason}\n"
+            f"**Action:** Firewall ban applied\n"
+            f"**Reason:** {reason_text}\n"
+            "**Operator Note:** Review whitelist before manual unban if this IP belongs to trusted infrastructure.\n"
             f"**Version:** v{__version__} ({__author__})"
         )
 
@@ -164,9 +173,10 @@ class NotificationManager:
         title = f"⚡ WardenIPS v{__version__} — Burst Flood Detected"
         body = (
             f"**IP:** `{ip}`\n"
+            f"**Detection Source:** {plugin or 'unknown'}\n"
             f"**Events:** {event_count} in {window}s\n"
-            f"**Plugin:** {plugin}\n"
-            f"Auto-banned immediately.\n"
+            "**Trigger:** High-frequency burst pattern\n"
+            "**Action:** Auto-banned immediately\n"
             f"**Version:** v{__version__} ({__author__})"
         )
 

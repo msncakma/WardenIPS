@@ -58,6 +58,7 @@ from wardenips.core.auth import (
   verify_totp_code,
 )
 from wardenips.core.logger import get_logger
+from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.updater import UpdateChecker
 
 logger = get_logger(__name__)
@@ -107,6 +108,7 @@ class DashboardAPI:
     self._bootstrap_setup_required: bool = False
     self._bootstrap_token_hash: str = ""
     self._bootstrap_token_expires_at: str = ""
+    self._country_lookup = CountryLookupEngine(self._config)
     self._initialize_config()
 
   def _initialize_config(self) -> None:
@@ -278,6 +280,7 @@ class DashboardAPI:
     details_raw = event.get("details")
     details_text = str(details_raw or "").lower()
     event_type = str(event.get("event_type") or "").lower()
+    player_name = str(event.get("player_name") or "")
     risk_score = int(event.get("risk_score") or 0)
 
     if "wp-login.php" in details_text or "admin-ajax.php" in details_text or event_type in {"suspicious_path", "scanner"}:
@@ -287,7 +290,16 @@ class DashboardAPI:
     if "../" in details_text or event_type in {"dir_traversal", "shell_injection"}:
       return "Traversal or command-injection pattern detected. Tighten WAF rules and review exposed endpoints."
     if event_type == "portscan" or "port_" in details_text:
-      return "Port scanning activity detected. Keep unused ports closed and monitor repeated probes."
+      if player_name.startswith("port_"):
+        scanned_port = player_name.replace("port_", "", 1)
+        return (
+          f"Port-scan activity detected on port {scanned_port}. "
+          "If this port is configured as a honeypot trap, treat this source as hostile reconnaissance."
+        )
+      return (
+        "Port scanning activity detected. Keep non-required ports closed, "
+        "and maintain trap-port monitoring for repeated probes."
+      )
     if risk_score >= 80:
       return "High-intensity activity detected. Consider stricter ban thresholds and upstream rate limiting."
     return "No immediate action required; continue monitoring this source for repeated behavior."
@@ -314,6 +326,43 @@ class DashboardAPI:
     if days:
       return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+  @staticmethod
+  def _parse_timestamp_unix(timestamp_value: object) -> Optional[int]:
+    raw = str(timestamp_value or "").strip()
+    if not raw:
+      return None
+    normalized = raw.replace(" ", "T")
+    try:
+      dt = datetime.fromisoformat(normalized)
+    except Exception:
+      return None
+    if dt.tzinfo is None:
+      # Older rows may be naive local times. Treat as server-local tz.
+      local_tz = datetime.now().astimezone().tzinfo
+      dt = dt.replace(tzinfo=local_tz)
+    return int(dt.timestamp())
+
+  @staticmethod
+  def _normalize_country_code(country_value: object) -> str:
+    code = str(country_value or "").strip().upper()
+    if len(code) == 2 and code.isalpha():
+      return code
+    return ""
+
+  def _resolve_country_code(self, details_obj: object, source_ip: object) -> str:
+    details = details_obj if isinstance(details_obj, dict) else {}
+    code = self._normalize_country_code(details.get("country_code"))
+    if code:
+      return code
+    source_value = str(source_ip or "").strip()
+    if self._country_lookup and self._is_valid_ip(source_value):
+      looked_up = self._normalize_country_code(
+        self._country_lookup.lookup_country_code(source_value)
+      )
+      if looked_up:
+        return looked_up
+    return ""
 
   def _get_system_uptime_seconds(self) -> Optional[int]:
     try:
@@ -458,6 +507,8 @@ class DashboardAPI:
     if self._runner:
       await self._runner.cleanup()
       logger.info("Dashboard API stopped.")
+    if self._country_lookup:
+      self._country_lookup.close()
 
   async def _handle_health(self, request: web.Request) -> web.Response:
     uptime = int(time.monotonic() - self._start_time)
@@ -498,6 +549,9 @@ class DashboardAPI:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
           bans = [dict(zip(columns, row)) for row in rows]
+      for ban in bans:
+        ban["banned_at_unix"] = self._parse_timestamp_unix(ban.get("banned_at"))
+        ban["expires_at_unix"] = self._parse_timestamp_unix(ban.get("expires_at"))
       return web.json_response({"bans": bans, "count": len(bans)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -534,7 +588,11 @@ class DashboardAPI:
         elif isinstance(details_value, dict):
           details_obj = details_value
         event["event_type"] = str(details_obj.get("event_type") or "")
-        event["country_code"] = str(details_obj.get("country_code") or "").upper()
+        event["country_code"] = self._resolve_country_code(
+          details_obj,
+          event.get("source_ip"),
+        )
+        event["timestamp_unix"] = self._parse_timestamp_unix(event.get("timestamp"))
         event["operator_advice"] = self._build_operator_advice(event)
       return web.json_response({"events": events, "count": len(events)})
     except Exception as exc:
@@ -599,7 +657,7 @@ class DashboardAPI:
           SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
                COUNT(*) as count
           FROM connection_events
-          WHERE timestamp >= datetime('now', ? || ' hours')
+          WHERE COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')
           GROUP BY hour
           ORDER BY hour ASC
           """,
@@ -636,16 +694,36 @@ class DashboardAPI:
       async with self._db._lock:
         async with self._db._db.execute(
           """
-          SELECT COALESCE(json_extract(details, '$.country_code'), 'ZZ') as country,
-                 COUNT(*) as count
+          SELECT source_ip, details
           FROM connection_events
-          GROUP BY country
-          ORDER BY count DESC
-          LIMIT 30
+          ORDER BY id DESC
+          LIMIT 5000
           """
         ) as cursor:
           rows = await cursor.fetchall()
-          countries = [{"country": (r[0] or "ZZ").upper(), "count": r[1]} for r in rows]
+
+          counts: dict[str, int] = {}
+          for source_ip, details_value in rows:
+            details_obj = {}
+            if isinstance(details_value, str) and details_value:
+              try:
+                details_obj = json.loads(details_value)
+              except Exception:
+                details_obj = {}
+            elif isinstance(details_value, dict):
+              details_obj = details_value
+
+            code = self._resolve_country_code(details_obj, source_ip) or "ZZ"
+            counts[code] = counts.get(code, 0) + 1
+
+          countries = [
+            {"country": country, "count": count}
+            for country, count in sorted(
+              counts.items(),
+              key=lambda item: item[1],
+              reverse=True,
+            )[:30]
+          ]
 
       return web.json_response({"asn_orgs": orgs, "countries": countries})
     except Exception as exc:
@@ -659,18 +737,40 @@ class DashboardAPI:
       async with self._db._lock:
         async with self._db._db.execute(
           """
-          SELECT COALESCE(json_extract(details, '$.country_code'), 'ZZ') as country,
-                 COUNT(*) as count
+          SELECT source_ip, details
           FROM connection_events
-          WHERE timestamp >= datetime('now', ? || ' hours')
-          GROUP BY country
-          ORDER BY count DESC
-          LIMIT 150
+          WHERE COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')
+          ORDER BY id DESC
+          LIMIT 5000
           """,
           (f"-{hours}",),
         ) as cursor:
           rows = await cursor.fetchall()
-          points = [{"country": (row[0] or "ZZ").upper(), "count": row[1]} for row in rows]
+
+          counts: dict[str, int] = {}
+          for source_ip, details_value in rows:
+            details_obj = {}
+            if isinstance(details_value, str) and details_value:
+              try:
+                details_obj = json.loads(details_value)
+              except Exception:
+                details_obj = {}
+            elif isinstance(details_value, dict):
+              details_obj = details_value
+
+            code = self._resolve_country_code(details_obj, source_ip)
+            if not code or code == "ZZ":
+              continue
+            counts[code] = counts.get(code, 0) + 1
+
+          points = [
+            {"country": country, "count": count}
+            for country, count in sorted(
+              counts.items(),
+              key=lambda item: item[1],
+              reverse=True,
+            )[:150]
+          ]
       return web.json_response({"points": points, "hours": hours})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -1997,9 +2097,21 @@ var R=1000;
 function $(s){return document.querySelector(s)}
 function N(n){return(n||0).toLocaleString()}
 function E(s){var d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function parseTs(v){
+  if(v===null||v===undefined||v==='')return null;
+  if(typeof v==='number')return v<1e12?v*1000:v;
+  var s=String(v).trim();
+  if(!s)return null;
+  if(/^\d+$/.test(s)){var n=Number(s);return n<1e12?n*1000:n;}
+  if(s.indexOf(' ')>0&&s.indexOf('T')===-1)s=s.replace(' ','T');
+  var d=new Date(s),ms=d.getTime();
+  return Number.isFinite(ms)?ms:null;
+}
 function T(iso){
-  if(!iso)return'-';
-  var d=new Date(iso+'Z'),n=new Date(),df=Math.floor((n-d)/1000);
+  var ts=parseTs(iso);
+  if(ts===null)return'-';
+  var df=Math.floor((Date.now()-ts)/1000);
+  if(df<0)df=0;
   if(df<60)return df+'s ago';if(df<3600)return Math.floor(df/60)+'m ago';
   if(df<86400)return Math.floor(df/3600)+'h ago';return Math.floor(df/86400)+'d ago';
 }
@@ -2074,9 +2186,14 @@ function renderGeoHeatmap(payload){
     meta.textContent='No country telemetry available yet.';
     return;
   }
-  var valid=points.filter(function(item){ return CENTROIDS[item.country]; });
+  var valid=points.filter(function(item){
+    var code=String(item.country||'').trim().toUpperCase();
+    return code.length===2 && code!=='ZZ' && !!CENTROIDS[code];
+  }).map(function(item){
+    return {country:String(item.country||'').trim().toUpperCase(), count:item.count||0};
+  });
   if(!valid.length){
-    meta.textContent='Country heatmap data exists but no centroid mapping matched yet.';
+    meta.textContent='No mappable country telemetry available yet.';
     return;
   }
   var max=Math.max.apply(null, valid.map(function(item){ return item.count||0; })) || 1;
@@ -2141,7 +2258,7 @@ async function refresh(){
   if(!bn||!bn.bans||!bn.bans.length){btb.innerHTML='';be.style.display='block';bp.textContent='0'}
   else{be.style.display='none';bp.textContent=bn.count;
     btb.innerHTML=bn.bans.map(function(b){
-      return '<tr><td class="h" title="'+E(b.source_ip)+'">'+E((b.source_ip||'').substring(0,16))+'&hellip;</td><td><span class="rb '+RC(b.risk_score)+'">'+b.risk_score+'</span></td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(b.reason)+'">'+E(b.reason)+'</td><td>'+D(b.ban_duration)+'</td><td>'+T(b.banned_at)+'</td><td>'+(b.expires_at?T(b.expires_at):'Never')+'</td></tr>';
+      return '<tr><td class="h" title="'+E(b.source_ip)+'">'+E((b.source_ip||'').substring(0,16))+'&hellip;</td><td><span class="rb '+RC(b.risk_score)+'">'+b.risk_score+'</span></td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(b.reason)+'">'+E(b.reason)+'</td><td>'+D(b.ban_duration)+'</td><td>'+T(b.banned_at_unix||b.banned_at)+'</td><td>'+(b.expires_at?T(b.expires_at_unix||b.expires_at):'Never')+'</td></tr>';
     }).join('')}
 
   // Events Table
@@ -2155,7 +2272,7 @@ async function refresh(){
       var advice=e.operator_advice||'No specific operator advice for this event.';
       var cc=(e.country_code||'').toUpperCase();
       var origin=cc?CF(cc)+' '+cc:'-';
-      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
+      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
     }).join('')}
 
   // Timeline
@@ -2186,7 +2303,11 @@ async function refresh(){
   else bars('thc',[],'level','count',0);
 
   // Country
-  bars('coc',co?co.countries:null,'country','count',2);
+  var countryItems=co&&co.countries?co.countries.filter(function(item){
+    var code=String((item&&item.country)||'').toUpperCase();
+    return code && code!=='ZZ';
+  }):null;
+  bars('coc',countryItems,'country','count',2);
 
   // Plugins
   bars('plc',pg?pg.plugins:null,'plugin','count',3);
@@ -2568,7 +2689,26 @@ var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:nul
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
-function ago(iso){ if(!iso) return '-'; var d=new Date(iso+'Z'), n=new Date(), df=Math.floor((n-d)/1000); if(df<60)return df+'s'; if(df<3600)return Math.floor(df/60)+'m'; if(df<86400)return Math.floor(df/3600)+'h'; return Math.floor(df/86400)+'d'; }
+function parseTs(v){
+  if(v===null||v===undefined||v==='')return null;
+  if(typeof v==='number')return v<1e12?v*1000:v;
+  var s=String(v).trim();
+  if(!s)return null;
+  if(/^\d+$/.test(s)){var n=Number(s);return n<1e12?n*1000:n;}
+  if(s.indexOf(' ')>0&&s.indexOf('T')===-1)s=s.replace(' ','T');
+  var d=new Date(s),ms=d.getTime();
+  return Number.isFinite(ms)?ms:null;
+}
+function ago(value){
+  var ts=parseTs(value);
+  if(ts===null) return '-';
+  var df=Math.floor((Date.now()-ts)/1000);
+  if(df<0)df=0;
+  if(df<60)return df+'s';
+  if(df<3600)return Math.floor(df/60)+'m';
+  if(df<86400)return Math.floor(df/3600)+'h';
+  return Math.floor(df/86400)+'d';
+}
 function tagRisk(r){ return r>=70?'t-red':r>=40?'t-yellow':'t-green'; }
 function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'?'t-green':'t-blue'; }
 function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[key] = setTimeout(fn, wait); }
@@ -2693,14 +2833,14 @@ function renderEvents(){
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
   var simulation = !!(state.stats&&state.stats.simulation_mode);
   var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;
   rows=rows.filter(function(b){ return !q || [b.source_ip,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
   rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.banned_at||'').localeCompare(String(a.banned_at||'')); });
-  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ var reason=(b.reason||'-'); if(simulation){ reason += ' [Simulated: not blocked in firewall]'; } return '<tr><td class="mono">'+E(b.source_ip||'-')+'</td><td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td><td>'+E(reason)+'</td><td>'+E(b.expires_at?ago(b.expires_at)+' left':'Never')+'</td><td><button class="btn small ghost ban-action" data-ip="'+E(b.source_ip)+'">Deactivate</button></td></tr>'; }).join('') : '<tr><td colspan="5" class="empty">'+(simulation?'No simulated ban records match the current filters.':'No active bans match the current filters.')+'</td></tr>';
+  $('#banRows').innerHTML = rows.length ? rows.map(function(b){ var reason=(b.reason||'-'); if(simulation){ reason += ' [Simulated: not blocked in firewall]'; } return '<tr><td class="mono">'+E(b.source_ip||'-')+'</td><td><span class="tag '+tagRisk(b.risk_score||0)+'">'+E(String(b.risk_score||0))+'</span></td><td>'+E(reason)+'</td><td>'+E(b.expires_at?ago(b.expires_at_unix||b.expires_at)+' left':'Never')+'</td><td><button class="btn small ghost ban-action" data-ip="'+E(b.source_ip)+'">Deactivate</button></td></tr>'; }).join('') : '<tr><td colspan="5" class="empty">'+(simulation?'No simulated ban records match the current filters.':'No active bans match the current filters.')+'</td></tr>';
 }
 function renderFirewall(){
   var rows=state.firewall.slice(); var q=filterText(); var family=$('#ipFamilyFilter').value;

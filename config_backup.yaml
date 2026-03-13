@@ -26,6 +26,7 @@ asn_protection:
   # No membership is required. It is fully free and open-source.
   enabled: true
   db_path: "/opt/wardenips/assets/GeoLite2-ASN.mmdb"
+  country_db_path: "/var/lib/wardenips/GeoLite2-Country.mmdb"  # Optional; enables dashboard country heatmap enrichment
   auto_update_enabled: true     # Weekly automatic updates from GitHub (Thursdays)
   # Mark traffic from suspicious ASNs as high-risk (increases the risk score)
   # Format: "AS<NUMBER>" (e.g., AS16509 = Amazon) or just the number (16509)
@@ -82,3 +83,21 @@ plugins:
     global_connection_burst_threshold: 12  # Treat 12+ near-simultaneous Minecraft connects as a potential flood
     global_connection_burst_window_seconds: 15
     global_connection_burst_min_unique_ips: 8  # Require multiple source IPs to reduce false positives
+
+  nginx:
+    enabled: false
+    log_path: "/var/log/nginx/access.log"
+
+  portscan:
+    enabled: true
+    log_path: "/var/log/kern.log"
+    scan_threshold: 5
+    trap_ports:
+      - 23    # Telnet
+      - 2323  # Mirai
+      - 135   # RPC
+      - 139   # NetBIOS
+      - 445   # SMB
+      - 1433  # MSSQL
+      - 3389  # RDP
+      - 5900  # VNC

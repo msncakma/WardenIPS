@@ -573,39 +573,49 @@ PY
 }
 
 download_geoip_database() {
-    log "Downloading MaxMind GeoLite2-ASN database (from Loyalsoldier/geoip)..."
-    
+    log "Preparing GeoLite2 ASN and Country databases (from Loyalsoldier/geoip)..."
+
     ASSETS_DIR="/opt/wardenips/assets"
-    GEOIP_URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
-    GEOIP_FILE="$ASSETS_DIR/GeoLite2-ASN.mmdb"
-    
-    mkdir -p "$ASSETS_DIR"
-    
-    if [ -f "$GEOIP_FILE" ]; then
-        warn "GeoLite2-ASN.mmdb already exists, skipping download."
-        return
-    fi
-    
-    if command -v curl >/dev/null 2>&1; then
-        if ! run_quiet curl -fsSL -o "$GEOIP_FILE" "$GEOIP_URL"; then
-            error "Failed to download GeoLite2-ASN.mmdb from GitHub. Check your internet connection."
+    ASN_URL="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
+    ASN_FILE="$ASSETS_DIR/GeoLite2-ASN.mmdb"
+    COUNTRY_URL="https://github.com/Loyalsoldier/geoip/raw/release/GeoLite2-Country.mmdb"
+    COUNTRY_FILE="$DATA_DIR/GeoLite2-Country.mmdb"
+
+    mkdir -p "$ASSETS_DIR" "$DATA_DIR"
+
+    download_mmdb() {
+        target_file="$1"
+        source_url="$2"
+        label="$3"
+
+        if [ -f "$target_file" ] && [ -s "$target_file" ]; then
+            warn "$label already exists, skipping download."
+            return
         fi
-    elif command -v wget >/dev/null 2>&1; then
-        if ! run_quiet wget -q -O "$GEOIP_FILE" "$GEOIP_URL"; then
-            error "Failed to download GeoLite2-ASN.mmdb from GitHub. Check your internet connection."
+
+        if command -v curl >/dev/null 2>&1; then
+            if ! run_quiet curl -fsSL -o "$target_file" "$source_url"; then
+                error "Failed to download $label from GitHub. Check your internet connection."
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if ! run_quiet wget -q -O "$target_file" "$source_url"; then
+                error "Failed to download $label from GitHub. Check your internet connection."
+            fi
+        else
+            error "Neither curl nor wget found. Cannot download $label. Install curl or wget and try again."
         fi
-    else
-        error "Neither curl nor wget found. Cannot download GeoLite2-ASN.mmdb. Install curl or wget and try again."
-    fi
-    
-    # Verify file was downloaded correctly (should be ~10MB)
-    if [ ! -f "$GEOIP_FILE" ] || [ ! -s "$GEOIP_FILE" ]; then
-        error "GeoLite2-ASN.mmdb download failed or file is empty."
-    fi
-    
-    chown "$SERVICE_USER":"$SERVICE_GROUP" "$GEOIP_FILE"
-    chmod 640 "$GEOIP_FILE"
-    log "GeoLite2-ASN.mmdb downloaded and configured."
+
+        if [ ! -f "$target_file" ] || [ ! -s "$target_file" ]; then
+            error "$label download failed or file is empty."
+        fi
+
+        chown "$SERVICE_USER":"$SERVICE_GROUP" "$target_file"
+        chmod 640 "$target_file"
+        log "$label downloaded and configured."
+    }
+
+    download_mmdb "$ASN_FILE" "$ASN_URL" "GeoLite2-ASN.mmdb"
+    download_mmdb "$COUNTRY_FILE" "$COUNTRY_URL" "GeoLite2-Country.mmdb"
 }
 
 install_cli_wrapper() {

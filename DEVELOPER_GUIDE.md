@@ -1,4 +1,4 @@
-# WardenIPS - Architecture & Developer Guide (v0.2.7-beta-3)
+# WardenIPS - Architecture & Developer Guide (v0.3.0-beta-1)
 
 This document is the official technical map of the **WardenIPS** ecosystem. It is designed for developers who want to:
 1. **Understand** how the system works under the hood.

@@ -39,6 +39,7 @@ except ImportError:
 # AbuseIPDB API endpoint
 _ABUSEIPDB_REPORT_URL = "https://api.abuseipdb.com/api/v2/report"
 _ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
+_WARDENIPS_PROJECT_URL = "https://github.com/msncakma/WardenIPS"
 
 
 class AbuseIPDBReporter:
@@ -171,10 +172,16 @@ class AbuseIPDBReporter:
         # Kategori formatı: virgulle ayrilmis
         cat_str = ",".join(str(c) for c in categories)
 
+        base_comment = str(comment or "").strip() or "Automated threat report from WardenIPS IPS."
+        attribution = f"Reported by WardenIPS: {_WARDENIPS_PROJECT_URL}"
+        full_comment = f"{base_comment} | {attribution}"
+        if len(full_comment) > 1024:
+            full_comment = full_comment[:1021] + "..."
+
         payload = {
             "ip": ip,
             "categories": cat_str,
-            "comment": f"[WardenIPS] {comment}" if comment else "[WardenIPS] Auto-report",
+            "comment": full_comment,
         }
 
         async with self._lock:

@@ -46,10 +46,28 @@ class PortscanPlugin(BasePlugin):
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        self._trap_ports = set(self._config.get("plugins.portscan.trap_ports", TRAP_PORTS))
+        raw_ports = self._config.get("plugins.portscan.trap_ports", TRAP_PORTS)
+        parsed_ports = set()
+        for port_value in raw_ports:
+            try:
+                parsed_ports.add(int(port_value))
+            except (TypeError, ValueError):
+                self._logger.warning("Ignoring invalid trap port value: %r", port_value)
+        self._trap_ports = parsed_ports or set(TRAP_PORTS)
         self._scan_threshold = self._config.get("plugins.portscan.scan_threshold", 10)
         self._log_path = self._config.get("plugins.portscan.log_path", "/var/log/kern.log")
         self._installed_iptables = False
+        self._installed_iptables_port_groups: list[str] = []
+
+    def _iter_trap_port_groups(self) -> list[str]:
+        """Return comma-separated trap-port groups (iptables multiport supports max 15)."""
+        ports = sorted(self._trap_ports)
+        if not ports:
+            return []
+        groups = []
+        for i in range(0, len(ports), 15):
+            groups.append(",".join(str(p) for p in ports[i:i + 15]))
+        return groups
 
     @property
     def name(self) -> str:
@@ -64,39 +82,38 @@ class PortscanPlugin(BasePlugin):
         Ensure iptables logs trap ports so we catch them even without UFW.
         """
         try:
-            # We add a rule that LOGs SYN packets to our trap ports.
-            # Using -m multiport --dports works for up to 15 ports.
-            ports_str = ",".join(map(str, list(self._trap_ports)[:15]))
-            
-            check_cmd = [
-                "iptables", "-C", "INPUT", "-p", "tcp", "--syn",
-                "-m", "multiport", "--dports", ports_str,
-                "-j", "LOG", "--log-prefix", "Warden-PortScan: "
-            ]
-            
-            proc = await asyncio.create_subprocess_exec(
-                *check_cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            await proc.wait()
-            
-            if proc.returncode != 0:
-                # Rule doesn't exist, insert it at the top of INPUT chain
-                insert_cmd = [
-                    "iptables", "-I", "INPUT", "1", "-p", "tcp", "--syn",
+            port_groups = self._iter_trap_port_groups()
+            for ports_str in port_groups:
+                check_cmd = [
+                    "iptables", "-C", "INPUT", "-p", "tcp", "--syn",
                     "-m", "multiport", "--dports", ports_str,
                     "-j", "LOG", "--log-prefix", "Warden-PortScan: "
                 ]
-                proc_ins = await asyncio.create_subprocess_exec(
-                    *insert_cmd,
+
+                proc = await asyncio.create_subprocess_exec(
+                    *check_cmd,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL
                 )
-                await proc_ins.wait()
-                if proc_ins.returncode == 0:
-                    self._installed_iptables = True
-                    self._logger.info("Installed custom iptables trap rule for ports: %s", ports_str)
+                await proc.wait()
+
+                if proc.returncode != 0:
+                    # Rule doesn't exist, insert it at the top of INPUT chain
+                    insert_cmd = [
+                        "iptables", "-I", "INPUT", "1", "-p", "tcp", "--syn",
+                        "-m", "multiport", "--dports", ports_str,
+                        "-j", "LOG", "--log-prefix", "Warden-PortScan: "
+                    ]
+                    proc_ins = await asyncio.create_subprocess_exec(
+                        *insert_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await proc_ins.wait()
+                    if proc_ins.returncode == 0:
+                        self._installed_iptables = True
+                        self._installed_iptables_port_groups.append(ports_str)
+                        self._logger.info("Installed custom iptables trap rule for ports: %s", ports_str)
         except Exception as e:
             self._logger.warning("Failed to setup PortScan trap rules (skip if not root or Windows): %s", e)
             
@@ -108,19 +125,19 @@ class PortscanPlugin(BasePlugin):
         """
         if self._installed_iptables:
             try:
-                ports_str = ",".join(map(str, list(self._trap_ports)[:15]))
-                del_cmd = [
-                    "iptables", "-D", "INPUT", "-p", "tcp", "--syn",
-                    "-m", "multiport", "--dports", ports_str,
-                    "-j", "LOG", "--log-prefix", "Warden-PortScan: "
-                ]
-                proc_del = await asyncio.create_subprocess_exec(
-                    *del_cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                await proc_del.wait()
-                self._logger.info("Removed custom iptables trap rule.")
+                for ports_str in self._installed_iptables_port_groups:
+                    del_cmd = [
+                        "iptables", "-D", "INPUT", "-p", "tcp", "--syn",
+                        "-m", "multiport", "--dports", ports_str,
+                        "-j", "LOG", "--log-prefix", "Warden-PortScan: "
+                    ]
+                    proc_del = await asyncio.create_subprocess_exec(
+                        *del_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await proc_del.wait()
+                    self._logger.info("Removed custom iptables trap rule for ports: %s", ports_str)
             except Exception as e:
                 self._logger.warning("Failed to remove PortScan trap rules: %s", e)
                 

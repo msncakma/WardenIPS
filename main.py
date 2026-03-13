@@ -437,6 +437,17 @@ class WardenIPS:
                     f"ASN={asn_result.asn_number} "
                     f"({event.details.get('event_type', 'unknown')})"
                 )
+                if event.connection_type.value == "portscan":
+                    port_label = str(event.player_name or "")
+                    if port_label.startswith("port_"):
+                        scanned_port = port_label.replace("port_", "", 1)
+                        reason += f" Port={scanned_port}"
+                        trap_ports = {
+                            str(p)
+                            for p in self._config.get("plugins.portscan.trap_ports", [])
+                        }
+                        if scanned_port in trap_ports:
+                            reason += " HoneypotTrap=true"
                 if smart_result.multi_vector:
                     reason += f" MultiVector+{smart_result.bonus_applied}"
                 if prior_ban_count > 0:

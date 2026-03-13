@@ -1,3 +1,25 @@
+wardenips (0.3.0~beta1-1) stable; urgency=medium
+
+  * Add robust timestamp-based relative time rendering across dashboards
+  * Add country enrichment fallback and improve geo heatmap mapping behavior
+  * Enrich ban/report notifications with honeypot-aware explanations
+  * Add AbuseIPDB attribution link in report comments
+  * Support GeoLite2-Country.mmdb download during install
+  * Improve configurable trap-port handling for large port lists
+  * Bump version to 0.3.0-beta-1
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 14 Mar 2026 10:10:00 +0000
+
+wardenips (0.2.7~beta4-1) stable; urgency=medium
+
+  * Fix dashboard relative time rendering with robust timestamp parsing
+  * Clamp negative "ago" values caused by timezone mismatches
+  * Improve country enrichment fallback for events and geo heatmap endpoints
+  * Fix geo heatmap behavior when only unmapped/unknown country codes exist
+  * Bump version to 0.2.7-beta-4
+
+ -- msncakma <wardenips@msncakma.dev>  Fri, 13 Mar 2026 23:10:00 +0000
+
 wardenips (0.2.7~beta3-1) stable; urgency=medium
 
   * Add dashboard simulation warnings and labels for event/ban visibility
