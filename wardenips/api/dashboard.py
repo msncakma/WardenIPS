@@ -74,12 +74,14 @@ class DashboardAPI:
     db,
     firewall,
     start_time: float,
+    whitelist=None,
     notifier=None,
     blocklist=None,
   ) -> None:
     self._config = config
     self._db = db
     self._firewall = firewall
+    self._whitelist = whitelist
     self._start_time = start_time
     self._notifier = notifier
     self._blocklist = blocklist
@@ -462,6 +464,9 @@ class DashboardAPI:
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
+    self._app.router.add_get("/api/admin/whitelist", self._handle_admin_get_whitelist)
+    self._app.router.add_post("/api/admin/whitelist/add", self._handle_admin_add_whitelist)
+    self._app.router.add_post("/api/admin/whitelist/remove", self._handle_admin_remove_whitelist)
     self._app.router.add_post("/api/admin/deactivate-ban", self._handle_admin_deactivate_ban)
     self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
@@ -1004,6 +1009,107 @@ class DashboardAPI:
     return web.json_response(
       {"ok": True, "ttl_seconds": max(int(self._sessions.get(token, 0) - time.time()), 0)}
     )
+
+  def _normalize_whitelist_entry(self, value: str) -> tuple[str, str]:
+    candidate = str(value or "").strip()
+    if not candidate:
+      raise ValueError("Whitelist entry is required.")
+    if "/" in candidate:
+      network = ipaddress.ip_network(candidate, strict=False)
+      return str(network), "cidr"
+    return str(ipaddress.ip_address(candidate)), "ip"
+
+  async def _handle_admin_get_whitelist(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    return web.json_response(
+      {
+        "ok": True,
+        "ips": list(self._config.get("whitelist.ips", []) or []),
+        "cidr_ranges": list(self._config.get("whitelist.cidr_ranges", []) or []),
+      }
+    )
+
+  async def _handle_admin_add_whitelist(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    raw_value = str(payload.get("value", "")).strip()
+    try:
+      normalized, entry_type = self._normalize_whitelist_entry(raw_value)
+    except Exception:
+      return web.json_response({"error": "invalid_entry", "message": "Provide a valid IPv4/IPv6 address or CIDR range."}, status=400)
+
+    ip_values = list(self._config.get("whitelist.ips", []) or [])
+    cidr_values = list(self._config.get("whitelist.cidr_ranges", []) or [])
+
+    if entry_type == "ip":
+      if normalized in ip_values:
+        return web.json_response({"ok": True, "message": f"{normalized} is already in whitelist.", "entry": normalized, "entry_type": entry_type})
+      ip_values.append(normalized)
+    else:
+      if normalized in cidr_values:
+        return web.json_response({"ok": True, "message": f"{normalized} is already in whitelist.", "entry": normalized, "entry_type": entry_type})
+      cidr_values.append(normalized)
+
+    await self._config.patch_values(
+      {
+        "whitelist.ips": ip_values,
+        "whitelist.cidr_ranges": cidr_values,
+      }
+    )
+    if self._whitelist:
+      await self._whitelist.reload(self._config)
+
+    await self._log_audit(request, "admin.whitelist_add", actor_username=actor, details={"entry": normalized, "entry_type": entry_type})
+    return web.json_response({"ok": True, "message": f"Added {normalized} to whitelist.", "entry": normalized, "entry_type": entry_type})
+
+  async def _handle_admin_remove_whitelist(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    raw_value = str(payload.get("value", "")).strip()
+    try:
+      normalized, entry_type = self._normalize_whitelist_entry(raw_value)
+    except Exception:
+      return web.json_response({"error": "invalid_entry", "message": "Provide a valid IPv4/IPv6 address or CIDR range."}, status=400)
+
+    ip_values = list(self._config.get("whitelist.ips", []) or [])
+    cidr_values = list(self._config.get("whitelist.cidr_ranges", []) or [])
+    changed = False
+
+    if entry_type == "ip" and normalized in ip_values:
+      ip_values = [item for item in ip_values if str(item).strip() != normalized]
+      changed = True
+    if entry_type == "cidr" and normalized in cidr_values:
+      cidr_values = [item for item in cidr_values if str(item).strip() != normalized]
+      changed = True
+
+    if not changed:
+      return web.json_response({"ok": True, "message": f"{normalized} was not present in whitelist.", "entry": normalized, "entry_type": entry_type})
+
+    await self._config.patch_values(
+      {
+        "whitelist.ips": ip_values,
+        "whitelist.cidr_ranges": cidr_values,
+      }
+    )
+    if self._whitelist:
+      await self._whitelist.reload(self._config)
+
+    await self._log_audit(request, "admin.whitelist_remove", actor_username=actor, details={"entry": normalized, "entry_type": entry_type})
+    return web.json_response({"ok": True, "message": f"Removed {normalized} from whitelist.", "entry": normalized, "entry_type": entry_type})
 
   async def _handle_admin_unban_ip(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
@@ -2273,6 +2379,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
           <button id="unbanManualBtn" class="btn primary">Unban IP</button>
         </div>
+        <div class="toolbar-grid">
+          <input id="manualWhitelist" class="ctrl search" placeholder="Enter IP or CIDR (example: 203.0.113.4 or 203.0.113.0/24)">
+          <button id="addWhitelistBtn" class="btn cyan">Add Whitelist</button>
+        </div>
+        <div class="toolbar-grid">
+          <button id="removeWhitelistBtn" class="btn ghost">Remove Whitelist Entry</button>
+        </div>
         <div class="action-grid">
           <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
           <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
@@ -2302,7 +2415,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <div class="toolbar"><select id="banSort" class="ctrl"><option value="recent">Sort: Recent</option><option value="risk">Sort: Highest Risk</option></select></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Hash</th><th>Risk</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead>
+              <thead><tr><th>Source IP</th><th>Risk</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead>
               <tbody id="banRows"></tbody>
             </table>
           </div>
@@ -2700,7 +2813,7 @@ async function performAction(path, body, successTitle, successMessage){ var payl
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
-  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp','manualWhitelist'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
@@ -2711,6 +2824,8 @@ function bind(){
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
   $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
+  $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); });
+  $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
   $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });

@@ -179,6 +179,7 @@ class WardenIPS:
             self._db,
             self._firewall,
             self._start_time,
+            whitelist=self._whitelist,
             notifier=self._notifier,
             blocklist=self._blocklist,
         )
