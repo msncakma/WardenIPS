@@ -28,6 +28,8 @@ from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+_IPSET_MAX_TIMEOUT_SECONDS = 2_147_483
+
 
 class FirewallManager:
     """
@@ -333,6 +335,13 @@ class FirewallManager:
             return True
 
         ban_duration = duration if duration is not None else self._default_ban_duration
+        if ban_duration > _IPSET_MAX_TIMEOUT_SECONDS:
+            logger.warning(
+                "Requested ban duration %ss exceeds ipset max timeout %ss; clamping.",
+                ban_duration,
+                _IPSET_MAX_TIMEOUT_SECONDS,
+            )
+            ban_duration = _IPSET_MAX_TIMEOUT_SECONDS
         target_set = self._get_set_for_ip(ip_str)
 
         if ban_duration > 0:

@@ -266,8 +266,14 @@ class WardenIPS:
             ]
             if len(ts_list) >= self._burst_threshold:
                 source_ip = event.source_ip
+                permanent_ban_default = bool(
+                    self._config.get("firewall.permanent_ban_default", True)
+                )
                 prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
-                ban_duration = self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                ban_duration = (
+                    0 if permanent_ban_default
+                    else self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                )
                 reason = (
                     f"[{plugin.name}] BURST FLOOD — "
                     f"{len(ts_list)} events in {self._burst_window}s"
@@ -410,8 +416,14 @@ class WardenIPS:
 
             if action == "BAN":
                 ban_threshold = self._config.get("firewall.ban_threshold", 70)
+                permanent_ban_default = bool(
+                    self._config.get("firewall.permanent_ban_default", True)
+                )
                 prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
-                ban_duration = self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                ban_duration = (
+                    0 if (permanent_ban_default and risk_score >= ban_threshold)
+                    else self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                )
                 protected = await self._is_critical_protected_ip(source_ip)
                 if protected:
                     self._logger.critical(

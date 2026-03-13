@@ -39,6 +39,7 @@ asn_protection:
 firewall:
   # Action to take when an IP reaches this risk score
   ban_threshold: 70
+  permanent_ban_default: true   # High-risk bans are permanent by default (manual unban via dashboard)
   ipset:
     set_name: "warden_blacklist"
     default_ban_duration: 3600  # Seconds (1 hour). Use 0 for permanent bans.

@@ -311,6 +311,8 @@ def _escape_html(text: str) -> str:
 def _md_to_html(text: str) -> str:
     """Minimal Markdown → HTML conversion for Telegram messages."""
     import re
+    # Escape raw content first so user-controlled values cannot break HTML parse.
+    text = _escape_html(text)
     # **bold** → <b>bold</b>
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     # `code` → <code>code</code>
