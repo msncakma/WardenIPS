@@ -56,6 +56,7 @@ class FirewallManager:
         self._set_name_v6: str = "warden_blacklist_v6"
         self._default_ban_duration: int = 3600
         self._simulation_mode: bool = False
+        self._forced_simulation: bool = False
         self._whitelist = None
         self._initialized: bool = False
         # Resolved absolute paths for ipset/iptables/ip6tables so they work
@@ -101,6 +102,7 @@ class FirewallManager:
         Initializes the ipset set and iptables rule.
         """
         fw_section = config.get_section("firewall")
+        self._forced_simulation = bool(fw_section.get("simulation_mode", False))
         ipset_section = fw_section.get("ipset", {})
         self._set_name = ipset_section.get("set_name", "warden_blacklist")
         self._default_ban_duration = ipset_section.get(
@@ -133,7 +135,13 @@ class FirewallManager:
             has_ipset = False
             has_iptables = False
 
-        if not is_linux or not has_ipset or not has_iptables:
+        if self._forced_simulation:
+            self._simulation_mode = True
+            logger.warning(
+                "Firewall is in SIMULATION mode! Reason: firewall.simulation_mode=true. "
+                "Commands will be logged but not executed."
+            )
+        elif not is_linux or not has_ipset or not has_iptables:
             self._simulation_mode = True
             if not is_linux:
                 reason = "Not Linux"
