@@ -28,6 +28,7 @@ WARDEN_ARCHITECTURE.md
 walkthrough.md
 VM_TEST_GUIDE.md
 IMPLEMENTATION_REPORT.md
+todo.md
 
 # Python packaging
 *.egg-info/
