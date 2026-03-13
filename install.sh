@@ -77,17 +77,46 @@ printf "%b\n" "${CYAN}============================================${NC}"
 printf "\n"
 
 install_dependencies() {
+    apt_with_lock_retry() {
+        ATTEMPT=1
+        MAX_ATTEMPTS=30
+        while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            if "$@"; then
+                return 0
+            fi
+
+            if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
+                return 1
+            fi
+
+            warn "apt/dpkg lock is busy (attempt ${ATTEMPT}/${MAX_ATTEMPTS}). Waiting 5s..."
+            sleep 5
+            ATTEMPT=$((ATTEMPT + 1))
+        done
+        return 1
+    }
+
     if command -v apt-get >/dev/null 2>&1; then
         log "Installing system dependencies..."
         if is_verbose; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            if ! apt_with_lock_retry apt-get update; then
+                error "Failed to run apt-get update. Another package manager may still be holding the lock."
+            fi
+            if ! apt_with_lock_retry env DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 acl ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog
+            then
+                error "Failed to install system dependencies via apt-get."
+            fi
         else
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            if ! apt_with_lock_retry apt-get update -qq; then
+                error "Failed to run apt-get update. Another package manager may still be holding the lock."
+            fi
+            if ! apt_with_lock_retry env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
                 acl ca-certificates curl git ipset iptables python3 python3-venv rsync rsyslog \
                 >/dev/null
+            then
+                error "Failed to install system dependencies via apt-get."
+            fi
         fi
         return
     fi
@@ -842,7 +871,7 @@ printf "%b\n" "  ${GREEN}Quick Start Commands${NC}"
 printf "%b\n" "    wardenips start              Start the service"
 printf "%b\n" "    wardenips status             Show service status"
 printf "%b\n" "    wardenips logs               Show live logs (tail -f)"
-printf "%b\n" "    wardenips status             Database summary"
+printf "%b\n" "    wardenips summary            Database summary"
 printf "%b\n" "    wardenips config             Show config file path"
-printf "%b\n" "    wardenips shell              Open install directory shell"
+printf "%b\n" "    wardenips path               Show install directory"
 printf "%b\n" ""
