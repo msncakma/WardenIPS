@@ -1,5 +1,0 @@
-#!/bin/bash
-set -e
-
-# Stream colorized logs from systemd journal
-exec journalctl -u wardenips.service -f -o cat

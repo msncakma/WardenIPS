@@ -122,91 +122,9 @@ jobs:
           path: ${{ steps.build.outputs.deb-file }}
           retention-days: 30
           
-  build-snap:
-    name: Build Snap Package
-    runs-on: ubuntu-22.04
-    outputs:
-      snap-file: ${{ steps.build.outputs.snap-file }}
-      
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          
-      - name: Extract version from tag/branch
-        id: version
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          else
-            VERSION=$(grep -oP '__version__ = "\K[^"]+' wardenips/__init__.py)
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Building snap version: ${VERSION}"
-          
-      - name: Install snapcraft
-        run: |
-          sudo snap install snapcraft --classic
-          sudo snap install multipass
-          
-      - name: Update snap version
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          sed -i "s/^version: .*/version: '${VERSION}'/" snap/snapcraft.yaml
-          echo "Updated snap/snapcraft.yaml version to ${VERSION}"
-          
-      - name: Make snap scripts executable
-        run: |
-          chmod +x snap/local/bin/*
-          
-      - name: Build snap package
-        id: build
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          
-          # Build snap package
-          snapcraft pack --destructive-mode
-          
-          # Find the generated snap file
-          SNAP_FILE="${PACKAGE_NAME}_${VERSION}_amd64.snap"
-          
-          if [ ! -f "$SNAP_FILE" ]; then
-            # Try with different naming pattern
-            SNAP_FILE=$(find . -name "${PACKAGE_NAME}_*.snap" | head -1)
-            SNAP_FILE=$(basename "$SNAP_FILE")
-          fi
-          
-          echo "snap-file=${SNAP_FILE}" >> $GITHUB_OUTPUT
-          echo "Built snap: ${SNAP_FILE}"
-          
-          # Show snap info
-          snap info --local "${SNAP_FILE}"
-          
-      - name: Test snap installation
-        run: |
-          SNAP_FILE="${{ steps.build.outputs.snap-file }}"
-          echo "Testing snap installation..."
-          
-          # Install snap in classic mode
-          sudo snap install --dangerous --classic "${SNAP_FILE}"
-          
-          # Test basic commands
-          wardenips version || echo "Version command test complete"
-          wardenips help || echo "Help command test complete"
-          
-          echo "✓ Snap can be installed successfully"
-          
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: snap-package
-          path: ${{ steps.build.outputs.snap-file }}
-          retention-days: 30
-
   create-release:
     name: Create GitHub Release
-    needs: [build-deb, build-snap]
+    needs: [build-deb]
     runs-on: ubuntu-22.04
     permissions:
       contents: write  # Required for creating releases
@@ -232,18 +150,6 @@ jobs:
           
           ### 📦 Installation
           
-          **Universal Snap Package (All Linux Distros):**
-          ```bash
-          # Download and install
-          wget https://github.com/msncakma/WardenIPS/releases/download/v${{ needs.build-deb.outputs.version }}/${{ needs.build-snap.outputs.snap-file }}
-          sudo snap install --dangerous --classic wardenips_*.snap
-          
-          # Configure and start
-          sudo wardenips.configure
-          sudo wardenips.start
-          wardenips.logs
-          ```
-          
           **Debian/Ubuntu (.deb package):**
           ```bash
           wget https://github.com/msncakma/WardenIPS/releases/download/v${{ needs.build-deb.outputs.version }}/${{ needs.build-deb.outputs.deb-file }}
@@ -257,7 +163,7 @@ jobs:
           ```
           
           ### ✨ What's New
-          - **Universal Snap Packaging**: Works on all Linux distributions
+          - Debian/Ubuntu package-first release flow
           - Professional CLI wrapper with colorized output  
           - ASN-based threat detection with autonomous weekly updates
           - Full source IP visibility in dashboard
@@ -265,15 +171,6 @@ jobs:
           - Debian/Ubuntu package distribution
           
           ### 🔧 Quick Start
-          
-          **Snap Installation:**
-          ```bash
-          sudo wardenips.configure              # Initial setup
-          sudo wardenips.edit                  # Edit configuration  
-          sudo wardenips.start                 # Start service
-          wardenips.logs                       # View colored logs
-          # Dashboard: http://127.0.0.1:7680/
-          ```
           
           **Debian Package:**
           ```bash
@@ -285,7 +182,7 @@ jobs:
           ```
           
           ### 📋 System Requirements
-          - Any modern Linux distribution with snap support OR Debian 11+ / Ubuntu 20.04+
+          - Debian 11+ or Ubuntu 20.04+
           - Python 3.10+
           - systemd, ipset, iptables
           - Root access for firewall management
@@ -303,18 +200,16 @@ jobs:
           prerelease: ${{ contains(needs.build-deb.outputs.version, '-') }}
           files: |
             ${{ needs.build-deb.outputs.deb-file }}
-            ${{ needs.build-snap.outputs.snap-file }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
   notify-success:
     name: Notify Success
-    needs: [build-deb, build-snap, create-release]
+    needs: [build-deb, create-release]
     runs-on: ubuntu-22.04
     steps:
       - name: Success notification
         run: |
           echo "🎉 Successfully released WardenIPS v${{ needs.build-deb.outputs.version }}"
           echo "📦 Debian Package: ${{ needs.build-deb.outputs.deb-file }}"
-          echo "📦 Snap Package: ${{ needs.build-snap.outputs.snap-file }}"
           echo "🔗 Release: https://github.com/msncakma/WardenIPS/releases/tag/v${{ needs.build-deb.outputs.version }}"

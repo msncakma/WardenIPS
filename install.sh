@@ -630,21 +630,6 @@ run_privileged() {
     exit 1
 }
 
-run_as_service_user() {
-    if [ "$(id -u)" -eq 0 ]; then
-        if command -v runuser >/dev/null 2>&1; then
-            exec runuser -u "$SERVICE_USER" -- "$@"
-        fi
-        if command -v su >/dev/null 2>&1; then
-            exec su -s /bin/sh -c "exec \"$1\" \"$2\" --config \"$3\"" "$SERVICE_USER"
-        fi
-        printf "${RED}✗ Neither runuser nor su is available to drop privileges.${NC}\n" >&2
-        exit 1
-    fi
-
-    exec "$@"
-}
-
 repair_permissions() {
     chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
     find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +
@@ -664,7 +649,6 @@ usage() {
     print_banner
     printf "${GREEN}${BOLD}Usage:${NC} wardenips <command> [args]\n\n"
     printf "${BOLD}Core Commands:${NC}\n"
-    printf "  ${CYAN}console${NC}         Run in console mode with direct logs (requires sudo)\n"
     printf "  ${CYAN}start${NC}           Start the WardenIPS service\n"
     printf "  ${CYAN}stop${NC}            Stop the WardenIPS service\n"
     printf "  ${CYAN}restart${NC}         Restart the WardenIPS service\n\n"
@@ -692,13 +676,6 @@ case "${1:-help}" in
         ;;
     summary|status-summary)
         "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
-        ;;
-    console)
-        print_banner
-        if [ "$(id -u)" -ne 0 ]; then
-            run_privileged "$0" console
-        fi
-        run_as_service_user "$PYTHON_BIN" "$MAIN_FILE" "$CONFIG_FILE"
         ;;
     start)
         run_privileged systemctl start "$SERVICE_NAME"

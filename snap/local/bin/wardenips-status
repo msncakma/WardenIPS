@@ -1,5 +1,0 @@
-#!/bin/bash
-set -e
-
-# Show systemd service status
-exec systemctl --no-pager status wardenips.service

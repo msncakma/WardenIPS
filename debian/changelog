@@ -1,8 +1,8 @@
-wardenips (0.2.5-1) stable; urgency=medium
+wardenips (0.2.5~snapshot1-1) stable; urgency=medium
 
-  * Fix Snapcraft schema key for Python requirements
-  * Fix Snap override-build environment variable usage
-  * Use `snapcraft pack --destructive-mode` in release workflow
-  * Release WardenIPS 0.2.5
+  * Remove CLI console command from wrapper help and dispatcher
+  * Drop Snap packaging and release pipeline steps
+  * Keep distribution flow Debian/Ubuntu only
+  * Bump project version to 0.2.5-snapshot.1
 
  -- msncakma <wardenips@msncakma.dev>  Thu, 13 Mar 2026 00:55:00 +0000
