@@ -115,3 +115,17 @@ plugins:
   nginx:
     enabled: false
     log_path: "/var/log/nginx/access.log"
+
+  portscan:
+    enabled: true
+    log_path: "/var/log/kern.log"
+    scan_threshold: 5
+    trap_ports:
+      - 23    # Telnet
+      - 2323  # Mirai
+      - 135   # RPC
+      - 139   # NetBIOS
+      - 445   # SMB
+      - 1433  # MSSQL
+      - 3389  # RDP
+      - 5900  # VNC

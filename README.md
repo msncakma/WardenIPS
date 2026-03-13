@@ -21,7 +21,7 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 - ASN-based threat detection with autonomous weekly GeoLite2 updates.
 - Live operational dashboard with continuously updating metrics and event visibility.
 - Privacy-aware design: no sensitive IP hashing, direct ASN enrichment.
-- Plugin-based detection model for SSH, Minecraft, and Nginx workloads.
+- Plugin-based detection model for Portscans, SSH, Minecraft, and Nginx workloads.
 - Burst and flood detection for fast bot and scanner containment.
 - Optional Telegram, Discord, AbuseIPDB, Redis, and Docker integrations.
 
@@ -70,6 +70,7 @@ WardenIPS now includes autonomous ASN enrichment and configurable ASN-based bloc
 
 ### Layered Detection
 
+- Portscan and botnet detection with UFW integration and standalone `iptables` trap rules (instant ban for honeypot ports).
 - SSH brute-force detection.
 - Minecraft rapid connection and bot-style behavior detection.
 - Nginx web threat detection for scanners, suspicious paths, traversal probes, and SQLi-style traffic.

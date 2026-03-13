@@ -38,6 +38,7 @@ from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
 from wardenips.plugins.nginx_plugin import NginxPlugin
+from wardenips.plugins.portscan_plugin import PortscanPlugin
 
 
 class WardenIPS:
@@ -198,6 +199,11 @@ class WardenIPS:
         if self._config.get("plugins.nginx.enabled", False):
             nginx_plugin = NginxPlugin(self._config)
             self._plugin_manager.register(nginx_plugin)
+
+        # PortScan Plugin
+        if self._config.get("plugins.portscan.enabled", True):
+            portscan_plugin = PortscanPlugin(self._config)
+            self._plugin_manager.register(portscan_plugin)
 
     def _start_tailers(self) -> None:
         """Creates and starts a LogTailer for each active plugin."""
