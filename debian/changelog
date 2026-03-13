@@ -1,3 +1,9 @@
+wardenips (0.2.6~beta3-1) stable; urgency=medium
+
+  * Bump version to 0.2.6-beta-3
+
+ -- msncakma <wardenips@msncakma.dev>  Fri, 13 Mar 2026 20:10:00 +0000
+
 wardenips (0.2.6~beta2-1) stable; urgency=medium
 
   * Bump version to 0.2.6-beta-2
