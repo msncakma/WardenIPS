@@ -27,9 +27,9 @@ If you want a cleaner product-style overview for sharing or presentation, see [d
 
 ## Transparency
 
-WardenIPS v0.2.6-beta-3 is feature-complete for its intended scope, with professional CLI tooling and robust error handling.
+WardenIPS v0.2.6-beta-2 is feature-complete for its intended scope, with professional CLI tooling and robust error handling.
 
-- Current state: **v0.2.6-beta-3** — active beta line with Debian-only packaging and release pipeline.
+- Current state: **v0.2.6-beta-2** — active beta line with Debian-only packaging and release pipeline.
 - Testing state: core flows are implemented and functional, broad production validation is ongoing.
 - Deployment advice: use in labs, staging, or controlled production pilots first.
 - Operational reality: misconfigured whitelists or aggressive thresholds can still block legitimate traffic.
@@ -286,7 +286,7 @@ WardenIPS uses a staged maturity model:
 - BETA: feature complete with active stabilization.
 - RELEASE: production-oriented stable milestone.
 
-Current version: **v0.2.6-beta-3**
+Current version: **v0.2.6-beta-2**
 
 Until a formal RELEASE tag exists for a given build, treat that build as non-final.
 
