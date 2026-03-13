@@ -52,6 +52,10 @@ class NotificationManager:
         self._lock: asyncio.Lock = asyncio.Lock()
         self._total_sent: int = 0
         self._total_failed: int = 0
+        self._notify_on_ban: bool = True
+        self._notify_on_burst: bool = True
+        self._notify_on_manual_ban: bool = True
+        self._min_risk_score: int = 70
 
     @classmethod
     async def create(cls, config) -> NotificationManager:
@@ -91,6 +95,14 @@ class NotificationManager:
                 )
 
         self._rate_limit = notif_section.get("rate_limit_per_minute", 20)
+        rules = notif_section.get("rules", {}) if isinstance(notif_section.get("rules", {}), dict) else {}
+        self._notify_on_ban = bool(rules.get("on_ban", True))
+        self._notify_on_burst = bool(rules.get("on_burst", True))
+        self._notify_on_manual_ban = bool(rules.get("on_manual_ban", True))
+        try:
+            self._min_risk_score = max(0, min(100, int(rules.get("min_risk_score", 70))))
+        except Exception:
+            self._min_risk_score = 70
 
         if (self._telegram_enabled or self._discord_enabled) and _AIOHTTP_AVAILABLE:
             self._session = aiohttp.ClientSession(
@@ -121,13 +133,22 @@ class NotificationManager:
         if not self.enabled or not _AIOHTTP_AVAILABLE or not self._session:
             return
 
+        plugin_name = str(plugin or "unknown")
+        is_manual_ban = plugin_name.lower() == "admin"
+        if is_manual_ban and not self._notify_on_manual_ban:
+            return
+        if not is_manual_ban:
+            if not self._notify_on_ban:
+                return
+            if int(risk or 0) < self._min_risk_score:
+                return
+
         if self._rate_limited():
             logger.debug("Notification rate limit reached, skipping.")
             return
 
         dur_str = f"{duration}s" if duration > 0 else "permanent"
         reason_text = str(reason or "No additional details provided.")
-        plugin_name = str(plugin or "unknown")
         is_honeypot = plugin_name.lower() == "portscan" and (
             "honeypot" in reason_text.lower() or "trap" in reason_text.lower()
         )
@@ -165,6 +186,8 @@ class NotificationManager:
     ) -> None:
         """Send a burst-detection notification."""
         if not self.enabled or not _AIOHTTP_AVAILABLE or not self._session:
+            return
+        if not self._notify_on_burst:
             return
 
         if self._rate_limited():

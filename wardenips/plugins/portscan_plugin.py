@@ -47,13 +47,22 @@ class PortscanPlugin(BasePlugin):
     def __init__(self, config) -> None:
         super().__init__(config)
         raw_ports = self._config.get("plugins.portscan.trap_ports", TRAP_PORTS)
+        raw_ignored_ports = self._config.get("plugins.portscan.ignored_ports", [])
         parsed_ports = set()
+        parsed_ignored_ports = set()
         for port_value in raw_ports:
             try:
                 parsed_ports.add(int(port_value))
             except (TypeError, ValueError):
                 self._logger.warning("Ignoring invalid trap port value: %r", port_value)
-        self._trap_ports = parsed_ports or set(TRAP_PORTS)
+        for port_value in raw_ignored_ports:
+            try:
+                parsed_ignored_ports.add(int(port_value))
+            except (TypeError, ValueError):
+                self._logger.warning("Ignoring invalid ignored port value: %r", port_value)
+        self._ignored_ports = parsed_ignored_ports
+        effective_trap_ports = (parsed_ports or set(TRAP_PORTS)) - self._ignored_ports
+        self._trap_ports = effective_trap_ports
         self._scan_threshold = self._config.get("plugins.portscan.scan_threshold", 10)
         self._log_path = self._config.get("plugins.portscan.log_path", "/var/log/kern.log")
         self._installed_iptables = False
@@ -150,6 +159,11 @@ class PortscanPlugin(BasePlugin):
 
         ip = match.group(1)
         port = match.group(2)
+        try:
+            if int(port) in self._ignored_ports:
+                return None
+        except ValueError:
+            return None
         timestamp = self._parse_timestamp(line)
 
         return ConnectionEvent(

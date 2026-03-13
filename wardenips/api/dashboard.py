@@ -132,6 +132,12 @@ class DashboardAPI:
     self._bootstrap_token_hash = str(bootstrap.get("token_hash", "") or "").strip()
     self._bootstrap_token_expires_at = str(bootstrap.get("token_expires_at", "") or "").strip()
 
+  def _sync_firewall_simulation_mode(self) -> tuple[bool, bool]:
+    """Apply firewall.simulation_mode from config to runtime firewall state."""
+    desired = bool(self._config.get("firewall.simulation_mode", False))
+    effective = bool(self._firewall.apply_simulation_config(desired))
+    return desired, effective
+
   @property
   def enabled(self) -> bool:
     return self._enabled and _AIOHTTP_WEB_AVAILABLE
@@ -303,6 +309,14 @@ class DashboardAPI:
     if risk_score >= 80:
       return "High-intensity activity detected. Consider stricter ban thresholds and upstream rate limiting."
     return "No immediate action required; continue monitoring this source for repeated behavior."
+
+  @staticmethod
+  def _get_event_threat_label(event: dict) -> str:
+    event_type = str(event.get("event_type") or "").strip().lower()
+    connection_type = str(event.get("connection_type") or "").strip().lower()
+    if connection_type == "ssh" and event_type == "accepted_login":
+      return "SUCCESS"
+    return str(event.get("threat_level") or "NONE").upper()
 
   def _normalize_next_path(self, candidate: str, default: str = "/dashboard") -> str:
     value = str(candidate or "").strip()
@@ -482,6 +496,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
+    self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
     self._app.router.add_get("/api/admin/whitelist", self._handle_admin_get_whitelist)
     self._app.router.add_post("/api/admin/whitelist/add", self._handle_admin_add_whitelist)
@@ -593,6 +608,7 @@ class DashboardAPI:
           details_obj,
           event.get("source_ip"),
         )
+        event["threat_label"] = self._get_event_threat_label(event)
         event["timestamp_unix"] = self._parse_timestamp_unix(event.get("timestamp"))
         event["operator_advice"] = self._build_operator_advice(event)
       return web.json_response({"events": events, "count": len(events)})
@@ -1186,6 +1202,69 @@ class DashboardAPI:
       }
     )
 
+  async def _handle_admin_ban_ip(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    ip_value = str(payload.get("ip", "")).strip()
+    if not ip_value:
+      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
+    try:
+      ipaddress.ip_address(ip_value)
+    except Exception:
+      return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 3600))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 3600)), 0)
+
+    reason = str(payload.get("reason", "")).strip() or "[ADMIN] Manual ban from dashboard"
+    risk_score_value = payload.get("risk_score", 100)
+    try:
+      risk_score = min(max(int(risk_score_value), 0), 100)
+    except Exception:
+      risk_score = 100
+
+    banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=reason)
+    if not banned:
+      return web.json_response(
+        {
+          "ok": False,
+          "message": f"Ban request for {ip_value} was skipped (already banned, whitelisted, or blocked by safety checks).",
+        },
+        status=409,
+      )
+
+    await self._db.log_ban(ip_value, reason, risk_score, duration)
+    await self._notifier.notify_ban(
+      ip=ip_value,
+      reason=reason,
+      risk=risk_score,
+      duration=duration,
+      plugin="admin",
+    )
+    await self._log_audit(
+      request,
+      "admin.ban_ip",
+      actor_username=actor,
+      details={"ip": ip_value, "duration": duration, "reason": reason, "risk_score": risk_score},
+    )
+    return web.json_response(
+      {
+        "ok": True,
+        "message": f"{ip_value} was added to firewall ban list.",
+        "duration": duration,
+        "risk_score": risk_score,
+      }
+    )
+
   async def _handle_admin_deactivate_ban(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
@@ -1396,12 +1475,18 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()
+    desired_simulation, effective_simulation = self._sync_firewall_simulation_mode()
     await self._log_audit(request, "admin.save_config", actor_username=actor, details={"mode": "yaml", "bytes": len(yaml_text)})
     current_yaml = await self._config.get_yaml_text()
+    message = "Configuration saved. Restart WardenIPS if you changed firewall, plugin, or notification wiring."
+    if (not desired_simulation) and effective_simulation:
+      message = (
+        "Configuration saved. Simulation mode remains active because firewall tools/permissions are not currently available at runtime."
+      )
     return web.json_response(
       {
         "ok": True,
-        "message": "Configuration saved. Restart WardenIPS if you changed firewall, plugin, or notification wiring.",
+        "message": message,
         "config": self._config.raw,
         "yaml": current_yaml,
       }
@@ -1425,12 +1510,18 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
     self._initialize_config()
+    desired_simulation, effective_simulation = self._sync_firewall_simulation_mode()
     await self._log_audit(request, "admin.patch_config", actor_username=actor, details={"changes": sorted(str(key) for key in changes.keys())})
     current_yaml = await self._config.get_yaml_text()
+    message = "Configuration updated."
+    if (not desired_simulation) and effective_simulation:
+      message = (
+        "Configuration updated. Simulation mode remains active because firewall tools/permissions are not currently available at runtime."
+      )
     return web.json_response(
       {
         "ok": True,
-        "message": "Configuration updated.",
+        "message": message,
         "config": self._config.raw,
         "yaml": current_yaml,
       }
@@ -2489,6 +2580,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-field{min-width:0}
 .config-field label{white-space:normal;line-height:1.3}
 .config-input,.config-select{width:100%;min-width:0}
+.chip-editor{display:flex;flex-wrap:wrap;gap:8px;min-height:42px;padding:8px 10px;border:1px solid var(--b);border-radius:12px;background:var(--surface2)}
+.chip-editor.empty::before{content:'No ignored ports';color:var(--muted);font-size:.78rem}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;background:color-mix(in srgb,var(--blue) 20%,var(--surface));border:1px solid color-mix(in srgb,var(--blue) 40%,var(--b));font-size:.78rem}
+.chip button{all:unset;cursor:pointer;font-weight:700;color:var(--muted);line-height:1}
+.chip button:hover{color:var(--txt)}
 .primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
 .advanced-wrap{margin-top:2px}
 @media(max-width:1280px){.config-sections{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -2586,6 +2682,14 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <div class="card">
         <h2>Action Center</h2>
         <div class="toolbar-grid">
+          <input id="manualBanIp" class="ctrl search" placeholder="Enter an IP address to ban manually">
+          <input id="manualBanDuration" class="ctrl" type="number" min="0" value="3600" placeholder="Duration (sec, 0=permanent)">
+          <button id="banManualBtn" class="btn warn">Ban IP</button>
+        </div>
+        <div class="toolbar-grid">
+          <input id="manualBanReason" class="ctrl search" placeholder="Optional reason (default: [ADMIN] Manual ban from dashboard)">
+        </div>
+        <div class="toolbar-grid">
           <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
           <button id="unbanManualBtn" class="btn primary">Unban IP</button>
         </div>
@@ -2609,7 +2713,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <h2>Recent Security Events</h2>
         <div class="toolbar">
           <select id="eventPluginFilter" class="ctrl"><option value="">All Plugins</option></select>
-          <select id="eventThreatFilter" class="ctrl"><option value="">All Threats</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="NONE">None</option></select>
+          <select id="eventThreatFilter" class="ctrl"><option value="">All Threats</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="SUCCESS">Successful Login</option><option value="NONE">None</option></select>
           <select id="eventSort" class="ctrl"><option value="time">Sort: Newest</option><option value="risk">Sort: Highest Risk</option></select>
         </div>
         <div class="table-wrap">
@@ -2734,6 +2838,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <label for="cfgDiscordWebhook">Discord Webhook URL</label>
               <input id="cfgDiscordWebhook" class="config-input" type="text" spellcheck="false">
             </div>
+            <label class="config-toggle full"><span>Notify On Ban Events</span><input id="cfgNotifOnBan" type="checkbox"></label>
+            <label class="config-toggle full"><span>Notify On Burst Flood Events</span><input id="cfgNotifOnBurst" type="checkbox"></label>
+            <label class="config-toggle full"><span>Notify On Manual Admin Bans</span><input id="cfgNotifOnManualBan" type="checkbox"></label>
+            <div class="config-field">
+              <label for="cfgNotifMinRisk">Minimum Risk For Ban Alerts</label>
+              <input id="cfgNotifMinRisk" class="config-input" type="number" min="0" max="100">
+            </div>
             <div class="config-field full">
               <label>Delivery Tests</label>
               <div class="notification-grid">
@@ -2742,11 +2853,12 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
                 <button id="testDiscordBtn" class="btn ghost" type="button">Test Discord</button>
               </div>
             </div>
+            <div class="toolbar-note full">Notification triggers are now selectable from this panel and applied immediately after saving.</div>
           </div>
         </section>
         <section class="config-section">
           <h3>Plugins</h3>
-          <p>Plugin activation and Minecraft burst heuristics.</p>
+          <p>Plugin activation, Minecraft burst heuristics, and Portscan exclusions.</p>
           <div class="config-grid">
             <label class="config-toggle full"><span>SSH Plugin Enabled</span><input id="cfgSshEnabled" type="checkbox"></label>
             <label class="config-toggle full"><span>Minecraft Plugin Enabled</span><input id="cfgMinecraftEnabled" type="checkbox"></label>
@@ -2757,6 +2869,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
             <div class="config-field">
               <label for="cfgMinecraftBurstWindow">MC Burst Window (sec)</label>
               <input id="cfgMinecraftBurstWindow" class="config-input" type="number" min="1">
+            </div>
+            <div class="config-field full">
+              <label for="cfgPortscanIgnoredPortsEntry">Portscan Ignored Ports (chip list)</label>
+              <input id="cfgPortscanIgnoredPorts" type="hidden">
+              <div id="cfgPortscanIgnoredPortsChips" class="chip-editor"></div>
+              <input id="cfgPortscanIgnoredPortsEntry" class="config-input" type="text" spellcheck="false" placeholder="Type port and press Enter (example: 19132)">
+              <div class="sub">Press Enter or comma to add. Click x on a chip to remove.</div>
             </div>
           </div>
         </section>
@@ -2800,10 +2919,18 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null};
+var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[]};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
+function isSimulationEnabled(value){
+  if(value===true||value===1) return true;
+  if(typeof value==='string'){
+    var normalized=value.trim().toLowerCase();
+    return normalized==='true'||normalized==='1'||normalized==='yes'||normalized==='on';
+  }
+  return false;
+}
 function parseTs(v){
   if(v===null||v===undefined||v==='')return null;
   if(typeof v==='number')return v<1e12?v*1000:v;
@@ -2825,7 +2952,7 @@ function ago(value){
   return Math.floor(df/86400)+'d';
 }
 function tagRisk(r){ return r>=70?'t-red':r>=40?'t-yellow':'t-green'; }
-function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'?'t-green':'t-blue'; }
+function tagThreat(t){ return t==='CRITICAL'||t==='HIGH'?'t-red':t==='MEDIUM'?'t-yellow':t==='LOW'||t==='SUCCESS'?'t-green':'t-blue'; }
 function debounce(key, fn, wait){ clearTimeout(inputTimers[key]); inputTimers[key] = setTimeout(fn, wait); }
 function filterText(){ return ($('#globalSearch').value||'').trim().toLowerCase(); }
 function setStatus(kind, title, message){
@@ -2840,6 +2967,44 @@ function setStatus(kind, title, message){
   toastTimer=setTimeout(close, tone==='err' ? 7000 : 4200);
 }
 function getConfigValue(path, fallback){ var value=state.config||{}; String(path).split('.').forEach(function(part){ value = value && typeof value==='object' ? value[part] : undefined; }); return value===undefined ? fallback : value; }
+function parsePortList(value){
+  var seen={};
+  return String(value||'').split(',').map(function(item){ return item.trim(); }).filter(function(item){
+    if(!item || !/^\d+$/.test(item)){ return false; }
+    var num=parseInt(item,10);
+    if(!Number.isFinite(num) || num<1 || num>65535){ return false; }
+    if(seen[num]){ return false; }
+    seen[num]=true;
+    return true;
+  }).map(function(item){ return parseInt(item,10); });
+}
+function syncPortscanIgnoredPortsField(){ $('#cfgPortscanIgnoredPorts').value=(state.portscanIgnoredPorts||[]).join(','); }
+function renderPortscanIgnoredPortChips(){
+  var host=$('#cfgPortscanIgnoredPortsChips');
+  var ports=state.portscanIgnoredPorts||[];
+  host.classList.toggle('empty', ports.length===0);
+  host.innerHTML=ports.map(function(port){ return '<span class="chip" data-port="'+E(String(port))+'">'+E(String(port))+'<button type="button" class="chip-remove" aria-label="Remove port">x</button></span>'; }).join('');
+}
+function setPortscanIgnoredPorts(value){
+  if(Array.isArray(value)){
+    state.portscanIgnoredPorts=parsePortList(value.join(','));
+  }else{
+    state.portscanIgnoredPorts=parsePortList(value);
+  }
+  syncPortscanIgnoredPortsField();
+  renderPortscanIgnoredPortChips();
+}
+function addPortscanIgnoredPortsFromInput(raw){
+  var incoming=parsePortList(raw);
+  if(!incoming.length){ return false; }
+  var existing=state.portscanIgnoredPorts||[];
+  var set={};
+  existing.concat(incoming).forEach(function(p){ set[p]=true; });
+  state.portscanIgnoredPorts=Object.keys(set).map(function(k){ return parseInt(k,10); }).sort(function(a,b){ return a-b; });
+  syncPortscanIgnoredPortsField();
+  renderPortscanIgnoredPortChips();
+  return true;
+}
 function getDismissKey(info){ return info&&info.update_available&&info.latest_version ? 'wardenips_update_dismissed_'+info.latest_version : info&&info.current_version ? 'wardenips_whatsnew_seen_'+info.current_version : ''; }
 function applyTheme(theme){ state.theme = theme==='light' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', state.theme); try{ localStorage.setItem('wardenips_admin_theme', state.theme); }catch(error){} $('#themeToggle').textContent = state.theme==='light' ? 'Dark Mode' : 'Light Mode'; $('#themeChip').textContent = 'Theme: ' + (state.theme==='light' ? 'Light' : 'Dark'); }
 function initTheme(){ var saved='dark'; try{ saved = localStorage.getItem('wardenips_admin_theme') || 'dark'; }catch(error){} applyTheme(saved); }
@@ -2928,7 +3093,7 @@ function handleUserActivity(){
   sendActivityPing();
 }
 function renderSummary(){
-  var simulation = !!(state.stats&&state.stats.simulation_mode);
+  var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
   $('#mFwBans').textContent = N(state.firewall.length);
@@ -2940,19 +3105,19 @@ function renderSummary(){
   $('#enforceSimBansBtn').hidden = !simulation;
 }
 function renderEvents(){
-  var simulation = !!(state.stats&&state.stats.simulation_mode);
+  var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
-  rows=rows.filter(function(e){ var blob=[e.source_ip,e.connection_type,e.threat_level,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||e.threat_level===threat); });
+  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat); });
   rows.sort(function(a,b){
     if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); }
     var ta=Date.parse(String(a.timestamp||'')); var tb=Date.parse(String(b.timestamp||''));
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(e.threat_level||'NONE')+'">'+E(e.threat_level||'NONE')+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
-  var simulation = !!(state.stats&&state.stats.simulation_mode);
+  var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
   var rows=state.bans.slice(); var q=filterText(); var sort=$('#banSort').value;
   rows=rows.filter(function(b){ return !q || [b.source_ip,b.reason].join(' ').toLowerCase().indexOf(q)!==-1; });
   rows.sort(function(a,b){ if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); } return String(b.banned_at||'').localeCompare(String(a.banned_at||'')); });
@@ -2980,10 +3145,16 @@ function renderConfigStudio(){
   $('#cfgTelegramChatId').value=String(getConfigValue('notifications.telegram.chat_id',''));
   $('#cfgDiscordEnabled').checked=!!getConfigValue('notifications.discord.enabled',false);
   $('#cfgDiscordWebhook').value=String(getConfigValue('notifications.discord.webhook_url',''));
+  $('#cfgNotifOnBan').checked=!!getConfigValue('notifications.rules.on_ban',true);
+  $('#cfgNotifOnBurst').checked=!!getConfigValue('notifications.rules.on_burst',true);
+  $('#cfgNotifOnManualBan').checked=!!getConfigValue('notifications.rules.on_manual_ban',true);
+  $('#cfgNotifMinRisk').value=String(getConfigValue('notifications.rules.min_risk_score',70));
   $('#cfgSshEnabled').checked=!!getConfigValue('plugins.ssh.enabled',true);
   $('#cfgMinecraftEnabled').checked=!!getConfigValue('plugins.minecraft.enabled',false);
   $('#cfgMinecraftBurstThreshold').value=String(getConfigValue('plugins.minecraft.global_connection_burst_threshold',12));
   $('#cfgMinecraftBurstWindow').value=String(getConfigValue('plugins.minecraft.global_connection_burst_window_seconds',15));
+  setPortscanIgnoredPorts(getConfigValue('plugins.portscan.ignored_ports',[]));
+  $('#cfgPortscanIgnoredPortsEntry').value='';
   $('#configEditor').value=state.configYaml||'';
   syncAdvancedYaml();
   filterConfigSections();
@@ -3025,10 +3196,15 @@ async function saveConfigForm(){
     'notifications.telegram.chat_id': $('#cfgTelegramChatId').value.trim(),
     'notifications.discord.enabled': $('#cfgDiscordEnabled').checked,
     'notifications.discord.webhook_url': $('#cfgDiscordWebhook').value.trim(),
+    'notifications.rules.on_ban': $('#cfgNotifOnBan').checked,
+    'notifications.rules.on_burst': $('#cfgNotifOnBurst').checked,
+    'notifications.rules.on_manual_ban': $('#cfgNotifOnManualBan').checked,
+    'notifications.rules.min_risk_score': parseInt($('#cfgNotifMinRisk').value,10)||70,
     'plugins.ssh.enabled': $('#cfgSshEnabled').checked,
     'plugins.minecraft.enabled': $('#cfgMinecraftEnabled').checked,
     'plugins.minecraft.global_connection_burst_threshold': parseInt($('#cfgMinecraftBurstThreshold').value,10)||12,
-    'plugins.minecraft.global_connection_burst_window_seconds': parseInt($('#cfgMinecraftBurstWindow').value,10)||15
+    'plugins.minecraft.global_connection_burst_window_seconds': parseInt($('#cfgMinecraftBurstWindow').value,10)||15,
+    'plugins.portscan.ignored_ports': (state.portscanIgnoredPorts||[])
   };
   var payload=await api('/api/admin/config/patch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({changes:changes})});
   if(!payload){ return false; }
@@ -3050,7 +3226,7 @@ async function saveConfigYaml(){
 }
 function renderAdvice(){
   var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length;
-  if(stats.simulation_mode){ items.push({title:'Simulation mode is enabled', body:'Events and risk scoring continue, but no firewall blocking is applied while simulation mode is active.'}); }
+  if(isSimulationEnabled(stats.simulation_mode)){ items.push({title:'Simulation mode is enabled', body:'Events and risk scoring continue, but no firewall blocking is applied while simulation mode is active.'}); }
   if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'This can be expected in simulation mode. In live mode, check firewall permissions or service startup ordering.'}); }
   if(highRiskEvents>=10){ items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'}); }
   if(state.blocklist&&state.blocklist.last_error){ items.push({title:'Blocklist fetch encountered an error', body:'Check the configured URLs and network connectivity. Error: '+(state.blocklist.last_error||'unknown')}); }
@@ -3068,7 +3244,7 @@ async function performAction(path, body, successTitle, successMessage){ var payl
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
-  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp','manualWhitelist'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventSort','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
@@ -3079,6 +3255,7 @@ function bind(){
   $('#refreshNow').addEventListener('click', function(){ handleUserActivity(); refresh(); });
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
+  $('#banManualBtn').addEventListener('click', async function(){ var ip=$('#manualBanIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the ban action.'); return; } var duration=parseInt($('#manualBanDuration').value,10); if(!Number.isFinite(duration)||duration<0){ duration=3600; } var reason=$('#manualBanReason').value.trim(); handleUserActivity(); await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:reason}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); }); $('#manualBanIp').value=''; });
   $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
   $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); });
   $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
@@ -3095,6 +3272,9 @@ function bind(){
   $('#saveFormConfigBtn').addEventListener('click', async function(){ handleUserActivity(); await saveConfigForm(); });
   $('#saveConfigBtn').addEventListener('click', async function(){ handleUserActivity(); await saveConfigYaml(); });
   $('#toggleAdvancedYamlBtn').addEventListener('click', function(){ state.advancedYamlOpen=!state.advancedYamlOpen; syncAdvancedYaml(); });
+  $('#cfgPortscanIgnoredPortsEntry').addEventListener('keydown', function(ev){ if(ev.key==='Enter' || ev.key===','){ ev.preventDefault(); var raw=this.value; if(addPortscanIgnoredPortsFromInput(raw)){ this.value=''; } } });
+  $('#cfgPortscanIgnoredPortsEntry').addEventListener('blur', function(){ var raw=this.value; if(addPortscanIgnoredPortsFromInput(raw)){ this.value=''; } });
+  $('#cfgPortscanIgnoredPortsChips').addEventListener('click', function(ev){ var button=ev.target.closest('.chip-remove'); if(!button){ return; } var chip=ev.target.closest('.chip'); if(!chip){ return; } var value=parseInt(chip.getAttribute('data-port')||'',10); if(!Number.isFinite(value)){ return; } state.portscanIgnoredPorts=(state.portscanIgnoredPorts||[]).filter(function(p){ return p!==value; }); syncPortscanIgnoredPortsField(); renderPortscanIgnoredPortChips(); });
   $('#banRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.ban-action'); if(!button){ return; } var sourceIp = button.getAttribute('data-ip'); if(!sourceIp || !confirm('Deactivate this database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-ban', {source_ip:sourceIp}, 'Ban record updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' matching records.'; }); });
   $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
 }

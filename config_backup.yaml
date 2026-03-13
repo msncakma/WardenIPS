@@ -56,6 +56,21 @@ successful_logins:
   enabled: true              # Log successful SSH and Minecraft sign-ins as normal events
   reset_risk_score: true     # Reset recent risk buildup for an IP after a successful login
 
+notifications:
+  rate_limit_per_minute: 20   # Max notifications across all channels
+  rules:
+    on_ban: true              # Alert when automated ban action is taken
+    on_burst: true            # Alert on burst-flood auto-bans
+    on_manual_ban: true       # Alert when admin manually bans an IP
+    min_risk_score: 70        # Minimum risk score for automated ban alerts
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+  discord:
+    enabled: false
+    webhook_url: ""
+
 dashboard:
   enabled: false
   host: "127.0.0.1"
@@ -92,6 +107,11 @@ plugins:
     enabled: true
     log_path: "/var/log/kern.log"
     scan_threshold: 5
+    ignored_ports: []
+    # ignored_ports examples for legit game/voice services:
+    #  - 19132   # Bedrock
+    #  - 24454   # Proximity voice (Simple Voice Chat)
+    #  - 9987    # TeamSpeak voice
     trap_ports:
       - 23    # Telnet
       - 2323  # Mirai

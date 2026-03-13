@@ -63,6 +63,11 @@ successful_logins:
 
 notifications:
   rate_limit_per_minute: 20   # Max notifications across all channels
+  rules:
+    on_ban: true              # Alert when automated ban action is taken
+    on_burst: true            # Alert on burst-flood auto-bans
+    on_manual_ban: true       # Alert when admin manually bans an IP
+    min_risk_score: 70        # Minimum risk score for automated ban alerts
   telegram:
     enabled: false
     bot_token: ""             # Get from @BotFather on Telegram
@@ -121,6 +126,11 @@ plugins:
     enabled: true
     log_path: "/var/log/kern.log"
     scan_threshold: 5
+    ignored_ports: []
+    # ignored_ports examples for legit game/voice services:
+    #  - 19132   # Bedrock
+    #  - 24454   # Proximity voice (Simple Voice Chat)
+    #  - 9987    # TeamSpeak voice
     trap_ports:
       - 23    # Telnet
       - 2323  # Mirai

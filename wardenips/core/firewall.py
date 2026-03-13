@@ -804,6 +804,33 @@ class FirewallManager:
         """Returns True if in simulation mode."""
         return self._simulation_mode
 
+    def apply_simulation_config(self, enabled: bool) -> bool:
+        """Apply firewall.simulation_mode at runtime and return effective mode."""
+        self._forced_simulation = bool(enabled)
+        if self._forced_simulation:
+            self._simulation_mode = True
+            return self._simulation_mode
+
+        # If simulation is disabled in config, only switch to live mode when
+        # the runtime environment can actually execute firewall commands.
+        can_use_tools = (
+            platform.system() == "Linux"
+            and shutil.which(self._ipset_cmd) is not None
+            and shutil.which(self._iptables_cmd) is not None
+        )
+
+        can_run_privileged = self._direct_privileged or self._use_sudo
+        if not can_run_privileged:
+            try:
+                import os
+
+                can_run_privileged = os.geteuid() == 0
+            except Exception:
+                can_run_privileged = False
+
+        self._simulation_mode = not (can_use_tools and can_run_privileged)
+        return self._simulation_mode
+
     def __repr__(self) -> str:
         mode = "simulation"
         if not self._simulation_mode:
