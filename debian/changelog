@@ -1,10 +1,10 @@
-wardenips (0.3.0~beta4-1) stable; urgency=medium
+wardenips (0.3.0~beta5-1) stable; urgency=medium
 
   * Add admin action to apply simulated bans to real firewall in bulk
   * Add honeypot-aware simulation replay and enforce flow improvements
   * Improve heatmap UI with visible world backdrop layer
   * Add ripple animation for newly arriving/increasing country points
-  * Bump version to 0.3.0-beta-4
+  * Bump version to 0.3.0-beta-5
 
  -- msncakma <wardenips@msncakma.dev>  Sat, 14 Mar 2026 10:45:00 +0000
 

@@ -2580,6 +2580,9 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-field{min-width:0}
 .config-field label{white-space:normal;line-height:1.3}
 .config-input,.config-select{width:100%;min-width:0}
+.toolbar-grid.three{grid-template-columns:minmax(0,1fr) 120px 160px}
+.toolbar-grid.dual-actions{grid-template-columns:minmax(0,1fr) auto auto}
+.toolbar-grid.stack-label{margin-bottom:6px}
 .chip-editor{display:flex;flex-wrap:wrap;gap:8px;min-height:42px;padding:8px 10px;border:1px solid var(--b);border-radius:12px;background:var(--surface2)}
 .chip-editor.empty::before{content:'No ignored ports';color:var(--muted);font-size:.78rem}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;background:color-mix(in srgb,var(--blue) 20%,var(--surface));border:1px solid color-mix(in srgb,var(--blue) 40%,var(--b));font-size:.78rem}
@@ -2588,7 +2591,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
 .advanced-wrap{margin-top:2px}
 @media(max-width:1280px){.config-sections{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}}
+@media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -2681,7 +2684,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card">
         <h2>Action Center</h2>
-        <div class="toolbar-grid">
+        <div class="toolbar-grid stack-label">
+          <div class="sub">Manual Ban</div>
+        </div>
+        <div class="toolbar-grid three">
           <input id="manualBanIp" class="ctrl search" placeholder="Enter an IP address to ban manually">
           <input id="manualBanDuration" class="ctrl" type="number" min="0" value="3600" placeholder="Duration (sec, 0=permanent)">
           <button id="banManualBtn" class="btn warn">Ban IP</button>
@@ -2689,16 +2695,20 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div class="toolbar-grid">
           <input id="manualBanReason" class="ctrl search" placeholder="Optional reason (default: [ADMIN] Manual ban from dashboard)">
         </div>
+        <div class="toolbar-grid stack-label">
+          <div class="sub">Manual Unban</div>
+        </div>
         <div class="toolbar-grid">
           <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
           <button id="unbanManualBtn" class="btn primary">Unban IP</button>
         </div>
-        <div class="toolbar-grid">
+        <div class="toolbar-grid stack-label">
+          <div class="sub">Whitelist Management (allowed IP/CIDR)</div>
+        </div>
+        <div class="toolbar-grid dual-actions">
           <input id="manualWhitelist" class="ctrl search" placeholder="Enter IP or CIDR (example: 203.0.113.4 or 203.0.113.0/24)">
           <button id="addWhitelistBtn" class="btn cyan">Add Whitelist</button>
-        </div>
-        <div class="toolbar-grid">
-          <button id="removeWhitelistBtn" class="btn ghost">Remove Whitelist Entry</button>
+          <button id="removeWhitelistBtn" class="btn ghost">Remove From Whitelist</button>
         </div>
         <div class="action-grid">
           <button id="enforceSimBansBtn" class="btn primary" hidden>Apply Simulated Bans To Firewall</button>
@@ -3107,14 +3117,14 @@ function renderSummary(){
 function renderEvents(){
   var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
   var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var sort=$('#eventSort').value;
-  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat); });
+  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.asn_number,e.player_name].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat); });
   rows.sort(function(a,b){
     if(sort==='risk'){ return (b.risk_score||0)-(a.risk_score||0); }
     var ta=Date.parse(String(a.timestamp||'')); var tb=Date.parse(String(b.timestamp||''));
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td>'+(e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span>':'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
   var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
