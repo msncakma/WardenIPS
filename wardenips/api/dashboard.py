@@ -91,8 +91,6 @@ class DashboardAPI:
     self._app: Optional[web.Application] = None
     self._runner: Optional[web.AppRunner] = None
     self._api_key: str = ""
-    self._dashboard_username: str = "admin"
-    self._dashboard_password: str = ""
     self._session_ttl: int = 600
     self._login_rate_limit_per_minute: int = 10
     self._public_dashboard_enabled: bool = True
@@ -119,8 +117,6 @@ class DashboardAPI:
     self._host = dash.get("host", "127.0.0.1")
     self._port = dash.get("port", 7680)
     self._api_key = dash.get("api_key", "")
-    self._dashboard_username = dash.get("username", "admin")
-    self._dashboard_password = dash.get("password", "")
     self._session_ttl = max(int(dash.get("session_ttl", 600)), 60)
     self._login_rate_limit_per_minute = max(
       int(dash.get("login_rate_limit_per_minute", 10)),
@@ -138,17 +134,9 @@ class DashboardAPI:
   def enabled(self) -> bool:
     return self._enabled and _AIOHTTP_WEB_AVAILABLE
 
-  def _get_dashboard_secrets(self) -> set[str]:
-    # Legacy secret set used only for legacy username/password fallback.
-    return {value for value in (self._dashboard_password, self._api_key) if value}
-
   def _get_bearer_secrets(self) -> set[str]:
-    # Bearer auth should not accept dashboard.password.
     # Keep API key support for scripted clients.
     return {self._api_key} if self._api_key else set()
-
-  def _dashboard_auth_configured(self) -> bool:
-    return bool(self._get_dashboard_secrets())
 
   def _bootstrap_token_is_valid(self) -> bool:
     if not self._bootstrap_setup_required or not self._bootstrap_token_hash:
@@ -163,11 +151,9 @@ class DashboardAPI:
 
   async def _admin_auth_available(self) -> bool:
     try:
-      if await self._db.has_admin_users():
-        return True
+      return await self._db.has_admin_users()
     except Exception:
-      pass
-    return self._dashboard_auth_configured()
+      return False
 
   async def _use_database_auth(self) -> bool:
     try:
@@ -255,8 +241,6 @@ class DashboardAPI:
     return True
 
   def _touch_session(self, request: web.Request) -> bool:
-    if not self._dashboard_auth_configured():
-      return False
     token = self._get_session_token(request)
     if not token:
       return False
@@ -270,12 +254,6 @@ class DashboardAPI:
   def _get_session_actor(self, request: web.Request) -> Optional[str]:
     token = self._get_session_token(request)
     return self._session_users.get(token)
-
-  def _password_matches(self, candidate: str) -> bool:
-    return any(
-      hmac.compare_digest(candidate, secret)
-      for secret in self._get_dashboard_secrets()
-    )
 
   def _check_auth(self, request: web.Request) -> bool:
     if self._is_session_authenticated(request):
@@ -359,14 +337,6 @@ class DashboardAPI:
           "redirect_to": "/setup",
         },
         status=403,
-      )
-    if not self._dashboard_auth_configured():
-      return web.json_response(
-        {
-          "error": "auth_not_configured",
-          "message": "No admin user exists yet. Complete the first-boot setup or configure a legacy fallback secret.",
-        },
-        status=503,
       )
     return web.json_response({"error": "unauthorized"}, status=401)
 
@@ -769,11 +739,8 @@ class DashboardAPI:
     if self._is_session_authenticated(request):
       raise web.HTTPFound(next_path)
     auth_ready = await self._admin_auth_available()
-    using_database_auth = await self._use_database_auth()
     html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
-    html = html.replace("__USERNAME__", json.dumps(self._dashboard_username))
     html = html.replace("__AUTH_READY__", "true" if auth_ready else "false")
-    html = html.replace("__DB_AUTH__", "true" if using_database_auth else "false")
     html = html.replace(
       "__PUBLIC_DASHBOARD_ENABLED__",
       "true" if self._public_dashboard_enabled else "false",
@@ -781,7 +748,7 @@ class DashboardAPI:
     html = html.replace(
       "__SETUP_MESSAGE__",
       json.dumps(
-        "No admin user exists yet. Complete the first-boot setup or configure a legacy fallback secret."
+        "No admin user exists yet. Complete the first-boot setup flow and create an admin account."
       ),
     )
     html = self._render_ui_template(html)
@@ -823,42 +790,29 @@ class DashboardAPI:
       str(payload.get("next", "/dashboard")).strip() or "/dashboard",
       "/dashboard",
     )
-    use_database_auth = await self._use_database_auth()
     if not await self._admin_auth_available():
       return self._json_auth_error()
-    if use_database_auth:
-      user = await self._db.get_admin_user_by_username(username)
-      if not user or not verify_password(str(user.get("password_hash", "")), password):
-        await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "invalid_credentials"})
-        return web.json_response(
-          {"error": "invalid_credentials", "message": "Invalid username or password."},
-          status=401,
-        )
-      if int(user.get("totp_enabled", 0)):
-        pending_token = secrets.token_urlsafe(24)
-        self._pending_logins[pending_token] = {
-          "username": user["username"],
-          "next_path": next_path,
-          "expires_at": time.time() + 300,
-        }
-        return web.json_response({"ok": True, "requires_totp": True, "pending_token": pending_token})
-
-      response = web.json_response({"ok": True, "redirect_to": next_path})
-      self._issue_session(response, request, username=user["username"])
-      await self._db.record_admin_login(user["username"], client_ip)
-      await self._log_audit(request, "auth.login_success", actor_username=user["username"], details={"method": "password_only"})
-      return response
-
-    if username != self._dashboard_username or not self._password_matches(password):
-      await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "legacy_invalid_credentials"})
+    user = await self._db.get_admin_user_by_username(username)
+    if not user or not verify_password(str(user.get("password_hash", "")), password):
+      await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "invalid_credentials"})
       return web.json_response(
         {"error": "invalid_credentials", "message": "Invalid username or password."},
         status=401,
       )
 
+    if int(user.get("totp_enabled", 0)):
+      pending_token = secrets.token_urlsafe(24)
+      self._pending_logins[pending_token] = {
+        "username": user["username"],
+        "next_path": next_path,
+        "expires_at": time.time() + 300,
+      }
+      return web.json_response({"ok": True, "requires_totp": True, "pending_token": pending_token})
+
     response = web.json_response({"ok": True, "redirect_to": next_path})
-    self._issue_session(response, request, username=username or self._dashboard_username)
-    await self._log_audit(request, "auth.login_success", actor_username=username or self._dashboard_username, details={"method": "legacy_fallback"})
+    self._issue_session(response, request, username=user["username"])
+    await self._db.record_admin_login(user["username"], client_ip)
+    await self._log_audit(request, "auth.login_success", actor_username=user["username"], details={"method": "password_only"})
     return response
 
   async def _handle_login_totp(self, request: web.Request) -> web.Response:
@@ -1390,7 +1344,7 @@ button[disabled]{opacity:.65;cursor:wait}
     <div class="feature-list">
       <div class="feature"><strong>Scoped operations</strong><span>Firewall changes, ban maintenance, notification tests, and configuration editing stay behind the session boundary.</span></div>
       <div class="feature"><strong>Two-stage login</strong><span>Password verification can hand off to a TOTP challenge without exposing privileged routes.</span></div>
-      <div class="feature"><strong>Legacy fallback</strong><span>Existing installs can continue using config-based credentials until they migrate to managed admin users.</span></div>
+      <div class="feature"><strong>Managed identities</strong><span>Admin access is handled by managed users created during first-boot setup, with optional TOTP verification.</span></div>
     </div>
     <div class="quick-meta">
       <span>Route: /admin</span>
@@ -1444,16 +1398,14 @@ button[disabled]{opacity:.65;cursor:wait}
     <div id="guestActions" class="secondary-actions">
       <a class="button-link" href="/dashboard">View Dashboard Without Login</a>
     </div>
-    <div class="foot"><span>Default username: <span id="defaultUser"></span></span><span id="modeHint">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__</span></div>
+    <div class="foot"><span id="modeHint">WardenIPS v__APP_VERSION__ · by __APP_AUTHOR__</span></div>
   </div>
 </div>
 <script>
 (function(){
 'use strict';
 var nextPath = __NEXT_PATH__;
-var defaultUser = __USERNAME__;
 var authReady = __AUTH_READY__;
-var usingDbAuth = __DB_AUTH__;
 var publicDashboardEnabled = __PUBLIC_DASHBOARD_ENABLED__;
 var setupMessage = __SETUP_MESSAGE__;
 var typingTimer = null;
@@ -1465,9 +1417,8 @@ function clearMessage(){ var box = $('#message'); box.className = 'msg'; box.tex
 function rateLimitedInput(handler, wait){ return function(ev){ clearTimeout(typingTimer); typingTimer = setTimeout(function(){ handler(ev); }, wait); }; }
 function setPanel(name){ ['passwordPanel','totpPanel'].forEach(function(id){ $('#'+id).classList.toggle('active', id === name); }); }
 
-$('#defaultUser').textContent = defaultUser || 'admin';
-$('#username').value = defaultUser || 'admin';
-$('#modeHint').textContent = usingDbAuth ? 'Managed admin users are enabled.' : 'Legacy config credential fallback is active.';
+$('#username').value = 'admin';
+$('#modeHint').textContent = 'Managed admin users are enabled.';
 if(!publicDashboardEnabled){ $('#guestActions').hidden = true; }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message');
 if(flashMessage){
@@ -2513,10 +2464,6 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <label for="cfgLoginRate">Login Rate Limit / min</label>
               <input id="cfgLoginRate" class="config-input" type="number" min="1">
             </div>
-            <div class="config-field full">
-              <label for="cfgDashboardUser">Dashboard Username</label>
-              <input id="cfgDashboardUser" class="config-input" type="text" spellcheck="false">
-            </div>
           </div>
         </section>
         <section class="config-section">
@@ -2762,7 +2709,6 @@ function renderConfigStudio(){
   $('#cfgPublicDashboard').checked=!!getConfigValue('dashboard.public_dashboard',true);
   $('#cfgSessionTtl').value=String(getConfigValue('dashboard.session_ttl',600));
   $('#cfgLoginRate').value=String(getConfigValue('dashboard.login_rate_limit_per_minute',10));
-  $('#cfgDashboardUser').value=String(getConfigValue('dashboard.username','admin'));
   $('#cfgBanThreshold').value=String(getConfigValue('firewall.ban_threshold',70));
   $('#cfgBanDuration').value=String(getConfigValue('firewall.ipset.default_ban_duration',3600));
   $('#cfgTelegramEnabled').checked=!!getConfigValue('notifications.telegram.enabled',false);
@@ -2807,7 +2753,6 @@ async function saveConfigForm(){
     'dashboard.public_dashboard': $('#cfgPublicDashboard').checked,
     'dashboard.session_ttl': parseInt($('#cfgSessionTtl').value,10)||600,
     'dashboard.login_rate_limit_per_minute': parseInt($('#cfgLoginRate').value,10)||10,
-    'dashboard.username': $('#cfgDashboardUser').value.trim()||'admin',
     'firewall.ban_threshold': parseInt($('#cfgBanThreshold').value,10)||70,
     'firewall.ipset.default_ban_duration': parseInt($('#cfgBanDuration').value,10)||3600,
     'notifications.telegram.enabled': $('#cfgTelegramEnabled').checked,

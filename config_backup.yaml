@@ -22,19 +22,19 @@ database:
     path: "/var/lib/wardenips/warden.db" 
 
 asn_protection:
-  # Loyalsoldier/geoip kaynağından (GitHub'da ücretsiz) otomatik indirilen GeoLite2-ASN.mmdb kullanır.
-  # Üyelik gerektirmez — tamamen ücretsiz ve açık kaynak.
+  # Uses GeoLite2-ASN.mmdb downloaded automatically from Loyalsoldier/geoip on GitHub.
+  # No membership is required. It is fully free and open-source.
   enabled: true
   db_path: "/opt/wardenips/assets/GeoLite2-ASN.mmdb"
   auto_update_enabled: true     # Weekly automatic updates from GitHub (Thursdays)
-  # Suslu ASN'lerden gelen trafiği high-risk olarak işaretleme (risk puanını artır)
-  # Format: "AS<NUMBER>" (örn: AS16509 = Amazon) veya sadece numara (16509)
+  # Mark traffic from suspicious ASNs as high-risk (increases the risk score)
+  # Format: "AS<NUMBER>" (e.g., AS16509 = Amazon) or just the number (16509)
   suspicious_asns:
-    # Örnek: sıkça saldırı yapan bilinen datacenter ASN'leri
+    # Example: known datacenter ASNs frequently associated with attacks
     # - "AS16509"    # Amazon AWS
     # - "AS14061"    # DigitalOcean
     # - "AS20473"    # Vultr
-    # Kendi kurallarını eklemelisin!
+    # Add your own rules here.
 
 firewall:
   # Action to take when an IP reaches this risk score
@@ -61,8 +61,6 @@ dashboard:
   homepage: "dashboard"
   public_dashboard: true
   api_key: ""
-  username: "admin"
-  password: ""
   session_ttl: 600
   login_rate_limit_per_minute: 10
   bootstrap:

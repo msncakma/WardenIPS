@@ -116,8 +116,7 @@ Dashboard auth notes:
 - `/` follows `dashboard.homepage` and defaults to the public dashboard.
 - Set `dashboard.public_dashboard: true` to let guests view the overview without logging in.
 - The first managed admin account is stored in the selected backend and uses Argon2 password hashing plus TOTP verification.
-- `dashboard.username` and `dashboard.password` remain as a legacy fallback path for older installs that have not migrated yet.
-- If `dashboard.password` is empty, `dashboard.api_key` is accepted as a fallback login password for compatibility.
+- `dashboard.api_key` is supported for scripted API clients using Bearer authentication.
 - Login attempts are rate-limited server-side.
 - Admin sessions expire after 10 minutes of inactivity by default.
 - High-risk admin actions are written to the audit log backend.
