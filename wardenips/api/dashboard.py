@@ -2043,8 +2043,9 @@ button.admin-link{font:inherit;cursor:pointer}
 .desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
 .geo-map{position:relative;min-height:240px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
 .geo-grid{position:absolute;inset:0;z-index:1;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
-.geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.42}
-.geo-world path{fill:color-mix(in srgb,var(--cyan) 20%,transparent);stroke:color-mix(in srgb,var(--cyan) 44%,var(--bdr));stroke-width:1.2}
+.geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.32}
+.geo-world .land{fill:color-mix(in srgb,var(--cyan) 15%,transparent);stroke:color-mix(in srgb,var(--cyan) 26%,var(--bdr));stroke-width:1.1;stroke-linejoin:round}
+.geo-world .island{fill:color-mix(in srgb,var(--cyan) 13%,transparent);stroke:color-mix(in srgb,var(--cyan) 24%,var(--bdr));stroke-width:.9}
 .geo-point{position:absolute;z-index:3;transform:translate(-50%,-50%);border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 65%,white);background:color-mix(in srgb,var(--red) 42%,transparent);cursor:pointer;box-shadow:0 0 0 1px #00000033,0 0 18px color-mix(in srgb,var(--red) 45%,transparent)}
 .geo-point.is-new::after{content:'';position:absolute;inset:-6px;border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 72%,white);opacity:.8;animation:geoPulse 1.2s ease-out}
 @keyframes geoPulse{0%{transform:scale(.65);opacity:.9}100%{transform:scale(2.1);opacity:0}}
@@ -2139,14 +2140,19 @@ footer a:hover{text-decoration:underline}
       <div class="pb">
         <div id="geoMap" class="geo-map">
           <div class="geo-grid"></div>
-          <svg class="geo-world" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-hidden="true">
-            <path d="M108 206l24-34 46-23 34 5 25 33-14 40-50 17-22 31-36-6-20-28z"/>
-            <path d="M265 278l34-20 28 18 8 29-26 20-30-10-17-19z"/>
-            <path d="M400 166l38-42 67-7 47 14 40 34 57 4 46 24 23 30-13 28-44 5-56-11-44 12-59-12-53 8-42-26z"/>
-            <path d="M520 261l41 3 23 18-10 26-40 12-34-8-11-26z"/>
-            <path d="M715 184l56-31 60 8 45 30-8 34-39 14-54-12-40 10-30-20z"/>
-            <path d="M802 261l38-12 35 18-6 29-34 18-41-10-12-24z"/>
-            <path d="M846 355l40-10 27 20-17 31-43 8-23-19z"/>
+          <svg class="geo-world" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <path class="land" d="M113 209c8-24 33-47 63-57 29-10 57-8 76 6 17 13 30 34 27 53-3 17-22 29-43 38-19 8-31 22-38 40-8 20-24 30-46 29-22-1-39-12-49-30-11-21-1-50 10-79z"/>
+            <path class="land" d="M286 293c17-19 42-28 65-22 20 5 39 22 42 42 2 17-9 30-23 40-17 11-36 15-55 10-18-5-33-18-38-35-5-13 0-25 9-35z"/>
+            <path class="land" d="M403 171c24-32 63-52 105-53 42-2 84 13 115 37 26 20 52 16 79 30 20 11 38 30 40 51 1 19-16 34-37 42-24 10-49 9-74 4-25-5-48-2-71 7-25 10-52 11-78 4-30-8-61-7-88 2-22 8-42 8-61-4-19-12-29-31-25-50 4-27 18-49 35-70z"/>
+            <path class="land" d="M523 274c18-10 41-14 62-10 18 3 34 15 38 31 3 14-4 26-16 35-14 11-33 17-52 17-20 0-38-8-50-20-10-10-14-24-8-36 4-8 13-13 26-17z"/>
+            <path class="land" d="M714 180c26-23 62-38 101-38 37 0 73 13 99 35 22 20 28 43 14 62-13 18-37 28-64 31-24 2-46 6-67 17-22 11-45 13-66 7-21-6-35-20-41-39-7-27 1-55 24-75z"/>
+            <path class="land" d="M806 271c14-9 33-14 51-12 21 3 41 16 47 35 5 15-2 31-14 44-14 13-32 22-51 23-18 1-36-6-47-19-11-13-15-32-9-48 4-10 11-17 23-23z"/>
+            <path class="land" d="M845 366c12-9 29-14 44-12 16 1 31 10 36 24 6 16-2 34-16 47-15 14-34 20-50 16-16-4-29-17-31-33-2-15 4-31 17-42z"/>
+            <circle class="island" cx="678" cy="152" r="4.3"/>
+            <circle class="island" cx="696" cy="162" r="3.5"/>
+            <circle class="island" cx="739" cy="330" r="4.1"/>
+            <circle class="island" cx="773" cy="342" r="2.9"/>
+            <circle class="island" cx="885" cy="221" r="3.2"/>
           </svg>
         </div>
         <div class="geo-legend"><span>Low</span><div class="bar"></div><span>High</span></div>
