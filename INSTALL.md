@@ -1,6 +1,6 @@
 # WardenIPS — Installation & Configuration Guide
 
-**Version: 0.3.0-beta-2**
+**Version: 0.3.0-beta-3**
 
 Complete guide for deploying WardenIPS on a Linux server.
 
