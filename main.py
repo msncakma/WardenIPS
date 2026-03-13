@@ -23,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from wardenips import __author__, __version__
+from wardenips.core.auth import hash_bootstrap_token
 from wardenips.core.config import ConfigManager
 from wardenips.core.logger import setup_logging, get_logger
 from wardenips.core.whitelist import WhitelistManager
@@ -184,6 +185,7 @@ class WardenIPS:
             blocklist=self._blocklist,
         )
         if self._dashboard.enabled:
+            await self._auto_setup_bootstrap_if_needed()
             await self._dashboard.start()
 
         self._logger.info("")
@@ -193,6 +195,39 @@ class WardenIPS:
             len(self._plugin_manager.enabled_plugins),
         )
         self._logger.info("=" * 60)
+
+    async def _auto_setup_bootstrap_if_needed(self) -> None:
+        """If dashboard is enabled but no admin users exist and setup is not
+        already pending, automatically generate a one-time bootstrap token,
+        write it to config, and log it so the operator can complete first-boot
+        setup without re-running the installer."""
+        try:
+            if await self._db.has_admin_users():
+                return
+            bootstrap = self._config.get("dashboard.bootstrap", {}) or {}
+            if bootstrap.get("setup_required") and bootstrap.get("token_hash"):
+                return  # installer already prepared a token
+            import secrets
+            from datetime import datetime, timedelta, timezone
+            token = secrets.token_urlsafe(32)
+            token_hash = hash_bootstrap_token(token)
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(hours=24)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            await self._config.patch_values({
+                "dashboard.bootstrap.setup_required": True,
+                "dashboard.bootstrap.token_hash": token_hash,
+                "dashboard.bootstrap.token_expires_at": expires_at,
+            })
+            self._dashboard._initialize_config()
+            self._logger.warning("=" * 60)
+            self._logger.warning("  NO ADMIN USER FOUND — first-boot setup required")
+            self._logger.warning("  Open: http://%s:%d/setup", self._dashboard._host, self._dashboard._port)
+            self._logger.warning("  Bootstrap token: %s", token)
+            self._logger.warning("  Expires at: %s", expires_at)
+            self._logger.warning("=" * 60)
+        except Exception as exc:
+            self._logger.error("Failed to auto-generate bootstrap token: %s", exc)
 
     def _register_plugins(self) -> None:
         """Registers plugins according to the configuration."""
