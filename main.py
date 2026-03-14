@@ -182,6 +182,7 @@ class WardenIPS:
             whitelist=self._whitelist,
             notifier=self._notifier,
             blocklist=self._blocklist,
+            abuse_reporter=self._abuse_reporter,
         )
         if self._dashboard.enabled:
             await self._dashboard.start()

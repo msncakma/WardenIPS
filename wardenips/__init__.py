@@ -6,5 +6,5 @@ Linux tabanlı sunucular için botnet ve DDoS saldırılarını
 tespit edip otonom savunma yapan yüksek performanslı IPS yazılımı.
 """
 
-__version__ = "0.3.1-beta-3"
+__version__ = "0.3.1-beta-4"
 __author__ = "msncakma <3"

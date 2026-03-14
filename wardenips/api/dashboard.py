@@ -79,6 +79,7 @@ class DashboardAPI:
     whitelist=None,
     notifier=None,
     blocklist=None,
+    abuse_reporter=None,
   ) -> None:
     self._config = config
     self._db = db
@@ -87,6 +88,7 @@ class DashboardAPI:
     self._start_time = start_time
     self._notifier = notifier
     self._blocklist = blocklist
+    self._abuse_reporter = abuse_reporter
     self._enabled: bool = False
     self._host: str = "127.0.0.1"
     self._port: int = 7680
@@ -114,7 +116,7 @@ class DashboardAPI:
 
   def _initialize_config(self) -> None:
     dash = self._config.get_section("dashboard") if self._config.get("dashboard", None) else {}
-    if not dash:
+    if not dash or not isinstance(dash, dict):
       return
     self._enabled = dash.get("enabled", False)
     self._host = dash.get("host", "127.0.0.1")
@@ -319,6 +321,35 @@ class DashboardAPI:
       return "SUCCESS"
     return str(event.get("threat_level") or "NONE").upper()
 
+  @staticmethod
+  def _extract_event_port(event: dict, details_obj: Optional[dict] = None) -> Optional[str]:
+    details = details_obj if isinstance(details_obj, dict) else {}
+    if not details:
+      details_value = event.get("details")
+      if isinstance(details_value, dict):
+        details = details_value
+      elif isinstance(details_value, str) and details_value:
+        try:
+          details = json.loads(details_value)
+        except Exception:
+          details = {}
+
+    for key in ("port", "target_port", "destination_port", "dest_port", "dst_port", "remote_port"):
+      value = details.get(key) if isinstance(details, dict) else None
+      if value is None:
+        continue
+      text = str(value).strip()
+      if text:
+        return text
+
+    player_name = str(event.get("player_name") or "")
+    if player_name.startswith("port_"):
+      scanned = player_name.replace("port_", "", 1).strip()
+      if scanned:
+        return scanned
+
+    return None
+
   def _normalize_next_path(self, candidate: str, default: str = "/dashboard") -> str:
     value = str(candidate or "").strip()
     if not value.startswith("/") or value.startswith("//"):
@@ -499,6 +530,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
+    self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
     self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
     self._app.router.add_get("/api/admin/whitelist", self._handle_admin_get_whitelist)
     self._app.router.add_post("/api/admin/whitelist/add", self._handle_admin_add_whitelist)
@@ -617,6 +649,7 @@ class DashboardAPI:
         event["threat_label"] = self._get_event_threat_label(event)
         event["timestamp_unix"] = self._parse_timestamp_unix(event.get("timestamp"))
         event["operator_advice"] = self._build_operator_advice(event)
+        event["event_port"] = self._extract_event_port(event, details_obj)
       return web.json_response({"events": events, "count": len(events)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -1435,6 +1468,109 @@ class DashboardAPI:
       }
     )
 
+  async def _handle_admin_report_and_ban(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    ip_value = str(payload.get("ip", "")).strip()
+    if not ip_value:
+      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
+    try:
+      ipaddress.ip_address(ip_value)
+    except Exception:
+      return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
+
+    reason = str(payload.get("reason", "")).strip() or "[ADMIN] Report+Ban from dashboard"
+    risk_score_value = payload.get("risk_score", 100)
+    try:
+      risk_score = min(max(int(risk_score_value), 0), 100)
+    except Exception:
+      risk_score = 100
+
+    raw_categories = payload.get("categories", [14])
+    categories: list[int] = []
+    if isinstance(raw_categories, list):
+      for item in raw_categories:
+        try:
+          value = int(item)
+        except Exception:
+          continue
+        if 1 <= value <= 24 and value not in categories:
+          categories.append(value)
+    if not categories:
+      categories = [14]
+
+    ban_applied = await self._firewall.ban_ip(ip_value, duration=duration, reason=reason)
+    if ban_applied:
+      await self._db.log_ban(ip_value, reason, risk_score, duration)
+      await self._notifier.notify_ban(
+        ip=ip_value,
+        reason=reason,
+        risk=risk_score,
+        duration=duration,
+        plugin="admin",
+      )
+
+    reported = False
+    if self._abuse_reporter:
+      try:
+        reported = await self._abuse_reporter.report_ip(
+          ip=ip_value,
+          categories=categories,
+          comment=f"{reason} | Trigger: admin report+ban",
+        )
+      except Exception:
+        reported = False
+
+    await self._log_audit(
+      request,
+      "admin.report_and_ban",
+      actor_username=actor,
+      details={
+        "ip": ip_value,
+        "duration": duration,
+        "risk_score": risk_score,
+        "categories": categories,
+        "ban_applied": ban_applied,
+        "reported": reported,
+      },
+    )
+
+    if not ban_applied and not reported:
+      return web.json_response(
+        {
+          "ok": False,
+          "message": f"No action taken for {ip_value} (already banned, whitelisted, or reporter unavailable).",
+          "ban_applied": False,
+          "reported": False,
+        },
+        status=409,
+      )
+
+    result_parts: list[str] = []
+    result_parts.append("ban applied" if ban_applied else "ban skipped")
+    result_parts.append("reported" if reported else "report skipped")
+    return web.json_response(
+      {
+        "ok": True,
+        "message": f"{ip_value}: " + ", ".join(result_parts) + ".",
+        "ban_applied": ban_applied,
+        "reported": reported,
+      }
+    )
+
   async def _handle_admin_deactivate_ban(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
@@ -1757,6 +1893,7 @@ class DashboardAPI:
             "player_name": player_name,
             "connection_type": connection_type,
             "event_type": str(details_obj.get("event_type") or ""),
+            "event_port": self._extract_event_port({"player_name": player_name}, details_obj),
             "country_code": self._resolve_country_code(details_obj, source_ip),
             "asn_number": asn_number,
             "asn_org": asn_org,
@@ -2808,7 +2945,9 @@ function renderBlocklist(ti){
   if(ti&&ti.enabled&&ti.first_setup){
     var fs=ti.first_setup;
     $('#tip').textContent = fs.completed ? 'Completed' : (fs.remaining||fs.mode);
-    $('#tis').textContent = N(ti.active&&ti.active.total_ips_loaded ? ti.active.total_ips_loaded : 0);
+    var firstSetupCount=Number(fs.ips_loaded||0);
+    var activeCount=Number(ti.active&&ti.active.total_ips_loaded ? ti.active.total_ips_loaded : 0);
+    $('#tis').textContent = N(activeCount||firstSetupCount||0);
     $('#tir').textContent = ti.active&&ti.active.last_fetch_at ? ti.active.last_fetch_at.split('T')[0] : '--';
   } else {
     $('#tip').textContent = '--';
@@ -3030,7 +3169,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-field{min-width:0}
 .config-field label{white-space:normal;line-height:1.3}
 .config-input,.config-select{width:100%;min-width:0}
-.toolbar-grid.three{grid-template-columns:minmax(0,1fr) 120px 160px}
+.toolbar-grid.three{align-items:stretch;grid-template-columns:minmax(0,1fr) minmax(135px,170px) minmax(130px,170px)}
 .toolbar-grid.query-grid{grid-template-columns:170px minmax(0,1fr) 150px}
 .toolbar-grid.dual-actions{grid-template-columns:minmax(0,1fr) auto auto}
 .toolbar-grid.stack-label{margin-bottom:6px}
@@ -3056,6 +3195,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .advanced-wrap{margin-top:2px}
 @media(max-width:1280px){.config-sections{column-count:2}}
 @media(max-width:900px){.config-sections{column-count:1}}
+@media(max-width:1180px){.toolbar-grid.three{grid-template-columns:minmax(0,1fr) minmax(135px,170px)}.toolbar-grid.three button{grid-column:1/-1}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
 @media(max-width:680px){.toolbar-grid.query-grid{grid-template-columns:1fr}}
 @media(max-width:980px){.action-center-grid{grid-template-columns:1fr}.intel-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -3454,6 +3594,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div class="metric"><div class="k">Active Ban Rows</div><div class="v" id="ipDetailActiveBanCount">0</div></div>
         <div class="metric"><div class="k">Firewall</div><div class="v" id="ipDetailFirewallState">--</div></div>
       </div>
+      <div class="toolbar-grid dual-actions" style="margin-top:10px">
+        <button id="ipDetailToggleBanBtn" class="btn warn" type="button">Ban This IP</button>
+        <button id="ipDetailReportBanBtn" class="btn cyan" type="button">Report + Ban</button>
+      </div>
       <div class="toolbar-grid stack-label" style="margin-top:10px">
         <div class="sub">Recent Logs For This IP</div>
       </div>
@@ -3483,7 +3627,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false};
+var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:''};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -3541,6 +3685,75 @@ function parsePortList(value){
     seen[num]=true;
     return true;
   }).map(function(item){ return parseInt(item,10); });
+}
+function detectPortFromEvent(event){
+  if(!event){ return ''; }
+  var candidates=['event_port','port','target_port','destination_port','dest_port','dst_port','remote_port'];
+  for(var i=0;i<candidates.length;i++){
+    var key=candidates[i];
+    if(event[key]!==undefined&&event[key]!==null&&String(event[key]).trim()){ return String(event[key]).trim(); }
+  }
+  var details=event.details;
+  if(typeof details==='string'&&details.trim()){
+    try{ details=JSON.parse(details); }catch(error){ details={}; }
+  }
+  if(details&&typeof details==='object'){
+    for(var j=0;j<candidates.length;j++){
+      var dkey=candidates[j];
+      if(details[dkey]!==undefined&&details[dkey]!==null&&String(details[dkey]).trim()){ return String(details[dkey]).trim(); }
+    }
+  }
+  var pname=String(event.player_name||'');
+  if(pname.indexOf('port_')===0){ return pname.slice(5).trim(); }
+  return '';
+}
+function isIpBannedInFirewall(ip){
+  var needle=String(ip||'').trim();
+  if(!needle){ return false; }
+  return (state.firewall||[]).some(function(item){ return String(item.ip||'').trim()===needle; });
+}
+function syncIpDetailActionButtons(){
+  var ip=String(state.ipDetailIp||'').trim();
+  var toggleBtn=$('#ipDetailToggleBanBtn');
+  var reportBtn=$('#ipDetailReportBanBtn');
+  if(!toggleBtn||!reportBtn){ return; }
+  if(!ip){
+    toggleBtn.disabled=true;
+    reportBtn.disabled=true;
+    toggleBtn.textContent='Ban This IP';
+    return;
+  }
+  var active=isIpBannedInFirewall(ip);
+  toggleBtn.disabled=false;
+  reportBtn.disabled=false;
+  toggleBtn.dataset.mode=active?'unban':'ban';
+  toggleBtn.textContent=active?'Unban This IP':'Ban This IP';
+}
+async function runIpDetailToggleBan(){
+  var ip=String(state.ipDetailIp||'').trim();
+  if(!ip){ return; }
+  var active=isIpBannedInFirewall(ip);
+  handleUserActivity();
+  if(active){
+    if(!confirm('Remove this IP from firewall bans?')){ return; }
+    var ok=await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); });
+    if(ok){ await openIpDetailModal(ip); }
+    return;
+  }
+  var duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10);
+  if(!Number.isFinite(duration)||duration<0){ duration=0; }
+  var ok=await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:'[ADMIN] Ban from IP detail modal'}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); });
+  if(ok){ await openIpDetailModal(ip); }
+}
+async function runIpDetailReportAndBan(){
+  var ip=String(state.ipDetailIp||'').trim();
+  if(!ip){ return; }
+  if(!confirm('Report and ban this IP now?')){ return; }
+  var duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10);
+  if(!Number.isFinite(duration)||duration<0){ duration=0; }
+  handleUserActivity();
+  var ok=await performAction('/api/admin/report-and-ban', {ip:ip, duration:duration, reason:'[ADMIN] Report+Ban from IP detail modal'}, 'Report + ban completed', function(payload){ return payload.message || ('Processed report+ban for '+ip+'.'); });
+  if(ok){ await openIpDetailModal(ip); }
 }
 function syncPortscanIgnoredPortsField(){ $('#cfgPortscanIgnoredPorts').value=(state.portscanIgnoredPorts||[]).join(','); }
 function renderPortscanIgnoredPortChips(){
@@ -3677,7 +3890,7 @@ function renderEvents(){
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'; var pluginName=String((e.connection_type||'unknown')).toUpperCase(); var port=detectPortFromEvent(e); var pluginLabel=(port&&String(e.connection_type||'').toLowerCase()==='portscan')?(pluginName+' · Port '+port):pluginName; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E(pluginLabel)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderWhitelistSnapshot(){
   var target=$('#whitelistRows');
@@ -3702,6 +3915,7 @@ async function loadWhitelist(){
 }
 function closeIpDetailModal(){
   state.ipDetailOpen=false;
+  state.ipDetailIp='';
   $('#ipDetailModal').hidden=true;
   document.body.style.overflow='';
 }
@@ -3709,6 +3923,7 @@ async function openIpDetailModal(ip){
   var sourceIp=String(ip||'').trim();
   if(!sourceIp){ return; }
   state.ipDetailOpen=true;
+  state.ipDetailIp=sourceIp;
   $('#ipDetailTitle').textContent='IP Activity: '+sourceIp;
   $('#ipDetailMeta').textContent='Loading recent records for this source...';
   $('#ipIntelAddress').textContent=sourceIp;
@@ -3724,6 +3939,7 @@ async function openIpDetailModal(ip){
   $('#ipDetailActiveBanCount').textContent='0';
   $('#ipDetailFirewallState').textContent='--';
   $('#ipDetailRows').innerHTML='<tr><td colspan="5" class="empty">Loading...</td></tr>';
+  syncIpDetailActionButtons();
   $('#ipDetailModal').hidden=false;
   document.body.style.overflow='hidden';
 
@@ -3742,11 +3958,12 @@ async function openIpDetailModal(ip){
   var eventRows=records.filter(function(r){ return r&&r.kind==='event'; });
   var banRows=records.filter(function(r){ return r&&r.kind==='ban'; });
   var activeBanCount=banRows.filter(function(r){ return !!r.is_active; }).length;
-  var firewallState=(state.firewall||[]).some(function(item){ return String(item.ip||'').trim()===sourceIp; }) ? 'Active' : 'Not active';
+  var firewallState=isIpBannedInFirewall(sourceIp) ? 'Active' : 'Not active';
   $('#ipDetailEventCount').textContent=N(eventRows.length);
   $('#ipDetailBanCount').textContent=N(banRows.length);
   $('#ipDetailActiveBanCount').textContent=N(activeBanCount);
   $('#ipDetailFirewallState').textContent=firewallState;
+  syncIpDetailActionButtons();
 
   var firstSeen='-';
   var lastSeen='-';
@@ -3808,6 +4025,10 @@ async function openIpDetailModal(ip){
     var plugin=String(row.connection_type||'-').toUpperCase();
     var eventType=String(row.event_type||'').toUpperCase();
     var pluginText=eventType?plugin+' / '+eventType:plugin;
+    var eventPort=detectPortFromEvent(row);
+    if(eventPort && String(row.connection_type||'').toLowerCase()==='portscan'){
+      pluginText += ' · Port '+eventPort;
+    }
     var threat=String(row.threat_level||'-').toUpperCase();
     return '<tr><td>'+ago(row.timestamp)+'</td><td><span class="row-kind event">EVENT</span></td><td>'+E(pluginText)+'</td><td>'+E(threat)+'</td><td>'+E(String(row.risk_score||0))+'</td></tr>';
   }).join('');
@@ -3838,7 +4059,8 @@ function renderQueryResults(rows){
     if(r.kind==='ban'){
       details=E((r.reason||'-')+' · '+(r.ban_duration&&r.ban_duration>0?(''+r.ban_duration+'s'):'Permanent')+' · '+(r.is_active?'Active':'Inactive'));
     }else{
-      var bits=[r.connection_type||'-', r.event_type||'', r.player_name||'', r.asn_org||''];
+      var port=detectPortFromEvent(r);
+      var bits=[r.connection_type||'-', r.event_type||'', port?('port '+port):'', r.player_name||'', r.asn_org||''];
       details=E(bits.filter(function(v){ return !!v; }).join(' · ')||'-');
     }
     return '<tr><td>'+E(kind)+'</td><td>'+E(ts)+'</td><td class="mono">'+ip+'</td><td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+details+'">'+details+'</td><td>'+E(String(r.risk_score||0))+'</td></tr>';
@@ -3886,7 +4108,7 @@ async function loadAuthSettings(){
   state.authSettings={ username:String(payload.username||''), totp_enabled:!!payload.totp_enabled };
   renderAuthSettings();
 }
-function renderBlocklistAdmin(){ var bl=state.blocklist; if(!bl||!bl.enabled){ $('#meshList').innerHTML='<div class="empty">Blocklist protection is disabled.</div>'; return; } var items=[]; if(bl.first_setup){ items.push('<div class="list-item"><strong>First Setup ('+E(bl.first_setup.mode)+')</strong><div class="sub">Status: '+(bl.first_setup.completed?'Completed':'Active — '+E(bl.first_setup.remaining||'unknown')+' remaining')+' · IPs loaded: '+N(bl.first_setup.ips_loaded||0)+'</div></div>'); } if(bl.active){ items.push('<div class="list-item"><strong>Active Blocklist</strong><div class="sub">Total IPs loaded: '+N(bl.active.total_ips_loaded||0)+' · Last fetch: '+ago(bl.active.last_fetch_at)+' · Last count: '+N(bl.active.last_fetch_count||0)+'</div></div>'); } if(bl.last_error){ items.push('<div class="list-item"><strong>Last Error</strong><div class="sub">'+E(bl.last_error)+'</div></div>'); } $('#meshList').innerHTML=items.join('')||'<div class="empty">Blocklist enabled, awaiting first fetch.</div>'; }
+function renderBlocklistAdmin(){ var bl=state.blocklist; if(!bl||!bl.enabled){ $('#meshList').innerHTML='<div class="empty">Blocklist protection is disabled.</div>'; return; } var items=[]; if(bl.first_setup){ var fsLoaded=Number(bl.first_setup.ips_loaded||0); var activeLoaded=Number(bl.active&&bl.active.total_ips_loaded||0); var loadedLabel=fsLoaded>0?N(fsLoaded):(activeLoaded>0?('0 (initial pass) · active list '+N(activeLoaded)):'0'); items.push('<div class="list-item"><strong>First Setup ('+E(bl.first_setup.mode)+')</strong><div class="sub">Status: '+(bl.first_setup.completed?'Completed':'Active — '+E(bl.first_setup.remaining||'unknown')+' remaining')+' · IPs loaded: '+loadedLabel+'</div></div>'); } if(bl.active){ items.push('<div class="list-item"><strong>Active Blocklist</strong><div class="sub">Total IPs loaded: '+N(bl.active.total_ips_loaded||0)+' · Last fetch: '+ago(bl.active.last_fetch_at)+' · Last count: '+N(bl.active.last_fetch_count||0)+'</div></div>'); } if(bl.last_error){ items.push('<div class="list-item"><strong>Last Error</strong><div class="sub">'+E(bl.last_error)+'</div></div>'); } $('#meshList').innerHTML=items.join('')||'<div class="empty">Blocklist enabled, awaiting first fetch.</div>'; }
 function renderConfigStudio(){
   $('#cfgLogLevel').value=String(getConfigValue('general.log_level','INFO'));
   $('#cfgAnalysisInterval').value=String(getConfigValue('general.analysis_interval',5));
@@ -4010,6 +4232,8 @@ function bind(){
   $('#configSectionSearch').addEventListener('input', function(){ debounce('config-search', filterConfigSections, 120); });
   $('#closeConfigBtn').addEventListener('click', function(){ closeConfigModal(); });
   $('#closeIpDetailBtn').addEventListener('click', function(){ closeIpDetailModal(); });
+  $('#ipDetailToggleBanBtn').addEventListener('click', async function(){ await runIpDetailToggleBan(); });
+  $('#ipDetailReportBanBtn').addEventListener('click', async function(){ await runIpDetailReportAndBan(); });
   $('#configModal').addEventListener('click', function(ev){ if(ev.target===this){ closeConfigModal(); } });
   $('#ipDetailModal').addEventListener('click', function(ev){ if(ev.target===this){ closeIpDetailModal(); } });
   document.addEventListener('keydown', function(ev){ if(ev.key==='Escape' && !$('#configModal').hidden){ closeConfigModal(); } if(ev.key==='Escape' && !$('#ipDetailModal').hidden){ closeIpDetailModal(); } });
