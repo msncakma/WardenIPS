@@ -706,10 +706,13 @@ class DashboardAPI:
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     limit = min(int(request.query.get("limit", "10")), 100)
+    hours = max(int(request.query.get("hours", "0")), 0)
     try:
+      time_clause = "AND COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
+      time_params: list = [f"-{hours}"] if hours > 0 else []
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT
                CASE
                  WHEN player_name LIKE 'port_%' THEN substr(player_name, 6)
@@ -719,12 +722,13 @@ class DashboardAPI:
                MAX(timestamp) AS last_seen
           FROM connection_events
           WHERE connection_type = 'portscan'
+          {time_clause}
           GROUP BY scanned_port
           HAVING scanned_port <> ''
           ORDER BY scan_count DESC, last_seen DESC
           LIMIT ?
           """,
-          (limit,),
+          tuple(time_params + [limit]),
         ) as cursor:
           rows = await cursor.fetchall()
           ports = [
@@ -735,7 +739,7 @@ class DashboardAPI:
             }
             for row in rows
           ]
-      return web.json_response({"ports": ports, "count": len(ports)})
+      return web.json_response({"ports": ports, "count": len(ports), "hours": hours})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -766,19 +770,24 @@ class DashboardAPI:
     """Top countries (if present in event details) and ASN organizations."""
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
+    hours = max(int(request.query.get("hours", "0")), 0)
     try:
+      time_clause = "AND COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
+      time_params: list = [f"-{hours}"] if hours > 0 else []
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT COALESCE(asn_org, 'Unknown') as org,
                COUNT(*) as count,
                SUM(CASE WHEN is_suspicious_asn=1 THEN 1 ELSE 0 END) as suspicious_count
           FROM connection_events
           WHERE asn_org IS NOT NULL
+          {time_clause}
           GROUP BY asn_org
           ORDER BY count DESC
           LIMIT 20
-          """
+          """,
+          tuple(time_params),
         ) as cursor:
           rows = await cursor.fetchall()
           orgs = [{"org": r[0], "count": r[1], "suspicious": r[2]} for r in rows]
@@ -786,12 +795,15 @@ class DashboardAPI:
       # Country values are optional and inferred from event details JSON.
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT source_ip, details
           FROM connection_events
+          WHERE 1=1
+          {time_clause}
           ORDER BY id DESC
           LIMIT 5000
-          """
+          """,
+          tuple(time_params),
         ) as cursor:
           rows = await cursor.fetchall()
 
@@ -2791,7 +2803,7 @@ footer a:hover{text-decoration:underline}
 
   <div class="pn">
     <div class="pl fw ai d2">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Recent Events</h2><span class="pill" id="ec">0</span></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Recent Events</h2><span class="pill" id="ec">0</span><button id="evBannedToggle" style="margin-left:auto;font-size:.7rem;font-weight:700;padding:.2rem .6rem;border-radius:8px;border:1px solid var(--bdr);background:color-mix(in srgb,var(--warn) 18%,var(--card-h));color:var(--warn);cursor:pointer" title="Toggle events from already-banned IPs">Hide Banned IPs</button></div>
       <div class="pb" style="max-height:400px">
         <table class="t" id="evt"><thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>User</th><th>Origin</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead><tbody id="evb"></tbody></table>
         <div class="em" id="eve" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><div>No events recorded yet</div></div>
@@ -2802,18 +2814,18 @@ footer a:hover{text-decoration:underline}
       <div class="pb"><div class="cb" id="thc"></div></div>
     </div>
     <div class="pl ai d4">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>Top Countries</h2></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>Top Countries</h2><select id="coTimeRange" style="margin-left:auto;font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
       <div class="pb"><div class="cb" id="coc"></div></div>
     </div>
     <div class="pl ai d3">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span><select id="atTimeRange" style="margin-left:auto;font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
       <div class="pb"><div class="cb" id="atc"></div></div>
     </div>
     <div class="pl ai d4">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/></svg>Plugins</h2></div>
       <div class="pb"><div class="cb" id="plc"></div></div>
     </div>
-    <div class="pl fw ai d3" hidden aria-hidden="true">
+    <div class="pl fw ai d3">
       <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2c3 3 4.5 6.5 4.5 10S15 19 12 22c-3-3-4.5-6.5-4.5-10S9 5 12 2z"/></svg>Attack Heatmap (Public)</h2></div>
       <div class="pb">
         <div id="geoMap" class="geo-map">
@@ -2912,6 +2924,9 @@ function CF(c){
 var CC=['c0','c1','c2','c3','c4','c5'];
 var GEO_COUNTS={};
 var GEO_SEEN=false;
+var evShowBanned=true;
+var lastBannedIpSet=new Set();
+var lastEvData=[];
 var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
   var next=theme==='light'?'light':'dark';
@@ -3013,16 +3028,48 @@ function renderGeoHeatmap(payload){
   meta.textContent='Showing '+valid.length+' countries from the last '+(payload.hours||24)+'h. Click a point for details.';
 }
 
+function renderEventsTable(events){
+  var etb=$('#evb'),ee=$('#eve'),ep=$('#ec');
+  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !lastBannedIpSet.has(e.source_ip); });
+  if(!eventsToShow.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0';return;}
+  ee.style.display='none';ep.textContent=eventsToShow.length;
+  etb.innerHTML=eventsToShow.map(function(e){
+    var pl=(e.connection_type||'unknown').toUpperCase();
+    var tc=e.threat_level;
+    var tcl=tc==='HIGH'||tc==='CRITICAL'?'tg-H':tc==='MEDIUM'?'tg-M':tc==='LOW'?'tg-L':'tg-N';
+    var advice=e.operator_advice||'No specific operator advice for this event.';
+    var cc=(e.country_code||'').toUpperCase();
+    var origin=cc?CF(cc)+' '+cc:'-';
+    var bannedMark=lastBannedIpSet.has(e.source_ip)?'<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BAN</span>':'';
+    return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;'+bannedMark+'</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
+  }).join('');
+}
+async function refreshCountry(){
+  var hours=parseInt(($('#coTimeRange')||{value:'24'}).value,10)||0;
+  var co=await A('/api/asn-stats'+(hours>0?'?hours='+hours:''));
+  var countryItems=co&&co.countries?co.countries.filter(function(item){
+    var code=String((item&&item.country)||'').toUpperCase();
+    return code && code!=='ZZ';
+  }):null;
+  bars('coc',countryItems,'country','count',2);
+}
+async function refreshTopPorts(){
+  var hours=parseInt(($('#atTimeRange')||{value:'24'}).value,10)||0;
+  var at=await A('/api/top-portscanned-ports?limit=10'+(hours>0?'&hours='+hours:''));
+  var ap=$('#ac');
+  if(at&&at.ports){ap.textContent=at.ports.length;
+    var ait=at.ports.map(function(p){return{label:'Port '+String(p.port||'-'),count:p.scan_count||0}});
+    bars('atc',ait,'label','count',1)}
+  else{ap.textContent='0';bars('atc',[],'label','count',1)}
+}
 async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
   var bn=await A('/api/bans');
   var ev=await A('/api/events?limit=50');
   var tl=await A('/api/events-timeline?hours=24');
-  var co=await A('/api/asn-stats');
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
-  var at=await A('/api/top-portscanned-ports?limit=10');
   var ti=await A('/api/blocklist');
   var gh=await A('/api/geo-heatmap?hours=24');
 
@@ -3047,7 +3094,8 @@ async function refresh(){
     else{bd.className='bdg bdg-live';bd.innerHTML='<span class="dot"></span>LIVE'}
   }
 
-  // Bans Table
+  // Bans Table — track banned IPs for the toggle filter
+  lastBannedIpSet=new Set((bn&&bn.bans?bn.bans:[]).map(function(b){ return b.source_ip; }));
   var btb=$('#bnb'),be=$('#bne'),bp=$('#bc');
   if(!bn||!bn.bans||!bn.bans.length){btb.innerHTML='';be.style.display='block';bp.textContent='0'}
   else{be.style.display='none';bp.textContent=bn.count;
@@ -3056,18 +3104,8 @@ async function refresh(){
     }).join('')}
 
   // Events Table
-  var etb=$('#evb'),ee=$('#eve'),ep=$('#ec');
-  if(!ev||!ev.events||!ev.events.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0'}
-  else{ee.style.display='none';ep.textContent=ev.count;
-    etb.innerHTML=ev.events.map(function(e){
-      var pl=(e.connection_type||'unknown').toUpperCase();
-      var tc=e.threat_level;
-      var tcl=tc==='HIGH'||tc==='CRITICAL'?'tg-H':tc==='MEDIUM'?'tg-M':tc==='LOW'?'tg-L':'tg-N';
-      var advice=e.operator_advice||'No specific operator advice for this event.';
-      var cc=(e.country_code||'').toUpperCase();
-      var origin=cc?CF(cc)+' '+cc:'-';
-      return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
-    }).join('')}
+  lastEvData=ev&&ev.events?ev.events:[];
+  renderEventsTable(lastEvData);
 
   // Timeline
   var tc2=$('#tlc'),tl2=$('#tll');
@@ -3097,21 +3135,13 @@ async function refresh(){
   else bars('thc',[],'level','count',0);
 
   // Country
-  var countryItems=co&&co.countries?co.countries.filter(function(item){
-    var code=String((item&&item.country)||'').toUpperCase();
-    return code && code!=='ZZ';
-  }):null;
-  bars('coc',countryItems,'country','count',2);
+  await refreshCountry();
 
   // Plugins
   bars('plc',pg?pg.plugins:null,'plugin','count',3);
 
   // Top scanned ports
-  var ap=$('#ac');
-  if(at&&at.ports){ap.textContent=at.ports.length;
-    var ait=at.ports.map(function(p){return{label:'Port '+String(p.port||'-'),count:p.scan_count||0}});
-    bars('atc',ait,'label','count',1)}
-  else{ap.textContent='0';bars('atc',[],'label','count',1)}
+  await refreshTopPorts();
 
   renderBlocklist(ti);
   renderGeoHeatmap(gh);
@@ -3121,6 +3151,15 @@ initTheme();
 $('#themeToggle').addEventListener('click',function(){
   applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
 });
+$('#evBannedToggle').addEventListener('click',function(){
+  evShowBanned=!evShowBanned;
+  this.textContent=evShowBanned?'Hide Banned IPs':'Show Banned IPs';
+  this.style.background=evShowBanned?'color-mix(in srgb,var(--warn) 18%,var(--card-h))':'color-mix(in srgb,var(--grn) 18%,var(--card-h))';
+  this.style.color=evShowBanned?'var(--warn)':'var(--grn)';
+  renderEventsTable(lastEvData);
+});
+$('#coTimeRange').addEventListener('change',function(){ refreshCountry(); });
+$('#atTimeRange').addEventListener('change',function(){ refreshTopPorts(); });
 refresh();
 setInterval(refresh,R);
 })();
@@ -3165,10 +3204,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-section:hover{transform:translateY(-1px);border-color:color-mix(in srgb,var(--accent) 45%,var(--b));box-shadow:0 14px 28px #00000022}
 .config-section h3{display:flex;align-items:center;justify-content:space-between}
 .config-section h3::after{content:'Section';font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:3px 7px;border:1px solid var(--b);border-radius:999px;background:var(--surface2)}
-.config-grid{grid-template-columns:repeat(2,minmax(150px,1fr))}
-.config-field{min-width:0}
-.config-field label{white-space:normal;line-height:1.3}
-.config-input,.config-select{width:100%;min-width:0}
+.config-grid{grid-template-columns:repeat(2,minmax(180px,1fr));gap:14px 16px}
+.config-field{min-width:0;padding:0}
+.config-field label{white-space:normal;line-height:1.4;font-size:.8rem;margin-bottom:4px}
+.config-input,.config-select{width:100%;min-width:0;padding:10px 14px;min-height:40px}
 .toolbar-grid.three{align-items:stretch;grid-template-columns:minmax(0,1fr) minmax(135px,170px) minmax(130px,170px)}
 .toolbar-grid.query-grid{grid-template-columns:170px minmax(0,1fr) 150px}
 .toolbar-grid.dual-actions{grid-template-columns:minmax(0,1fr) auto auto}
@@ -3411,7 +3450,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
       <div class="card"><h2>Blocklist Protection</h2><div class="list" id="meshList"></div></div>
-      <div class="card"><h2>Top Portscanned Ports</h2><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
+      <div class="card"><h2>Top Portscanned Ports</h2><div class="toolbar" style="margin-bottom:8px"><select id="adminAtTimeRange" class="ctrl" style="font-size:.78rem;padding:6px 10px"><option value="0">All Time</option><option value="24" selected>Last 24h</option><option value="72">Last 3 Days</option><option value="168">Last 7 Days</option><option value="720">Last 30 Days</option></select></div><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
     </div>
   </div>
 
@@ -4215,7 +4254,9 @@ function renderAdvice(){
 function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort(); select.innerHTML='<option value="">All Plugins</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 function syncCountryFilter(){ var select=$('#eventCountryFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return String(e.country_code||'').toUpperCase(); }).filter(function(v){ return v && v!=='ZZ'; }))).sort(); select.innerHTML='<option value="">All Countries</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v)+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 async function refresh(){
-  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-portscanned-ports?limit=12'),api('/api/blocklist')]);
+  var adminPortsHours=parseInt(($('#adminAtTimeRange')||{value:'24'}).value,10)||0;
+  var portsQuery='/api/top-portscanned-ports?limit=12'+(adminPortsHours>0?'&hours='+adminPortsHours:'');
+  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api(portsQuery),api('/api/blocklist')]);
   if(results.some(function(item){ return item===null; })){ return; }
   state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.topPorts=results[5]&&results[5].ports?results[5].ports:[]; state.blocklist=results[6]||null;
   syncPluginFilter(); syncCountryFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderTopPortscannedPorts(); renderBlocklistAdmin(); renderAdvice();
@@ -4241,6 +4282,7 @@ function bind(){
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
   $('#topPortsToggleBtn').addEventListener('click', function(){ state.topPortsExpanded=!state.topPortsExpanded; renderTopPortscannedPorts(); });
+    $('#adminAtTimeRange').addEventListener('change', function(){ handleUserActivity(); refresh(); });
   $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
   $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
   $('#saveAdminTotpBtn').addEventListener('click', async function(){
