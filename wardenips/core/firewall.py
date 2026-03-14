@@ -360,9 +360,11 @@ class FirewallManager:
                 "-exist",
             )
         else:
-            # Kalici ban (timeout 0)
+            # Explicitly set timeout 0 so permanent bans do not inherit
+            # the set-level default timeout.
             success = await self._exec_command(
                 self._ipset_cmd, "add", target_set, ip_str,
+                "timeout", "0",
                 "-exist",
             )
 
