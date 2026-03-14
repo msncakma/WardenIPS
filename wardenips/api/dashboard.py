@@ -1757,6 +1757,7 @@ class DashboardAPI:
             "player_name": player_name,
             "connection_type": connection_type,
             "event_type": str(details_obj.get("event_type") or ""),
+            "country_code": self._resolve_country_code(details_obj, source_ip),
             "asn_number": asn_number,
             "asn_org": asn_org,
             "risk_score": risk_score,
@@ -3035,6 +3036,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .toolbar-grid.stack-label{margin-bottom:6px}
 .ip-link-btn{all:unset;cursor:pointer;color:var(--blue);text-decoration:underline;text-underline-offset:2px;font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}
 .ip-link-btn:hover{color:color-mix(in srgb,var(--blue) 70%,white)}
+.action-center-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.action-panel{padding:12px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}
+.action-panel .toolbar-grid:last-child{margin-bottom:0}
+.intel-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.intel-item{padding:10px;border:1px solid var(--b);border-radius:12px;background:var(--surface)}
+.intel-item .k{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.intel-item .v{display:block;font-size:.84rem;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chip-editor{display:flex;flex-wrap:wrap;gap:8px;min-height:42px;padding:8px 10px;border:1px solid var(--b);border-radius:12px;background:var(--surface2)}
 .chip-editor.empty::before{content:'No ignored ports';color:var(--muted);font-size:.78rem}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;background:color-mix(in srgb,var(--blue) 20%,var(--surface));border:1px solid color-mix(in srgb,var(--blue) 40%,var(--b));font-size:.78rem}
@@ -3046,6 +3054,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 @media(max-width:900px){.config-sections{column-count:1}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
 @media(max-width:680px){.toolbar-grid.query-grid{grid-template-columns:1fr}}
+@media(max-width:980px){.action-center-grid{grid-template-columns:1fr}.intel-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.intel-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -3138,70 +3148,74 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card">
         <h2>Action Center</h2>
-        <div class="toolbar-grid stack-label">
-          <div class="sub">Manual Ban</div>
+        <div class="action-center-grid">
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Manual Ban</div></div>
+            <div class="toolbar-grid three">
+              <input id="manualBanIp" class="ctrl search" placeholder="Enter an IP address to ban manually">
+              <input id="manualBanDuration" class="ctrl" type="number" min="0" value="0" placeholder="Duration (sec, 0=permanent)">
+              <button id="banManualBtn" class="btn warn">Ban IP</button>
+            </div>
+            <div class="toolbar-grid">
+              <input id="manualBanReason" class="ctrl search" placeholder="Optional reason (default: [ADMIN] Manual ban from dashboard)">
+            </div>
+            <div class="toolbar-grid stack-label"><div class="sub">Manual Unban</div></div>
+            <div class="toolbar-grid">
+              <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
+              <button id="unbanManualBtn" class="btn primary">Unban IP</button>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Whitelist Management (allowed IP/CIDR)</div></div>
+            <div class="toolbar-grid dual-actions">
+              <input id="manualWhitelist" class="ctrl search" placeholder="Enter IP or CIDR (example: 203.0.113.4 or 203.0.113.0/24)">
+              <button id="addWhitelistBtn" class="btn cyan">Add Whitelist</button>
+              <button id="removeWhitelistBtn" class="btn ghost">Remove From Whitelist</button>
+            </div>
+            <div class="toolbar-grid stack-label" style="margin-top:-2px">
+              <div class="sub">Current Whitelist Entries</div>
+              <button id="refreshWhitelistBtn" class="btn ghost">Refresh List</button>
+            </div>
+            <div class="table-wrap" style="max-height:220px">
+              <table>
+                <thead><tr><th>Type</th><th>Entry</th></tr></thead>
+                <tbody id="whitelistRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Record Query (IP / ASN / Username)</div></div>
+            <div class="toolbar-grid query-grid">
+              <select id="queryField" class="ctrl">
+                <option value="auto">Auto Detect</option>
+                <option value="ip">IP</option>
+                <option value="asn">ASN</option>
+                <option value="user">Username</option>
+              </select>
+              <input id="queryValue" class="ctrl search" placeholder="Example: 203.0.113.4, AS15169, notch">
+              <button id="queryRunBtn" class="btn ghost">Run Query</button>
+            </div>
+            <div class="table-wrap" style="max-height:240px">
+              <table>
+                <thead><tr><th>Type</th><th>Time</th><th>IP</th><th>Details</th><th>Risk</th></tr></thead>
+                <tbody id="queryRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Admin Security</div></div>
+            <div class="toolbar-grid query-grid" style="margin-bottom:0">
+              <div id="adminTotpLabel" class="sub">Require TOTP on login for this admin account</div>
+              <input id="adminTotpEnabled" class="ctrl" type="checkbox" aria-label="Require TOTP for this admin account" style="width:1.15rem;height:1.15rem;justify-self:start;align-self:center">
+              <button id="saveAdminTotpBtn" class="btn ghost">Save TOTP Setting</button>
+            </div>
+          </div>
         </div>
-        <div class="toolbar-grid three">
-          <input id="manualBanIp" class="ctrl search" placeholder="Enter an IP address to ban manually">
-          <input id="manualBanDuration" class="ctrl" type="number" min="0" value="0" placeholder="Duration (sec, 0=permanent)">
-          <button id="banManualBtn" class="btn warn">Ban IP</button>
-        </div>
-        <div class="toolbar-grid">
-          <input id="manualBanReason" class="ctrl search" placeholder="Optional reason (default: [ADMIN] Manual ban from dashboard)">
-        </div>
-        <div class="toolbar-grid stack-label">
-          <div class="sub">Manual Unban</div>
-        </div>
-        <div class="toolbar-grid">
-          <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
-          <button id="unbanManualBtn" class="btn primary">Unban IP</button>
-        </div>
-        <div class="toolbar-grid stack-label">
-          <div class="sub">Whitelist Management (allowed IP/CIDR)</div>
-        </div>
-        <div class="toolbar-grid dual-actions">
-          <input id="manualWhitelist" class="ctrl search" placeholder="Enter IP or CIDR (example: 203.0.113.4 or 203.0.113.0/24)">
-          <button id="addWhitelistBtn" class="btn cyan">Add Whitelist</button>
-          <button id="removeWhitelistBtn" class="btn ghost">Remove From Whitelist</button>
-        </div>
-        <div class="toolbar-grid stack-label" style="margin-top:-2px">
-          <div class="sub">Current Whitelist Entries</div>
-          <button id="refreshWhitelistBtn" class="btn ghost">Refresh List</button>
-        </div>
-        <div class="table-wrap" style="max-height:220px">
-          <table>
-            <thead><tr><th>Type</th><th>Entry</th></tr></thead>
-            <tbody id="whitelistRows"></tbody>
-          </table>
-        </div>
-        <div class="toolbar-grid stack-label">
-          <div class="sub">Record Query (IP / ASN / Username)</div>
-        </div>
-        <div class="toolbar-grid query-grid">
-          <select id="queryField" class="ctrl">
-            <option value="auto">Auto Detect</option>
-            <option value="ip">IP</option>
-            <option value="asn">ASN</option>
-            <option value="user">Username</option>
-          </select>
-          <input id="queryValue" class="ctrl search" placeholder="Example: 203.0.113.4, AS15169, notch">
-          <button id="queryRunBtn" class="btn ghost">Run Query</button>
-        </div>
-        <div class="table-wrap" style="max-height:240px">
-          <table>
-            <thead><tr><th>Type</th><th>Time</th><th>IP</th><th>Details</th><th>Risk</th></tr></thead>
-            <tbody id="queryRows"></tbody>
-          </table>
-        </div>
-        <div class="toolbar-grid stack-label">
-          <div class="sub">Admin Security</div>
-        </div>
-        <div class="toolbar-grid query-grid">
-          <div id="adminTotpLabel" class="sub">Require TOTP on login for this admin account</div>
-          <input id="adminTotpEnabled" class="ctrl" type="checkbox" aria-label="Require TOTP for this admin account" style="width:1.15rem;height:1.15rem;justify-self:start;align-self:center">
-          <button id="saveAdminTotpBtn" class="btn ghost">Save TOTP Setting</button>
-        </div>
-        <div class="action-grid">
+
+        <div class="action-grid" style="margin-top:12px">
           <button id="enforceSimBansBtn" class="btn primary" hidden>Apply Simulated Bans To Firewall</button>
           <button id="reconcileBansBtn" class="btn cyan">Push Active DB Bans -> Firewall</button>
           <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
@@ -3417,11 +3431,25 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       </div>
     </div>
     <div class="modal-body">
+      <div class="panel-box" style="margin-bottom:12px">
+        <strong>IP Intelligence</strong>
+        <div class="intel-grid">
+          <div class="intel-item"><span class="k">IP</span><span class="v mono" id="ipIntelAddress">-</span></div>
+          <div class="intel-item"><span class="k">ASN</span><span class="v" id="ipIntelAsn">-</span></div>
+          <div class="intel-item"><span class="k">Company</span><span class="v" id="ipIntelCompany">-</span></div>
+          <div class="intel-item"><span class="k">Location</span><span class="v" id="ipIntelCountry">-</span></div>
+          <div class="intel-item"><span class="k">First Seen</span><span class="v" id="ipIntelFirstSeen">-</span></div>
+          <div class="intel-item"><span class="k">Last Seen</span><span class="v" id="ipIntelLastSeen">-</span></div>
+        </div>
+      </div>
       <div class="hero-meta" id="ipDetailStats" style="grid-template-columns:repeat(4,minmax(0,1fr))">
         <div class="metric"><div class="k">Events</div><div class="v" id="ipDetailEventCount">0</div></div>
         <div class="metric"><div class="k">Ban History</div><div class="v" id="ipDetailBanCount">0</div></div>
         <div class="metric"><div class="k">Active Ban Rows</div><div class="v" id="ipDetailActiveBanCount">0</div></div>
         <div class="metric"><div class="k">Firewall</div><div class="v" id="ipDetailFirewallState">--</div></div>
+      </div>
+      <div class="toolbar-grid stack-label" style="margin-top:10px">
+        <div class="sub">Recent Logs For This IP</div>
       </div>
       <div class="table-wrap" style="max-height:420px">
         <table>
@@ -3677,6 +3705,12 @@ async function openIpDetailModal(ip){
   state.ipDetailOpen=true;
   $('#ipDetailTitle').textContent='IP Activity: '+sourceIp;
   $('#ipDetailMeta').textContent='Loading recent records for this source...';
+  $('#ipIntelAddress').textContent=sourceIp;
+  $('#ipIntelAsn').textContent='-';
+  $('#ipIntelCompany').textContent='-';
+  $('#ipIntelCountry').textContent='-';
+  $('#ipIntelFirstSeen').textContent='-';
+  $('#ipIntelLastSeen').textContent='-';
   $('#ipDetailEventCount').textContent='0';
   $('#ipDetailBanCount').textContent='0';
   $('#ipDetailActiveBanCount').textContent='0';
@@ -3708,11 +3742,37 @@ async function openIpDetailModal(ip){
 
   var firstSeen='-';
   var lastSeen='-';
+  var firstSeenLabel='-';
+  var lastSeenLabel='-';
   if(records.length){
     var unixValues=records.map(function(r){ return parseTs(r.timestamp); }).filter(function(v){ return v!==null; }).sort(function(a,b){ return a-b; });
-    if(unixValues.length){ firstSeen=ago(unixValues[0]); lastSeen=ago(unixValues[unixValues.length-1]); }
+    if(unixValues.length){
+      firstSeen=ago(unixValues[0]);
+      lastSeen=ago(unixValues[unixValues.length-1]);
+      firstSeenLabel=new Date(unixValues[0]).toLocaleString();
+      lastSeenLabel=new Date(unixValues[unixValues.length-1]).toLocaleString();
+    }
   }
   $('#ipDetailMeta').textContent='Events: '+N(eventRows.length)+' · Ban records: '+N(banRows.length)+' · First seen: '+firstSeen+' ago · Last seen: '+lastSeen+' ago';
+
+  var asnCounter={};
+  var companyCounter={};
+  var countryCounter={};
+  eventRows.forEach(function(item){
+    var asnRaw=String(item.asn_number||'').trim();
+    var asn=asnRaw ? ('AS'+asnRaw.replace(/^AS/i,'')) : '';
+    var company=String(item.asn_org||'').trim();
+    var country=String(item.country_code||'').trim().toUpperCase();
+    if(asn){ asnCounter[asn]=(asnCounter[asn]||0)+1; }
+    if(company){ companyCounter[company]=(companyCounter[company]||0)+1; }
+    if(country){ countryCounter[country]=(countryCounter[country]||0)+1; }
+  });
+  function topKey(counter){ var keys=Object.keys(counter||{}); if(!keys.length){ return '-'; } keys.sort(function(a,b){ return (counter[b]||0)-(counter[a]||0); }); return keys[0]; }
+  $('#ipIntelAsn').textContent=topKey(asnCounter);
+  $('#ipIntelCompany').textContent=topKey(companyCounter);
+  $('#ipIntelCountry').textContent=topKey(countryCounter);
+  $('#ipIntelFirstSeen').textContent=firstSeenLabel;
+  $('#ipIntelLastSeen').textContent=lastSeenLabel;
 
   if(!records.length){
     $('#ipDetailRows').innerHTML='<tr><td colspan="5" class="empty">No historical records for this IP.</td></tr>';
