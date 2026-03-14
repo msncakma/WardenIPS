@@ -68,9 +68,40 @@ class PortscanPlugin(BasePlugin):
         self._scan_threshold = self._config.get("plugins.portscan.scan_threshold", 10)
         self._log_path = self._config.get("plugins.portscan.log_path", "/var/log/kern.log")
         self._monitor_all_ports = bool(self._config.get("plugins.portscan.monitor_all_ports", True))
+        self._all_ports_limit_per_min = max(
+            int(self._config.get("plugins.portscan.monitor_all_ports_limit_per_min", 120)),
+            1,
+        )
+        self._all_ports_limit_burst = max(
+            int(self._config.get("plugins.portscan.monitor_all_ports_burst", 120)),
+            1,
+        )
+        raw_interfaces = self._config.get("plugins.portscan.monitor_all_ports_interfaces", [])
+        parsed_interfaces: list[str] = []
+        if isinstance(raw_interfaces, (list, tuple, set)):
+            for value in raw_interfaces:
+                interface = str(value).strip()
+                if interface:
+                    parsed_interfaces.append(interface)
+        self._monitor_all_ports_interfaces = parsed_interfaces
         self._installed_iptables = False
         self._installed_iptables_port_groups: list[str] = []
-        self._installed_all_ports_rule = False
+        self._installed_all_ports_interfaces: list[str] = []
+
+    def _build_all_ports_rule_args(self, interface: Optional[str] = None) -> list[str]:
+        args = ["INPUT"]
+        if interface:
+            args.extend(["-i", interface])
+        args.extend(
+            [
+                "-p", "tcp", "--syn",
+                "-m", "conntrack", "--ctstate", "NEW",
+                "-m", "limit", "--limit", f"{self._all_ports_limit_per_min}/minute",
+                "--limit-burst", str(self._all_ports_limit_burst),
+                "-j", "LOG", "--log-prefix", "Warden-PortScan-All: ",
+            ]
+        )
+        return args
 
     def _iter_trap_port_groups(self) -> list[str]:
         """Return comma-separated trap-port groups (iptables multiport supports max 15)."""
@@ -131,32 +162,39 @@ class PortscanPlugin(BasePlugin):
             if self._monitor_all_ports:
                 # Catch broad scan attempts (not only honeypot ports) so operator can
                 # see non-trap probes in event history.
-                check_all_cmd = [
-                    "iptables", "-C", "INPUT", "-p", "tcp", "--syn",
-                    "-m", "conntrack", "--ctstate", "NEW",
-                    "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
-                ]
-                proc_all = await asyncio.create_subprocess_exec(
-                    *check_all_cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc_all.wait()
-                if proc_all.returncode != 0:
-                    insert_all_cmd = [
-                        "iptables", "-I", "INPUT", "1", "-p", "tcp", "--syn",
-                        "-m", "conntrack", "--ctstate", "NEW",
-                        "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
-                    ]
-                    proc_ins_all = await asyncio.create_subprocess_exec(
-                        *insert_all_cmd,
+                targets = self._monitor_all_ports_interfaces or [""]
+                for interface in targets:
+                    rule_args = self._build_all_ports_rule_args(interface or None)
+                    check_all_cmd = ["iptables", "-C", *rule_args]
+                    proc_all = await asyncio.create_subprocess_exec(
+                        *check_all_cmd,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
-                    await proc_ins_all.wait()
-                    if proc_ins_all.returncode == 0:
-                        self._installed_all_ports_rule = True
-                        self._logger.info("Installed all-port SYN log rule for PortScan telemetry.")
+                    await proc_all.wait()
+                    if proc_all.returncode != 0:
+                        insert_all_cmd = ["iptables", "-I", *rule_args]
+                        proc_ins_all = await asyncio.create_subprocess_exec(
+                            *insert_all_cmd,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await proc_ins_all.wait()
+                        if proc_ins_all.returncode == 0:
+                            self._installed_all_ports_interfaces.append(interface)
+                            if interface:
+                                self._logger.info(
+                                    "Installed all-port SYN log rule for interface '%s' (%s/min burst=%s).",
+                                    interface,
+                                    self._all_ports_limit_per_min,
+                                    self._all_ports_limit_burst,
+                                )
+                            else:
+                                self._logger.info(
+                                    "Installed all-port SYN log rule (%s/min burst=%s).",
+                                    self._all_ports_limit_per_min,
+                                    self._all_ports_limit_burst,
+                                )
         except Exception as e:
             self._logger.warning("Failed to setup PortScan trap rules (skip if not root or Windows): %s", e)
             
@@ -184,20 +222,21 @@ class PortscanPlugin(BasePlugin):
             except Exception as e:
                 self._logger.warning("Failed to remove PortScan trap rules: %s", e)
 
-        if self._installed_all_ports_rule:
+        if self._installed_all_ports_interfaces:
             try:
-                del_all_cmd = [
-                    "iptables", "-D", "INPUT", "-p", "tcp", "--syn",
-                    "-m", "conntrack", "--ctstate", "NEW",
-                    "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
-                ]
-                proc_del_all = await asyncio.create_subprocess_exec(
-                    *del_all_cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc_del_all.wait()
-                self._logger.info("Removed all-port SYN log rule for PortScan telemetry.")
+                for interface in self._installed_all_ports_interfaces:
+                    rule_args = self._build_all_ports_rule_args(interface or None)
+                    del_all_cmd = ["iptables", "-D", *rule_args]
+                    proc_del_all = await asyncio.create_subprocess_exec(
+                        *del_all_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc_del_all.wait()
+                    if interface:
+                        self._logger.info("Removed all-port SYN log rule for interface '%s'.", interface)
+                    else:
+                        self._logger.info("Removed all-port SYN log rule for PortScan telemetry.")
             except Exception as e:
                 self._logger.warning("Failed to remove all-port PortScan rule: %s", e)
                 

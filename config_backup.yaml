@@ -107,6 +107,10 @@ plugins:
     enabled: true
     log_path: "/var/log/kern.log"
     scan_threshold: 5
+    monitor_all_ports: true
+    monitor_all_ports_limit_per_min: 120
+    monitor_all_ports_burst: 120
+    monitor_all_ports_interfaces: []
     ignored_ports: []
     # ignored_ports examples for legit game/voice services:
     #  - 19132   # Bedrock
