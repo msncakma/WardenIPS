@@ -67,8 +67,10 @@ class PortscanPlugin(BasePlugin):
         self._trap_ports = effective_trap_ports
         self._scan_threshold = self._config.get("plugins.portscan.scan_threshold", 10)
         self._log_path = self._config.get("plugins.portscan.log_path", "/var/log/kern.log")
+        self._monitor_all_ports = bool(self._config.get("plugins.portscan.monitor_all_ports", True))
         self._installed_iptables = False
         self._installed_iptables_port_groups: list[str] = []
+        self._installed_all_ports_rule = False
 
     def _iter_trap_port_groups(self) -> list[str]:
         """Return comma-separated trap-port groups (iptables multiport supports max 15)."""
@@ -125,6 +127,36 @@ class PortscanPlugin(BasePlugin):
                         self._installed_iptables = True
                         self._installed_iptables_port_groups.append(ports_str)
                         self._logger.info("Installed custom iptables trap rule for ports: %s", ports_str)
+
+            if self._monitor_all_ports:
+                # Catch broad scan attempts (not only honeypot ports) so operator can
+                # see non-trap probes in event history.
+                check_all_cmd = [
+                    "iptables", "-C", "INPUT", "-p", "tcp", "--syn",
+                    "-m", "conntrack", "--ctstate", "NEW",
+                    "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
+                ]
+                proc_all = await asyncio.create_subprocess_exec(
+                    *check_all_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc_all.wait()
+                if proc_all.returncode != 0:
+                    insert_all_cmd = [
+                        "iptables", "-I", "INPUT", "1", "-p", "tcp", "--syn",
+                        "-m", "conntrack", "--ctstate", "NEW",
+                        "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
+                    ]
+                    proc_ins_all = await asyncio.create_subprocess_exec(
+                        *insert_all_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc_ins_all.wait()
+                    if proc_ins_all.returncode == 0:
+                        self._installed_all_ports_rule = True
+                        self._logger.info("Installed all-port SYN log rule for PortScan telemetry.")
         except Exception as e:
             self._logger.warning("Failed to setup PortScan trap rules (skip if not root or Windows): %s", e)
             
@@ -151,6 +183,23 @@ class PortscanPlugin(BasePlugin):
                     self._logger.info("Removed custom iptables trap rule for ports: %s", ports_str)
             except Exception as e:
                 self._logger.warning("Failed to remove PortScan trap rules: %s", e)
+
+        if self._installed_all_ports_rule:
+            try:
+                del_all_cmd = [
+                    "iptables", "-D", "INPUT", "-p", "tcp", "--syn",
+                    "-m", "conntrack", "--ctstate", "NEW",
+                    "-j", "LOG", "--log-prefix", "Warden-PortScan-All: "
+                ]
+                proc_del_all = await asyncio.create_subprocess_exec(
+                    *del_all_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc_del_all.wait()
+                self._logger.info("Removed all-port SYN log rule for PortScan telemetry.")
+            except Exception as e:
+                self._logger.warning("Failed to remove all-port PortScan rule: %s", e)
                 
         await super().on_stop()
 

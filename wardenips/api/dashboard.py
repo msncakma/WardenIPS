@@ -1500,14 +1500,11 @@ class DashboardAPI:
       else:
         apply_failed += 1
 
+    # Reconcile is intentionally one-way (DB -> Firewall).
+    # Keep firewall-only entries untouched so manual operator bans are preserved.
     removed_extra = 0
     remove_failed = 0
-    for ip_value in sorted(firewall_ips - desired_ips):
-      success = await self._firewall.unban_ip(ip_value)
-      if success:
-        removed_extra += 1
-      else:
-        remove_failed += 1
+    firewall_extra_untouched = len(firewall_ips - desired_ips)
 
     await self._log_audit(
       request,
@@ -1522,6 +1519,7 @@ class DashboardAPI:
         "apply_failed": apply_failed,
         "removed_extra": removed_extra,
         "remove_failed": remove_failed,
+        "firewall_extra_untouched": firewall_extra_untouched,
       },
     )
 
@@ -1536,6 +1534,7 @@ class DashboardAPI:
         "apply_failed": apply_failed,
         "removed_extra": removed_extra,
         "remove_failed": remove_failed,
+        "firewall_extra_untouched": firewall_extra_untouched,
       }
     )
 
@@ -2370,9 +2369,9 @@ button.admin-link{font:inherit;cursor:pointer}
 .sc .sb{font-size:.7rem;color:var(--dim2);margin-top:.35rem}
 
 /* Panels */
-.pn{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2rem}
+.pn{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2rem;align-items:start}
 @media(max-width:900px){.pn{grid-template-columns:1fr}}
-.pl{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 92%,#000 8%));border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;transition:all .25s ease;box-shadow:var(--shadow)}
+.pl{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 92%,#000 8%));border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;transition:all .25s ease;box-shadow:var(--shadow);height:auto}
 .pl:hover{border-color:var(--bdr-g)}
 .ph{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid var(--bdr)}
 .ph h2{font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:.5rem}
@@ -2866,7 +2865,7 @@ body{font-family:Georgia,"Aptos",serif;background:radial-gradient(circle at top 
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 85% 12%,color-mix(in srgb,var(--accent) 18%,transparent) 0%,transparent 24%),radial-gradient(circle at 12% 78%,color-mix(in srgb,var(--cyan) 16%,transparent) 0%,transparent 28%);pointer-events:none}
 .app{max-width:1600px;margin:0 auto;padding:26px;position:relative;z-index:1}.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:18px;margin-bottom:22px}.brand h1{font-size:2rem;font-weight:800;letter-spacing:-.04em}.brand p{font-size:.95rem;color:var(--muted);margin-top:6px;max-width:58ch;line-height:1.5}.utility-strip{display:grid;grid-template-columns:1.45fr .95fr;gap:16px;margin-bottom:16px}.utility-card,.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:20px;padding:18px;box-shadow:var(--shadow)}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.82rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.utility-metrics div{padding:12px;border-radius:14px;background:var(--surface);border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
 .actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.toolbar,.action-grid,.notification-grid,.config-actions,.quick-toggle-grid,.action-columns,.modal-header{display:flex;gap:10px;flex-wrap:wrap}.toolbar-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;margin-bottom:12px}.ctrl,.btn,.config-editor,.config-input,.config-select{background:var(--surface2);border:1px solid var(--b);color:var(--txt);border-radius:14px;padding:10px 13px;font-size:.88rem;transition:transform .18s ease,background .18s ease,border-color .18s ease}.btn{cursor:pointer;font-weight:700}.btn:hover{transform:translateY(-1px)}.btn.primary{background:linear-gradient(135deg,var(--accent),#ff6f61);border-color:color-mix(in srgb,var(--accent) 60%,white)}.btn.warn{background:linear-gradient(135deg,#b45309,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#9f1239,#e11d48);border-color:#fb7185}.btn.ghost{background:var(--surface)}.btn.cyan{background:linear-gradient(135deg,var(--cyan),#0f9ea6);border-color:color-mix(in srgb,var(--cyan) 70%,white)}.btn.theme{background:linear-gradient(135deg,var(--blue),#6d78ff);border-color:color-mix(in srgb,var(--blue) 65%,white)}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}.action-grid button,.notification-grid button,.quick-toggle-grid label{flex:1 1 220px}
-.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
+.hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px;align-items:start}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
 .layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--b);font-size:.84rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:color-mix(in srgb,var(--red) 20%,transparent);color:#ffd3d7}.t-green{background:color-mix(in srgb,var(--green) 18%,transparent);color:#b8ffe0}.t-yellow{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:#ffe1a7}.t-blue{background:color-mix(in srgb,var(--blue) 18%,transparent);color:#c9deff}
 .advice-tip{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;border:1px solid var(--b);background:var(--surface2);font-size:.72rem;font-weight:800;cursor:help}
@@ -2892,6 +2891,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-field label{white-space:normal;line-height:1.3}
 .config-input,.config-select{width:100%;min-width:0}
 .toolbar-grid.three{grid-template-columns:minmax(0,1fr) 120px 160px}
+.toolbar-grid.query-grid{grid-template-columns:170px minmax(0,1fr) 150px}
 .toolbar-grid.dual-actions{grid-template-columns:minmax(0,1fr) auto auto}
 .toolbar-grid.stack-label{margin-bottom:6px}
 .chip-editor{display:flex;flex-wrap:wrap;gap:8px;min-height:42px;padding:8px 10px;border:1px solid var(--b);border-radius:12px;background:var(--surface2)}
@@ -2904,6 +2904,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 @media(max-width:1280px){.config-sections{column-count:2}}
 @media(max-width:900px){.config-sections{column-count:1}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
+@media(max-width:680px){.toolbar-grid.query-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -3025,7 +3026,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <div class="toolbar-grid stack-label">
           <div class="sub">Record Query (IP / ASN / Username)</div>
         </div>
-        <div class="toolbar-grid three">
+        <div class="toolbar-grid query-grid">
           <select id="queryField" class="ctrl">
             <option value="auto">Auto Detect</option>
             <option value="ip">IP</option>
@@ -3638,7 +3639,7 @@ function bind(){
   $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
   $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
   $('#enforceSimBansBtn').addEventListener('click', async function(){ if(!confirm('Apply current simulated ban records to the real firewall now?')){ return; } handleUserActivity(); await performAction('/api/admin/enforce-simulated-bans', {}, 'Simulated bans applied', function(payload){ return 'Applied '+N(payload.applied||0)+' ban(s) to firewall. Failed: '+N(payload.failed||0)+', skipped: '+N(payload.skipped||0)+'.'; }); });
-  $('#reconcileBansBtn').addEventListener('click', async function(){ if(!confirm('Reconcile firewall with active DB bans now? This will remove firewall IPs that are not active in DB.')){ return; } handleUserActivity(); await performAction('/api/admin/reconcile-bans', {}, 'Firewall reconciled', function(payload){ return 'DB active: '+N(payload.db_active_considered||0)+' · Reapplied: '+N(payload.reapplied||0)+' · Removed extras: '+N(payload.removed_extra||0)+' · Apply failed: '+N(payload.apply_failed||0)+' · Remove failed: '+N(payload.remove_failed||0)+' · Expired deactivated: '+N(payload.expired_deactivated||0)+'.'; }); });
+  $('#reconcileBansBtn').addEventListener('click', async function(){ if(!confirm('Reconcile firewall from active DB bans now? (One-way: DB -> Firewall)')){ return; } handleUserActivity(); await performAction('/api/admin/reconcile-bans', {}, 'Firewall reconciled', function(payload){ return 'DB active: '+N(payload.db_active_considered||0)+' · Reapplied: '+N(payload.reapplied||0)+' · Apply failed: '+N(payload.apply_failed||0)+' · Expired deactivated: '+N(payload.expired_deactivated||0)+' · Firewall extras untouched: '+N(payload.firewall_extra_untouched||0)+'.'; }); });
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
   $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });
