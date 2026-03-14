@@ -814,6 +814,31 @@ class FirewallManager:
 
             if proc.returncode != 0:
                 error_msg = stderr.decode("utf-8", errors="replace").strip()
+
+                # ipset may still emit non-zero on some platforms for idempotent
+                # operations even when '-exist' is passed. Treat those known
+                # duplicate/not-found cases as success to keep operations stable.
+                is_ipset_cmd = bool(args) and str(args[0]).endswith("ipset")
+                has_exist_flag = "-exist" in args
+                benign_markers = (
+                    "already exists",
+                    "it's already added",
+                    "is already added",
+                    "is NOT in set",
+                    "element is missing",
+                )
+                if (
+                    is_ipset_cmd
+                    and has_exist_flag
+                    and any(marker.lower() in error_msg.lower() for marker in benign_markers)
+                ):
+                    logger.debug(
+                        "Ignoring idempotent ipset non-zero result: %s — %s",
+                        cmd_str,
+                        error_msg,
+                    )
+                    return True
+
                 if ignore_errors:
                     logger.debug(
                         "Command returned error (ignored): %s — %s",
