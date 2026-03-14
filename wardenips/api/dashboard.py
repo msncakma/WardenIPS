@@ -621,7 +621,18 @@ class DashboardAPI:
           SELECT id, timestamp, source_ip, player_name,
                connection_type, asn_number, asn_org,
                is_suspicious_asn, risk_score,
-               threat_level, details
+               threat_level, details,
+               EXISTS(
+                 SELECT 1
+                 FROM ban_history bh
+                 WHERE bh.source_ip = connection_events.source_ip
+                   AND bh.is_active = 1
+                   AND (
+                     bh.expires_at IS NULL
+                     OR bh.expires_at = ''
+                     OR COALESCE(strftime('%s', bh.expires_at), 0) > strftime('%s', 'now')
+                   )
+               ) AS is_banned
           FROM connection_events
           ORDER BY id DESC
           LIMIT ?
@@ -642,6 +653,7 @@ class DashboardAPI:
         elif isinstance(details_value, dict):
           details_obj = details_value
         event["event_type"] = str(details_obj.get("event_type") or "")
+        event["is_banned"] = bool(event.get("is_banned"))
         event["country_code"] = self._resolve_country_code(
           details_obj,
           event.get("source_ip"),
@@ -2925,7 +2937,6 @@ var CC=['c0','c1','c2','c3','c4','c5'];
 var GEO_COUNTS={};
 var GEO_SEEN=false;
 var evShowBanned=true;
-var lastBannedIpSet=new Set();
 var lastEvData=[];
 var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
@@ -3030,7 +3041,7 @@ function renderGeoHeatmap(payload){
 
 function renderEventsTable(events){
   var etb=$('#evb'),ee=$('#eve'),ep=$('#ec');
-  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !lastBannedIpSet.has(e.source_ip); });
+  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !e.is_banned; });
   if(!eventsToShow.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0';return;}
   ee.style.display='none';ep.textContent=eventsToShow.length;
   etb.innerHTML=eventsToShow.map(function(e){
@@ -3040,7 +3051,7 @@ function renderEventsTable(events){
     var advice=e.operator_advice||'No specific operator advice for this event.';
     var cc=(e.country_code||'').toUpperCase();
     var origin=cc?CF(cc)+' '+cc:'-';
-    var bannedMark=lastBannedIpSet.has(e.source_ip)?'<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BAN</span>':'';
+    var bannedMark=e.is_banned?'<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BAN</span>':'';
     return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;'+bannedMark+'</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
   }).join('');
 }
@@ -3094,8 +3105,7 @@ async function refresh(){
     else{bd.className='bdg bdg-live';bd.innerHTML='<span class="dot"></span>LIVE'}
   }
 
-  // Bans Table — track banned IPs for the toggle filter
-  lastBannedIpSet=new Set((bn&&bn.bans?bn.bans:[]).map(function(b){ return b.source_ip; }));
+  // Bans Table
   var btb=$('#bnb'),be=$('#bne'),bp=$('#bc');
   if(!bn||!bn.bans||!bn.bans.length){btb.innerHTML='';be.style.display='block';bp.textContent='0'}
   else{be.style.display='none';bp.textContent=bn.count;
@@ -3929,7 +3939,7 @@ function renderEvents(){
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'; var pluginName=String((e.connection_type||'unknown')).toUpperCase(); var port=detectPortFromEvent(e); var pluginLabel=(port&&String(e.connection_type||'').toLowerCase()==='portscan')?(pluginName+' · Port '+port):pluginName; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E(pluginLabel)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var bannedBadge=e.is_banned?'<span class="tag t-red" style="margin-left:6px">BAN</span>':''; var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'+bannedBadge; var pluginName=String((e.connection_type||'unknown')).toUpperCase(); var port=detectPortFromEvent(e); var pluginLabel=(port&&String(e.connection_type||'').toLowerCase()==='portscan')?(pluginName+' · Port '+port):pluginName; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E(pluginLabel)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderWhitelistSnapshot(){
   var target=$('#whitelistRows');
