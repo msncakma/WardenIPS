@@ -27,7 +27,7 @@ If you run internet-facing services and want practical prevention with transpare
 
 ## Transparent Status
 
-Current version: v0.3.0-beta-12
+Current version: v0.3.1-beta-1
 
 This project is in beta, and that matters.
 
