@@ -8,14 +8,14 @@ general:
 whitelist:
   # IPv4/IPv6 addresses that will NEVER be blocked. Add your IP here!
   ips:
-    - "127.0.0.1"
-    - "::1"
-    # - "192.168.1.100"         # MUST CHANGE: Your server or home IP
+    - "127.0.0.1" # MUST KEEP: localhost
+    - "::1" # MUST KEEP: localhost IPv6
+
   # CIDR ranges that will NEVER be blocked
   cidr_ranges:
-    - "10.0.0.0/8"
-    - "172.16.0.0/12"
-    # - "192.168.0.0/16"
+    - "10.0.0.0/8" # RFC1918 private network
+    - "100.64.0.0/10" # Tailscale default subnet
+    - "172.16.0.0/12" # RFC1918 private network
 
 database:
   backend: "sqlite"           # "sqlite" (default) or "redis" (enterprise/cluster)
@@ -55,7 +55,7 @@ abuseipdb:
   # Automatically reports banned IPs to AbuseIPDB
   enabled: false
   api_key: ""
-  rate_limit_per_minute: 10
+  rate_limit_per_minute: 35
 
 successful_logins:
   enabled: true              # Log successful SSH and Minecraft sign-ins as normal events
@@ -131,7 +131,7 @@ plugins:
     #  - 19132   # Bedrock
     #  - 24454   # Proximity voice (Simple Voice Chat)
     #  - 9987    # TeamSpeak voice
-    trap_ports:
+    trap_ports: #Don't use your actual service ports here, or you may get false positives! These are honeypot (trap) ports to catch scanners.
       - 23    # Telnet
       - 2323  # Mirai
       - 135   # RPC
