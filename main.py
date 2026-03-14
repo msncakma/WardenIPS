@@ -471,13 +471,18 @@ class WardenIPS:
                         duration=ban_duration,
                         plugin=plugin.name,
                     )
-
-                self._logger.warning(
-                    "THREAT DETECTED: IP=%s Risk=%d Action=%s "
-                    "Plugin=%s Type=%s",
-                    event.source_ip, risk_score, action,
-                    plugin.name, event.details.get("event_type", "?"),
-                )
+                    self._logger.warning(
+                        "THREAT DETECTED: IP=%s Risk=%d Action=%s "
+                        "Plugin=%s Type=%s",
+                        event.source_ip, risk_score, action,
+                        plugin.name, event.details.get("event_type", "?"),
+                    )
+                else:
+                    self._logger.debug(
+                        "Duplicate event suppressed (already banned): IP=%s Plugin=%s Type=%s",
+                        event.source_ip, plugin.name,
+                        event.details.get("event_type", "?"),
+                    )
             elif action == "WATCH":
                 self._logger.info(
                     "SUSPICIOUS: IP=%s Risk=%d Plugin=%s",
