@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import socket
 from typing import List, Optional, Set, Union
 
 from wardenips.core.config import ConfigManager
@@ -20,7 +21,7 @@ from wardenips.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# IP ağ tipi kısaltmaları
+# IP ag tipi kisaltmalari
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
@@ -35,8 +36,8 @@ class WhitelistManager:
     Features:
         - IPv4 and IPv6 unique IP support.
         - CIDR block (network ranges) support.
-        - Geofencing — country-based allow/deny rules.
-        - Hot-reload — automatically updates the list on configuration changes.
+        - Geofencing -- country-based allow/deny rules.
+        - Hot-reload -- automatically updates the list on configuration changes.
         - O(1) lookup for unique IPs, O(n) for CIDR scanning (n = number of CIDRs).
 
     Usage:
@@ -49,12 +50,15 @@ class WhitelistManager:
         self._whitelisted_ips: Set[IPAddress] = set()
         self._whitelisted_networks: List[IPNetwork] = []
         self._geofencing_enabled: bool = False
+        # Hard-coded protected IPs -- loopback and own server addresses.
+        # NEVER logged, NEVER shown in the UI, NEVER removable via config.
+        self._protected_ips: Set[IPAddress] = set()
         self._geofencing_mode: str = "allow"
         self._geofencing_countries: Set[str] = set()
         self._enabled: bool = True
         self._lock: asyncio.Lock = asyncio.Lock()
 
-    # ── Factory ──
+    # -- Factory --
 
     @classmethod
     async def create(cls, config: ConfigManager) -> WhitelistManager:
@@ -69,16 +73,18 @@ class WhitelistManager:
         """
         instance = cls()
         await instance._load_from_config(config)
+        instance._detect_own_ips()
         return instance
 
-    # ── Ana API ──
+    # -- Ana API --
 
     async def is_whitelisted(self, ip_str: str) -> bool:
         """
         Checks if an IP address is whitelisted.
 
         Control order:
-            1. Whitelist disabled → False (all IPs are evaluated)
+            0. Protected IPs (loopback/own-server) -- always True, silently
+            1. Whitelist disabled -> False (all IPs are evaluated)
             2. Unique IP match (O(1) set lookup)
             3. CIDR network match
 
@@ -88,6 +94,14 @@ class WhitelistManager:
         Returns:
             True if IP is whitelisted, False otherwise.
         """
+        # Step 0 -- Protected IPs are always allowed and never logged
+        try:
+            _ip_obj = ipaddress.ip_address(ip_str)
+            if _ip_obj in self._protected_ips:
+                return True
+        except ValueError:
+            pass
+
         if not self._enabled:
             return False
 
@@ -97,12 +111,12 @@ class WhitelistManager:
             logger.warning("Invalid IP format, whitelist check failed: %s", ip_str)
             return False
 
-        # 1. Tekil IP kontrolü — O(1)
+        # 1. Tekil IP kontrolu -- O(1)
         if ip in self._whitelisted_ips:
             logger.debug("IP whitelist'te bulundu (unique): %s", ip_str)
             return True
 
-        # 2. CIDR ağ kontrolü
+        # 2. CIDR ag kontrolu
         for network in self._whitelisted_networks:
             if ip in network:
                 logger.debug(
@@ -129,12 +143,9 @@ class WhitelistManager:
             return True
 
         if country_code is None:
-            # Ülke tespit edilemediyse varsayılan davranış:
-            # - "allow" modeunda izin VERME (güvenli taraf)
-            # - "deny" modeunda izin VER
             if self._geofencing_mode == "allow":
                 logger.warning(
-                    "Country code not detected and geofencing 'allow' mode — "
+                    "Country code not detected and geofencing 'allow' mode -- "
                     "connection denied."
                 )
                 return False
@@ -146,7 +157,7 @@ class WhitelistManager:
             allowed = code in self._geofencing_countries
             if not allowed:
                 logger.info(
-                    "Geofencing: %s country code not in 'allow' list — connection denied.",
+                    "Geofencing: %s country code not in 'allow' list -- connection denied.",
                     code,
                 )
             return allowed
@@ -155,12 +166,11 @@ class WhitelistManager:
             denied = code in self._geofencing_countries
             if denied:
                 logger.info(
-                    "Geofencing: %s country code in 'deny' list — connection denied.",
+                    "Geofencing: %s country code in 'deny' list -- connection denied.",
                     code,
                 )
             return not denied
 
-        # Bilinmeyen mode — güvenli tarafta kal, izin ver
         logger.warning("Geofencing: Unknown mode '%s', allowing connection.", self._geofencing_mode)
         return True
 
@@ -176,6 +186,7 @@ class WhitelistManager:
             self._whitelisted_ips.clear()
             self._whitelisted_networks.clear()
             self._geofencing_countries.clear()
+            # _protected_ips is NEVER cleared -- loopback and own IPs are permanent
             await self._load_from_config(config)
             logger.info("Whitelist reloaded.")
 
@@ -200,7 +211,39 @@ class WhitelistManager:
             logger.info("Runtime whitelist applied: %d IP(s).", added)
         return added
 
-    # ── Information ──
+    def _detect_own_ips(self) -> None:
+        """Detect own server IPs and add them to _protected_ips.
+
+        Called once at startup. Silent on failure -- never logs protected IPs.
+        """
+        # Always protect loopback
+        for _addr in ("127.0.0.1", "::1"):
+            try:
+                self._protected_ips.add(ipaddress.ip_address(_addr))
+            except ValueError:
+                pass
+
+        # Detect via hostname resolution
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None):
+                try:
+                    self._protected_ips.add(ipaddress.ip_address(info[4][0]))
+                except (ValueError, IndexError):
+                    pass
+        except Exception:
+            pass
+
+        # Detect outbound interface IP (most reliable for the primary address)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+                _s.settimeout(0.1)
+                _s.connect(("8.8.8.8", 80))
+                self._protected_ips.add(ipaddress.ip_address(_s.getsockname()[0]))
+        except Exception:
+            pass
+
+    # -- Information --
 
     @property
     def stats(self) -> dict:
@@ -214,7 +257,7 @@ class WhitelistManager:
             "geofencing_countries": sorted(self._geofencing_countries),
         }
 
-    # ── Internal Methods ──
+    # -- Internal Methods --
 
     async def _load_from_config(self, config: ConfigManager) -> None:
         """
@@ -223,7 +266,14 @@ class WhitelistManager:
         Args:
             config: ConfigManager instance.
         """
-        # ── Whitelist ──
+        # Always protect loopback -- injected at code level, not removable via config
+        for _addr in ("127.0.0.1", "::1"):
+            try:
+                self._protected_ips.add(ipaddress.ip_address(_addr))
+            except ValueError:
+                pass
+
+        # -- Whitelist --
         wl_section = config.get_section("whitelist")
         self._enabled = wl_section.get("enabled", True)
 
@@ -255,12 +305,12 @@ class WhitelistManager:
                 )
 
         logger.info(
-            "Whitelist loaded — %d unique IP, %d CIDR networks.",
+            "Whitelist loaded -- %d unique IP, %d CIDR networks.",
             len(self._whitelisted_ips),
             len(self._whitelisted_networks),
         )
 
-        # ── Geofencing ──
+        # -- Geofencing --
         geo_section = config.get_section("geofencing")
         self._geofencing_enabled = geo_section.get("enabled", False)
         self._geofencing_mode = geo_section.get("mode", "allow").lower()
@@ -269,7 +319,7 @@ class WhitelistManager:
 
         if self._geofencing_enabled:
             logger.info(
-                "Geofencing aktif — Mod: %s, Ülkeler: %s",
+                "Geofencing aktif -- Mod: %s, Ulkeler: %s",
                 self._geofencing_mode,
                 sorted(self._geofencing_countries),
             )

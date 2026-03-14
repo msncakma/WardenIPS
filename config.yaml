@@ -44,7 +44,7 @@ asn_protection:
 
 firewall:
   # Action to take when an IP reaches this risk score
-  simulation_mode: false       # true = monitor only (no firewall actions)
+  simulation_mode: true        # true = monitor only (no firewall actions)
   ban_threshold: 70
   permanent_ban_default: true   # High-risk bans are permanent by default (manual unban via dashboard)
   ipset:

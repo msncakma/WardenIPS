@@ -1180,6 +1180,35 @@ class DashboardAPI:
         status=500,
       )
     self._pending_setups.pop(pending_token, None)
+    # Apply first-install defaults
+    try:
+      private_nets = payload.get("whitelist_private_networks") or []
+      if private_nets and isinstance(private_nets, list):
+        existing_ips = list(self._config.get("whitelist.ips", []) or [])
+        existing_cidrs = list(self._config.get("whitelist.cidr_ranges", []) or [])
+        for raw in private_nets:
+          raw = str(raw).strip()
+          if not raw:
+            continue
+          try:
+            if "/" in raw:
+              n = str(ipaddress.ip_network(raw, strict=False))
+              if n not in existing_cidrs:
+                existing_cidrs.append(n)
+            else:
+              ip_val = str(ipaddress.ip_address(raw))
+              if ip_val not in existing_ips:
+                existing_ips.append(ip_val)
+          except ValueError:
+            pass
+        await self._config.patch_values({"whitelist.ips": existing_ips, "whitelist.cidr_ranges": existing_cidrs})
+        if self._whitelist:
+          await self._whitelist.reload(self._config)
+      # Ensure monitor mode is active for fresh installs
+      await self._config.patch_values({"firewall.simulation_mode": True})
+      self._firewall.apply_simulation_config(True)
+    except Exception:
+      pass
     await self._clear_bootstrap_config()
     response = web.json_response({"ok": True, "redirect_to": "/admin", "message": "Initial admin setup completed."})
     self._issue_session(response, request, username=username)
@@ -2299,6 +2328,13 @@ button[disabled]{opacity:.65;cursor:wait}
         <div class="secret" id="totpSecret"></div>
       </div>
       <form id="setupCompleteForm" style="margin-top:16px">
+        <div style="margin-bottom:14px;padding:13px 14px;border-radius:14px;border:1px solid var(--b);background:var(--surface2)">
+          <div style="font-size:.8rem;font-weight:700;margin-bottom:6px;">Private Network Whitelist <span style="font-weight:400;color:var(--muted)">(Optional)</span></div>
+          <p style="font-size:.76rem;margin-bottom:8px;">Add Tailscale or other overlay network CIDR ranges to automatically protect them from being blocked.</p>
+          <label style="display:flex;align-items:center;gap:7px;font-size:.8rem;cursor:pointer;margin-bottom:10px;"><input id="addTailscale" type="checkbox" style="width:auto;accent-color:var(--accent)"> Tailscale (100.64.0.0/10)</label>
+          <div style="font-size:.76rem;color:var(--muted);margin-bottom:5px;">Additional ranges (one per line, e.g. 10.0.0.0/8)</div>
+          <textarea id="extraNets" style="width:100%;background:var(--surface);border:1px solid var(--b);color:var(--txt);border-radius:10px;padding:8px 10px;font-size:.82rem;height:52px;resize:vertical;outline:none;font-family:inherit"></textarea>
+        </div>
         <div class="field">
           <label for="setupTotpCode">Authenticator Code</label>
           <input id="setupTotpCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456">
@@ -2369,7 +2405,8 @@ $('#setupCompleteForm').addEventListener('submit', async function(ev){
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         pending_setup_token: pendingSetupToken,
-        totp_code: $('#setupTotpCode').value.trim()
+        totp_code: $('#setupTotpCode').value.trim(),
+        whitelist_private_networks: (function(){ var nets=[]; if($('#addTailscale')&&$('#addTailscale').checked){ nets.push('100.64.0.0/10'); } if($('#extraNets')){ ($('#extraNets').value||'').split(/[\n,]+/).forEach(function(s){ var t=s.trim(); if(t) nets.push(t); }); } return nets; })()
       })
     });
     var payload = await response.json();
@@ -2866,7 +2903,7 @@ async function refresh(){
     $('#sfw').textContent=N(s.firewall_active_bans);
     var sim=s.simulation_mode;
     var bd=$('#sb');
-    if(sim){bd.className='bdg bdg-sim';bd.innerHTML='SIMULATION'}
+    if(sim){bd.className='bdg bdg-sim';bd.innerHTML='MONITOR'}
     else{bd.className='bdg bdg-live';bd.innerHTML='<span class="dot"></span>LIVE'}
   }
 
@@ -3046,7 +3083,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <p class="sub">Everything sensitive stays here: firewall actions, cleanup tools, and live configuration control.</p>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end">
-          <div id="simulationTopNotice" class="theme-chip" hidden style="border-color:color-mix(in srgb,var(--red) 55%,var(--b));color:#ffd6db;background:color-mix(in srgb,var(--red) 16%,var(--surface));">Warning: Simulation mode is enabled. No blocking actions will be applied.</div>
+          <div id="simulationTopNotice" class="theme-chip" hidden style="border-color:color-mix(in srgb,var(--blue) 45%,var(--b));color:#c8e4ff;background:color-mix(in srgb,var(--blue) 12%,var(--surface));">Monitor Mode active — events are recorded but no firewall actions applied. Disable to switch to enforcement.</div>
           <div class="theme-chip" id="themeChip">Theme: Dark</div>
         </div>
       </div>
@@ -3266,7 +3303,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <h3>Firewall Policy</h3>
           <p>Ban thresholding and default ban duration for enforced actions.</p>
           <div class="config-grid">
-            <label class="config-toggle full"><span>Simulation Mode (No Action)</span><input id="cfgSimulationMode" type="checkbox"></label>
+            <label class="config-toggle full"><span>Monitor Mode (Observe Only — no firewall actions)</span><input id="cfgSimulationMode" type="checkbox"></label>
             <div class="config-field">
               <label for="cfgBanThreshold">Ban Threshold</label>
               <input id="cfgBanThreshold" class="config-input" type="number" min="0" max="100">
@@ -3551,7 +3588,7 @@ function renderSummary(){
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
   $('#mFwBans').textContent = N(state.firewall.length);
   $('#mPeers').textContent = state.blocklist&&state.blocklist.enabled ? (state.blocklist.first_setup&&state.blocklist.first_setup.completed?'Active Only':'First Setup + Active') : 'Disabled';
-  $('#runtimeMode').textContent = 'Mode: '+(simulation?'Simulation':'Live');
+  $('#runtimeMode').textContent = 'Mode: '+(simulation?'Monitor':'Live');
   $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
   $('#simulationTopNotice').hidden = !simulation;
@@ -3566,7 +3603,7 @@ function renderEvents(){
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Simulation mode is enabled, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td class="mono">'+E(e.source_ip||'-')+'</td><td>'+E((e.connection_type||'unknown').toUpperCase())+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderBans(){
   var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
@@ -3727,7 +3764,6 @@ async function saveConfigYaml(){
 }
 function renderAdvice(){
   var items=[]; var stats=state.stats||{}; var highRiskEvents=state.events.filter(function(event){ return (event.risk_score||0)>=70; }).length;
-  if(isSimulationEnabled(stats.simulation_mode)){ items.push({title:'Simulation mode is enabled', body:'Events and risk scoring continue, but no firewall blocking is applied while simulation mode is active.'}); }
   if((stats.active_bans||0)>0&&state.firewall.length===0){ items.push({title:'Database bans do not match firewall entries', body:'This can be expected in simulation mode. In live mode, check firewall permissions or service startup ordering.'}); }
   if(highRiskEvents>=10){ items.push({title:'High-risk event volume is elevated', body:'Review recent events and confirm whitelist coverage before tightening thresholds further.'}); }
   if(state.blocklist&&state.blocklist.last_error){ items.push({title:'Blocklist fetch encountered an error', body:'Check the configured URLs and network connectivity. Error: '+(state.blocklist.last_error||'unknown')}); }
