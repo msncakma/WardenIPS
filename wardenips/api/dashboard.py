@@ -507,6 +507,8 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
     self._app.router.add_post("/api/admin/enforce-simulated-bans", self._handle_admin_enforce_simulated_bans)
     self._app.router.add_post("/api/admin/reconcile-bans", self._handle_admin_reconcile_bans)
+    self._app.router.add_get("/api/admin/auth-settings", self._handle_admin_get_auth_settings)
+    self._app.router.add_post("/api/admin/auth-settings", self._handle_admin_set_auth_settings)
     self._app.router.add_post("/api/admin/query-records", self._handle_admin_query_records)
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
@@ -997,6 +999,104 @@ class DashboardAPI:
     await self._log_audit(request, "auth.login_success", actor_username=username, details={"method": "password_totp"})
     return response
 
+  async def _handle_admin_get_auth_settings(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    if not actor:
+      return self._json_auth_error()
+
+    user = await self._db.get_admin_user_by_username(actor)
+    if not user:
+      return web.json_response(
+        {"error": "admin_user_not_found", "message": "Admin user profile was not found."},
+        status=404,
+      )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "username": actor,
+        "totp_enabled": bool(int(user.get("totp_enabled", 0))),
+      }
+    )
+
+  async def _handle_admin_set_auth_settings(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    if not actor:
+      return self._json_auth_error()
+
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    if "totp_enabled" not in payload:
+      return web.json_response(
+        {"error": "missing_totp_enabled", "message": "totp_enabled is required."},
+        status=400,
+      )
+
+    raw_enabled = payload.get("totp_enabled")
+    if isinstance(raw_enabled, bool):
+      enabled = raw_enabled
+    elif isinstance(raw_enabled, (int, float)):
+      enabled = bool(int(raw_enabled))
+    elif isinstance(raw_enabled, str):
+      enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+      return web.json_response(
+        {"error": "invalid_totp_enabled", "message": "totp_enabled must be a boolean-like value."},
+        status=400,
+      )
+
+    user = await self._db.get_admin_user_by_username(actor)
+    if not user:
+      return web.json_response(
+        {"error": "admin_user_not_found", "message": "Admin user profile was not found."},
+        status=404,
+      )
+
+    if enabled and not str(user.get("totp_secret", "")).strip():
+      return web.json_response(
+        {
+          "error": "totp_secret_missing",
+          "message": "Cannot enable TOTP because this admin user has no TOTP secret.",
+        },
+        status=400,
+      )
+
+    updated = await self._db.set_admin_totp_enabled(actor, enabled)
+    if not enabled:
+      pending_for_actor = [
+        token
+        for token, item in self._pending_logins.items()
+        if str(item.get("username", "")) == actor
+      ]
+      for token in pending_for_actor:
+        self._pending_logins.pop(token, None)
+
+    await self._log_audit(
+      request,
+      "admin.auth_settings_update",
+      actor_username=actor,
+      details={"totp_enabled": enabled, "updated": updated},
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "username": actor,
+        "totp_enabled": enabled,
+        "updated": updated,
+        "message": "TOTP requirement enabled." if enabled else "TOTP requirement disabled.",
+      }
+    )
+
   async def _handle_setup_begin(self, request: web.Request) -> web.Response:
     if not self._bootstrap_token_is_valid():
       return web.json_response({"error": "setup_unavailable", "message": "First-boot setup is not available anymore."}, status=403)
@@ -1420,21 +1520,16 @@ class DashboardAPI:
     self._touch_session(request)
     actor = self._get_session_actor(request)
 
-    if self._firewall.simulation_mode:
-      return web.json_response(
-        {
-          "error": "simulation_mode_enabled",
-          "message": "Cannot reconcile firewall while simulation mode is enabled.",
-        },
-        status=400,
-      )
-
     now_unix = int(time.time())
     desired: dict[str, dict[str, object]] = {}
     expired_ips: set[str] = set()
     skipped_invalid = 0
+    db_total_bans = 0
 
     async with self._db._lock:
+      async with self._db._db.execute("SELECT COUNT(*) FROM ban_history") as total_cursor:
+        total_row = await total_cursor.fetchone()
+        db_total_bans = int(total_row[0]) if total_row else 0
       async with self._db._db.execute(
         """
         SELECT source_ip, reason, ban_duration, expires_at
@@ -1478,6 +1573,15 @@ class DashboardAPI:
     for ip_value in expired_ips:
       deactivated_expired += await self._db.deactivate_ban_by_ip(ip_value)
 
+    candidates = [
+      {
+        "ip": ip_value,
+        "duration": int(meta.get("duration", 0)),
+        "reason": str(meta.get("reason", "db reconcile")),
+      }
+      for ip_value, meta in desired.items()
+    ]
+
     firewall_items = await self._firewall.list_banned_ips(limit=20000)
     firewall_ips = {
       str(item.get("ip") or "").strip()
@@ -1486,19 +1590,11 @@ class DashboardAPI:
     }
     desired_ips = set(desired.keys())
 
-    re_applied = 0
-    apply_failed = 0
-    for ip_value, meta in desired.items():
-      success = await self._firewall.ban_ip(
-        ip_value,
-        duration=int(meta.get("duration", 0)),
-        reason=f"{meta.get('reason', 'db reconcile')} [DBReconcile]",
-        force_reapply=True,
-      )
-      if success:
-        re_applied += 1
-      else:
-        apply_failed += 1
+    enforce_result = await self._firewall.enforce_db_bans(candidates)
+    re_applied = int(enforce_result.get("applied", 0))
+    apply_failed = int(enforce_result.get("failed", 0))
+    apply_skipped = int(enforce_result.get("skipped", 0))
+    requested = int(enforce_result.get("requested", 0))
 
     # Reconcile is intentionally one-way (DB -> Firewall).
     # Keep firewall-only entries untouched so manual operator bans are preserved.
@@ -1511,12 +1607,15 @@ class DashboardAPI:
       "admin.reconcile_bans",
       actor_username=actor,
       details={
+        "db_total_bans": db_total_bans,
         "db_active_considered": len(desired_ips),
         "expired_deactivated": deactivated_expired,
         "invalid_rows_skipped": skipped_invalid,
         "firewall_before": len(firewall_ips),
+        "requested": requested,
         "reapplied": re_applied,
         "apply_failed": apply_failed,
+        "apply_skipped": apply_skipped,
         "removed_extra": removed_extra,
         "remove_failed": remove_failed,
         "firewall_extra_untouched": firewall_extra_untouched,
@@ -1526,12 +1625,15 @@ class DashboardAPI:
     return web.json_response(
       {
         "ok": True,
+        "db_total_bans": db_total_bans,
         "db_active_considered": len(desired_ips),
         "expired_deactivated": deactivated_expired,
         "invalid_rows_skipped": skipped_invalid,
         "firewall_before": len(firewall_ips),
+        "requested": requested,
         "reapplied": re_applied,
         "apply_failed": apply_failed,
+        "apply_skipped": apply_skipped,
         "removed_extra": removed_extra,
         "remove_failed": remove_failed,
         "firewall_extra_untouched": firewall_extra_untouched,
@@ -3042,9 +3144,17 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
             <tbody id="queryRows"></tbody>
           </table>
         </div>
+        <div class="toolbar-grid stack-label">
+          <div class="sub">Admin Security</div>
+        </div>
+        <div class="toolbar-grid query-grid">
+          <div id="adminTotpLabel" class="sub">Require TOTP on login for this admin account</div>
+          <input id="adminTotpEnabled" class="ctrl" type="checkbox" aria-label="Require TOTP for this admin account" style="width:1.15rem;height:1.15rem;justify-self:start;align-self:center">
+          <button id="saveAdminTotpBtn" class="btn ghost">Save TOTP Setting</button>
+        </div>
         <div class="action-grid">
           <button id="enforceSimBansBtn" class="btn primary" hidden>Apply Simulated Bans To Firewall</button>
-          <button id="reconcileBansBtn" class="btn cyan">Reconcile DB Bans ↔ Firewall</button>
+          <button id="reconcileBansBtn" class="btn cyan">Push Active DB Bans -> Firewall</button>
           <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
           <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
           <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
@@ -3262,7 +3372,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], topPorts:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[]};
+var state = {events:[], bans:[], firewall:[], topPorts:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -3503,6 +3613,22 @@ async function runRecordQuery(){
   setStatus('ok','Query complete', 'Found '+N(payload.count||0)+' record(s) for '+(payload.field||field).toUpperCase()+'.');
 }
 function renderTopPortscannedPorts(){ $('#topPortsList').innerHTML = state.topPorts.length ? state.topPorts.map(function(p){ return '<div class="list-item"><strong class="mono">Port '+E(String(p.port||'-'))+'</strong><div class="sub">Scans: '+N(p.scan_count||0)+' · Last seen: '+ago(p.last_seen)+'</div></div>'; }).join('') : '<div class="empty">No portscan history yet.</div>'; }
+function renderAuthSettings(){
+  var label=$('#adminTotpLabel');
+  var toggle=$('#adminTotpEnabled');
+  if(!label||!toggle){ return; }
+  var profile=state.authSettings||{};
+  var username=String(profile.username||'this admin account');
+  var enabled=!!profile.totp_enabled;
+  toggle.checked=enabled;
+  label.textContent='Require TOTP on login for '+username;
+}
+async function loadAuthSettings(){
+  var payload=await api('/api/admin/auth-settings');
+  if(!payload){ return; }
+  state.authSettings={ username:String(payload.username||''), totp_enabled:!!payload.totp_enabled };
+  renderAuthSettings();
+}
 function renderBlocklistAdmin(){ var bl=state.blocklist; if(!bl||!bl.enabled){ $('#meshList').innerHTML='<div class="empty">Blocklist protection is disabled.</div>'; return; } var items=[]; if(bl.first_setup){ items.push('<div class="list-item"><strong>First Setup ('+E(bl.first_setup.mode)+')</strong><div class="sub">Status: '+(bl.first_setup.completed?'Completed':'Active — '+E(bl.first_setup.remaining||'unknown')+' remaining')+' · IPs loaded: '+N(bl.first_setup.ips_loaded||0)+'</div></div>'); } if(bl.active){ items.push('<div class="list-item"><strong>Active Blocklist</strong><div class="sub">Total IPs loaded: '+N(bl.active.total_ips_loaded||0)+' · Last fetch: '+ago(bl.active.last_fetch_at)+' · Last count: '+N(bl.active.last_fetch_count||0)+'</div></div>'); } if(bl.last_error){ items.push('<div class="list-item"><strong>Last Error</strong><div class="sub">'+E(bl.last_error)+'</div></div>'); } $('#meshList').innerHTML=items.join('')||'<div class="empty">Blocklist enabled, awaiting first fetch.</div>'; }
 function renderConfigStudio(){
   $('#cfgLogLevel').value=String(getConfigValue('general.log_level','INFO'));
@@ -3633,13 +3759,22 @@ function bind(){
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
   $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
   $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
+  $('#saveAdminTotpBtn').addEventListener('click', async function(){
+    handleUserActivity();
+    var enabled=$('#adminTotpEnabled').checked;
+    var payload=await api('/api/admin/auth-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({totp_enabled:enabled})});
+    if(!payload){ return; }
+    state.authSettings={ username:String(payload.username||''), totp_enabled:!!payload.totp_enabled };
+    renderAuthSettings();
+    setStatus('ok','Admin auth updated', payload.message || (enabled ? 'TOTP is now required at login.' : 'TOTP requirement is now disabled.'));
+  });
   $('#banManualBtn').addEventListener('click', async function(){ var ip=$('#manualBanIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the ban action.'); return; } var duration=parseInt($('#manualBanDuration').value,10); if(!Number.isFinite(duration)||duration<0){ duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10); } if(!Number.isFinite(duration)||duration<0){ duration=0; } var reason=$('#manualBanReason').value.trim(); handleUserActivity(); await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:reason}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); }); $('#manualBanIp').value=''; });
   $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
   $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); });
   $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
   $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
   $('#enforceSimBansBtn').addEventListener('click', async function(){ if(!confirm('Apply current simulated ban records to the real firewall now?')){ return; } handleUserActivity(); await performAction('/api/admin/enforce-simulated-bans', {}, 'Simulated bans applied', function(payload){ return 'Applied '+N(payload.applied||0)+' ban(s) to firewall. Failed: '+N(payload.failed||0)+', skipped: '+N(payload.skipped||0)+'.'; }); });
-  $('#reconcileBansBtn').addEventListener('click', async function(){ if(!confirm('Reconcile firewall from active DB bans now? (One-way: DB -> Firewall)')){ return; } handleUserActivity(); await performAction('/api/admin/reconcile-bans', {}, 'Firewall reconciled', function(payload){ return 'DB active: '+N(payload.db_active_considered||0)+' · Reapplied: '+N(payload.reapplied||0)+' · Apply failed: '+N(payload.apply_failed||0)+' · Expired deactivated: '+N(payload.expired_deactivated||0)+' · Firewall extras untouched: '+N(payload.firewall_extra_untouched||0)+'.'; }); });
+  $('#reconcileBansBtn').addEventListener('click', async function(){ if(!confirm('Push active DB bans to firewall now? This is one-way (DB -> Firewall).')){ return; } handleUserActivity(); await performAction('/api/admin/reconcile-bans', {}, 'Firewall sync completed', function(payload){ return 'DB total: '+N(payload.db_total_bans||0)+' · DB active: '+N(payload.db_active_considered||0)+' · Requested: '+N(payload.requested||0)+' · Applied: '+N(payload.reapplied||0)+' · Failed: '+N(payload.apply_failed||0)+' · Skipped: '+N(payload.apply_skipped||0)+' · Expired deactivated: '+N(payload.expired_deactivated||0)+' · Firewall extras untouched: '+N(payload.firewall_extra_untouched||0)+'.'; }); });
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
   $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });
@@ -3658,7 +3793,7 @@ function bind(){
   $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
 }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
-initTheme(); bind(); bindActivity(); loadConfig(); loadUpdateStatus(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+initTheme(); bind(); bindActivity(); loadConfig(); loadAuthSettings(); loadUpdateStatus(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 })();
 </script>
 </body>

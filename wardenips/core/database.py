@@ -747,6 +747,21 @@ class DatabaseManager:
             )
             await self._db.commit()
 
+    async def set_admin_totp_enabled(self, username: str, enabled: bool) -> int:
+        """Enable or disable TOTP for a specific active admin account."""
+        async with self._lock:
+            async with self._db.execute(
+                """
+                UPDATE admin_users
+                SET totp_enabled = ?,
+                    updated_at = datetime('now')
+                WHERE username = ? AND is_active = 1
+                """,
+                (1 if enabled else 0, username),
+            ) as cursor:
+                await self._db.commit()
+                return cursor.rowcount if cursor.rowcount is not None else 0
+
     async def log_audit_event(
         self,
         action: str,
