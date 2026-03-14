@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional, Dict
 
@@ -87,6 +88,9 @@ class PortscanPlugin(BasePlugin):
         self._installed_iptables = False
         self._installed_iptables_port_groups: list[str] = []
         self._installed_all_ports_interfaces: list[str] = []
+        # Dedup cache: prevents double-processing when both UFW and Warden-PortScan
+        # iptables rules log the same packet (same ip+port within 2 seconds).
+        self._recently_seen: dict[tuple, float] = {}
 
     def _build_all_ports_rule_args(self, interface: Optional[str] = None) -> list[str]:
         args = ["INPUT"]
@@ -261,6 +265,20 @@ class PortscanPlugin(BasePlugin):
                 return None
         except ValueError:
             return None
+
+        # Deduplicate: UFW and Warden-PortScan iptables rules both log the same
+        # SYN packet, producing two kern.log lines within milliseconds of each
+        # other.  Drop the second one to avoid double ban-logging.
+        now_mono = time.monotonic()
+        seen_key = (ip, port)
+        if now_mono - self._recently_seen.get(seen_key, 0.0) < 2.0:
+            return None
+        self._recently_seen[seen_key] = now_mono
+        # Prune stale entries to prevent unbounded growth
+        if len(self._recently_seen) > 5000:
+            cutoff = now_mono - 2.0
+            self._recently_seen = {k: v for k, v in self._recently_seen.items() if v > cutoff}
+
         timestamp = self._parse_timestamp(line)
 
         return ConnectionEvent(

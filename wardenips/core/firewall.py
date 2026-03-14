@@ -341,8 +341,9 @@ class FirewallManager:
 
         # Skip if already banned unless a forced replay was requested.
         # Forced replay is used when applying bans collected during simulation.
+        # Return False (not True) so callers don't write duplicate DB/AbuseIPDB entries.
         if ip_str in self._banned_ips and not force_reapply:
-            return True
+            return False
 
         ban_duration = duration if duration is not None else self._default_ban_duration
         if ban_duration > _IPSET_MAX_TIMEOUT_SECONDS:
@@ -353,6 +354,12 @@ class FirewallManager:
             )
             ban_duration = _IPSET_MAX_TIMEOUT_SECONDS
         target_set = self._get_set_for_ip(ip_str)
+
+        # Optimistic lock: mark as banned before the async ipset call so that any
+        # concurrent event for the same IP also sees it as banned and returns
+        # False above — preventing duplicate DB logs and AbuseIPDB reports.
+        if not force_reapply:
+            self._banned_ips.add(ip_str)
 
         if force_reapply:
             await self._exec_command(
@@ -380,12 +387,16 @@ class FirewallManager:
             )
 
         if success:
-            self._banned_ips.add(ip_str)
+            self._banned_ips.add(ip_str)  # idempotent for normal path
             dur_str = f"{ban_duration}s" if ban_duration > 0 else "KALICI"
             logger.info(
                 "IP BANNED: %s | Duration: %s | Reason: %s",
                 ip_str, dur_str, reason,
             )
+        else:
+            # Rollback the optimistic add if ipset command failed
+            if not force_reapply:
+                self._banned_ips.discard(ip_str)
         return success
 
     async def enforce_db_bans(self, items: list[dict[str, object]]) -> dict[str, int]:
