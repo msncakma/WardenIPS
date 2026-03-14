@@ -145,7 +145,7 @@ class WardenIPS:
         )
         self._logger.info("Firewall: %s", self._firewall)
         self._smart_scoring = SmartScoringEngine(
-            self._config.get("firewall.ipset.default_ban_duration", 3600)
+            self._config.get("firewall.ipset.default_ban_duration", 0)
         )
 
         self._abuse_reporter = await AbuseIPDBReporter.create(self._config)
@@ -267,13 +267,9 @@ class WardenIPS:
             ]
             if len(ts_list) >= self._burst_threshold:
                 source_ip = event.source_ip
-                permanent_ban_default = bool(
-                    self._config.get("firewall.permanent_ban_default", True)
-                )
-                prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
-                ban_duration = (
-                    0 if permanent_ban_default
-                    else self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                ban_duration = max(
+                    int(self._config.get("firewall.ipset.default_ban_duration", 0)),
+                    0,
                 )
                 reason = (
                     f"[{plugin.name}] BURST FLOOD — "
@@ -416,14 +412,10 @@ class WardenIPS:
             action = plugin.get_action_recommendation(risk_score)
 
             if action == "BAN":
-                ban_threshold = self._config.get("firewall.ban_threshold", 70)
-                permanent_ban_default = bool(
-                    self._config.get("firewall.permanent_ban_default", True)
-                )
                 prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
-                ban_duration = (
-                    0 if (permanent_ban_default and risk_score >= ban_threshold)
-                    else self._smart_scoring.recidivist_ban_duration(prior_ban_count)
+                ban_duration = max(
+                    int(self._config.get("firewall.ipset.default_ban_duration", 0)),
+                    0,
                 )
                 protected = await self._is_critical_protected_ip(source_ip)
                 if protected:

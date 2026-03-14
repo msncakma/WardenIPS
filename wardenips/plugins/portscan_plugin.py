@@ -29,8 +29,10 @@ logger = get_logger(__name__)
 # kernel: [1234.567] [UFW BLOCK] IN=eth0 OUT= MAC=... SRC=1.2.3.4 DST=... PROTO=TCP ... DPT=23
 # kernel: [1234.567] Warden-PortScan: IN=eth0 OUT= MAC=... SRC=1.2.3.4 DST=... PROTO=TCP ... DPT=23
 _RE_PORTSCAN = re.compile(
-    r"(?:\[UFW BLOCK\]|Warden-PortScan:).*?SRC=([0-9a-fA-F:\.]+).*?DPT=(\d+)"
+    r"(?:\[UFW BLOCK\]|\[UFW AUDIT\]|Warden-PortScan(?:-All)?:|\bDROP\b|\bREJECT\b|\bDENY\b).*?SRC=([0-9a-fA-F:\.]+).*?DPT=(\d+)"
 )
+
+_RE_GENERIC_FIREWALL = re.compile(r"SRC=([0-9a-fA-F:\.]+).*?DPT=(\d+)")
 
 # Syslog style prefix: Mar 13 14:30:22
 _RE_SYSLOG_DATE = re.compile(r"^(\w{3}\s+\d+\s+\d+:\d+:\d+)")
@@ -155,7 +157,14 @@ class PortscanPlugin(BasePlugin):
     async def parse_line(self, line: str) -> Optional[ConnectionEvent]:
         match = _RE_PORTSCAN.search(line)
         if not match:
-            return None
+            # Fallback for distro-specific firewall log prefixes that still expose
+            # SRC/DPT fields but don't include UFW/Warden marker strings.
+            upper_line = line.upper()
+            if not any(marker in upper_line for marker in ("DROP", "REJECT", "DENY", "BLOCK", "Warden-PortScan".upper())):
+                return None
+            match = _RE_GENERIC_FIREWALL.search(line)
+            if not match:
+                return None
 
         ip = match.group(1)
         port = match.group(2)

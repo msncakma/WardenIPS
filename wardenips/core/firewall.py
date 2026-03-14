@@ -46,7 +46,7 @@ class FirewallManager:
 
     Usage:
     fw = await FirewallManager.create(config, whitelist_manager)
-    await fw.ban_ip("203.0.113.50", duration=3600, reason="Brute-force")
+    await fw.ban_ip("203.0.113.50", duration=0, reason="Brute-force")
     await fw.unban_ip("203.0.113.50")
     await fw.shutdown()
     """
@@ -54,7 +54,7 @@ class FirewallManager:
     def __init__(self) -> None:
         self._set_name: str = "warden_blacklist"
         self._set_name_v6: str = "warden_blacklist_v6"
-        self._default_ban_duration: int = 3600
+        self._default_ban_duration: int = 0
         self._simulation_mode: bool = False
         self._forced_simulation: bool = False
         self._whitelist = None
@@ -106,7 +106,7 @@ class FirewallManager:
         ipset_section = fw_section.get("ipset", {})
         self._set_name = ipset_section.get("set_name", "warden_blacklist")
         self._default_ban_duration = ipset_section.get(
-            "default_ban_duration", 3600
+            "default_ban_duration", 0
         )
 
         # Platform ve yetki kontrolu
@@ -277,6 +277,7 @@ class FirewallManager:
         # a restart does not lose track of already-banned IPs.
         if not self._simulation_mode:
             await self._load_existing_bans()
+            await self._normalize_existing_bans_if_permanent_default()
 
         self._initialized = True
         ipv6_str = "enabled" if self._ipv6_supported else "disabled"
@@ -352,6 +353,16 @@ class FirewallManager:
             )
             ban_duration = _IPSET_MAX_TIMEOUT_SECONDS
         target_set = self._get_set_for_ip(ip_str)
+
+        if force_reapply:
+            await self._exec_command(
+                self._ipset_cmd,
+                "del",
+                target_set,
+                ip_str,
+                "-exist",
+                ignore_errors=True,
+            )
 
         if ban_duration > 0:
             success = await self._exec_command(
@@ -604,6 +615,32 @@ class FirewallManager:
                 logger.debug("Failed to get ban count for %s: %s", set_name, exc)
 
         return total
+
+    async def _normalize_existing_bans_if_permanent_default(self) -> None:
+        """Re-apply existing entries with timeout 0 when permanent mode is configured."""
+        if self._simulation_mode or self._default_ban_duration > 0:
+            return
+        if not self._banned_ips:
+            return
+
+        normalized = 0
+        for ip_value in list(self._banned_ips):
+            # Force reapply so existing entries created with legacy set defaults
+            # do not continue counting down with stale timeouts.
+            success = await self.ban_ip(
+                ip_value,
+                duration=0,
+                reason="startup normalize permanent",
+                force_reapply=True,
+            )
+            if success:
+                normalized += 1
+
+        if normalized:
+            logger.info(
+                "Normalized %d existing firewall entry(ies) to permanent timeout=0.",
+                normalized,
+            )
 
     async def list_banned_ips(self, limit: int = 500) -> list[dict[str, str]]:
         """

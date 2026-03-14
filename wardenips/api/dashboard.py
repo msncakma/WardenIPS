@@ -14,6 +14,7 @@ Endpoints:
   GET  /api/events?limit=N      — Recent events
   GET  /api/firewall            — Firewall status
   GET  /api/top-attackers       — Top attacking source IPs
+  GET  /api/top-portscanned-ports — Top scanned destination ports (portscan plugin)
   GET  /api/events-timeline     — Events grouped by hour
   GET  /api/asn-stats           — Events grouped by ASN organization
   GET  /api/threat-distribution — Events grouped by threat level
@@ -490,6 +491,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/events", self._handle_events)
     self._app.router.add_get("/api/firewall", self._handle_firewall)
     self._app.router.add_get("/api/top-attackers", self._handle_top_attackers)
+    self._app.router.add_get("/api/top-portscanned-ports", self._handle_top_portscanned_ports)
     self._app.router.add_get("/api/events-timeline", self._handle_events_timeline)
     self._app.router.add_get("/api/asn-stats", self._handle_asn_stats)
     self._app.router.add_get("/api/geo-heatmap", self._handle_geo_heatmap)
@@ -504,6 +506,8 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/deactivate-ban", self._handle_admin_deactivate_ban)
     self._app.router.add_post("/api/admin/deactivate-all-bans", self._handle_admin_deactivate_all_bans)
     self._app.router.add_post("/api/admin/enforce-simulated-bans", self._handle_admin_enforce_simulated_bans)
+    self._app.router.add_post("/api/admin/reconcile-bans", self._handle_admin_reconcile_bans)
+    self._app.router.add_post("/api/admin/query-records", self._handle_admin_query_records)
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
     self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
@@ -660,6 +664,43 @@ class DashboardAPI:
           columns = [d[0] for d in cursor.description]
           attackers = [dict(zip(columns, row)) for row in rows]
       return web.json_response({"attackers": attackers})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_top_portscanned_ports(self, request: web.Request) -> web.Response:
+    if not self._check_public_dashboard_access(request):
+      return self._json_auth_error()
+    limit = min(int(request.query.get("limit", "10")), 100)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT
+               CASE
+                 WHEN player_name LIKE 'port_%' THEN substr(player_name, 6)
+                 ELSE ''
+               END AS scanned_port,
+               COUNT(*) AS scan_count,
+               MAX(timestamp) AS last_seen
+          FROM connection_events
+          WHERE connection_type = 'portscan'
+          GROUP BY scanned_port
+          HAVING scanned_port <> ''
+          ORDER BY scan_count DESC, last_seen DESC
+          LIMIT ?
+          """,
+          (limit,),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          ports = [
+            {
+              "port": str(row[0]),
+              "scan_count": int(row[1]),
+              "last_seen": row[2],
+            }
+            for row in rows
+          ]
+      return web.json_response({"ports": ports, "count": len(ports)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -1219,11 +1260,11 @@ class DashboardAPI:
     except Exception:
       return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
 
-    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 3600))
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
     try:
       duration = max(int(duration_value), 0)
     except Exception:
-      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 3600)), 0)
+      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
 
     reason = str(payload.get("reason", "")).strip() or "[ADMIN] Manual ban from dashboard"
     risk_score_value = payload.get("risk_score", 100)
@@ -1370,6 +1411,276 @@ class DashboardAPI:
         "failed": result.get("failed", 0),
         "skipped": result.get("skipped", 0),
         "expired_deactivated": deactivated_expired,
+      }
+    )
+
+  async def _handle_admin_reconcile_bans(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+
+    if self._firewall.simulation_mode:
+      return web.json_response(
+        {
+          "error": "simulation_mode_enabled",
+          "message": "Cannot reconcile firewall while simulation mode is enabled.",
+        },
+        status=400,
+      )
+
+    now_unix = int(time.time())
+    desired: dict[str, dict[str, object]] = {}
+    expired_ips: set[str] = set()
+    skipped_invalid = 0
+
+    async with self._db._lock:
+      async with self._db._db.execute(
+        """
+        SELECT source_ip, reason, ban_duration, expires_at
+        FROM ban_history
+        WHERE is_active = 1
+        ORDER BY banned_at DESC
+        LIMIT 20000
+        """
+      ) as cursor:
+        rows = await cursor.fetchall()
+
+    for source_ip, reason, ban_duration, expires_at in rows:
+      ip_value = str(source_ip or "").strip()
+      if not ip_value or ip_value in desired:
+        continue
+      try:
+        ipaddress.ip_address(ip_value)
+      except Exception:
+        skipped_invalid += 1
+        continue
+
+      try:
+        duration = max(int(ban_duration or 0), 0)
+      except Exception:
+        duration = 0
+
+      expires_unix = self._parse_timestamp_unix(expires_at)
+      if expires_unix is not None:
+        remaining = expires_unix - now_unix
+        if remaining <= 0:
+          expired_ips.add(ip_value)
+          continue
+        duration = max(int(remaining), 1)
+
+      desired[ip_value] = {
+        "duration": duration,
+        "reason": str(reason or "db reconcile"),
+      }
+
+    deactivated_expired = 0
+    for ip_value in expired_ips:
+      deactivated_expired += await self._db.deactivate_ban_by_ip(ip_value)
+
+    firewall_items = await self._firewall.list_banned_ips(limit=20000)
+    firewall_ips = {
+      str(item.get("ip") or "").strip()
+      for item in firewall_items
+      if str(item.get("ip") or "").strip()
+    }
+    desired_ips = set(desired.keys())
+
+    re_applied = 0
+    apply_failed = 0
+    for ip_value, meta in desired.items():
+      success = await self._firewall.ban_ip(
+        ip_value,
+        duration=int(meta.get("duration", 0)),
+        reason=f"{meta.get('reason', 'db reconcile')} [DBReconcile]",
+        force_reapply=True,
+      )
+      if success:
+        re_applied += 1
+      else:
+        apply_failed += 1
+
+    removed_extra = 0
+    remove_failed = 0
+    for ip_value in sorted(firewall_ips - desired_ips):
+      success = await self._firewall.unban_ip(ip_value)
+      if success:
+        removed_extra += 1
+      else:
+        remove_failed += 1
+
+    await self._log_audit(
+      request,
+      "admin.reconcile_bans",
+      actor_username=actor,
+      details={
+        "db_active_considered": len(desired_ips),
+        "expired_deactivated": deactivated_expired,
+        "invalid_rows_skipped": skipped_invalid,
+        "firewall_before": len(firewall_ips),
+        "reapplied": re_applied,
+        "apply_failed": apply_failed,
+        "removed_extra": removed_extra,
+        "remove_failed": remove_failed,
+      },
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "db_active_considered": len(desired_ips),
+        "expired_deactivated": deactivated_expired,
+        "invalid_rows_skipped": skipped_invalid,
+        "firewall_before": len(firewall_ips),
+        "reapplied": re_applied,
+        "apply_failed": apply_failed,
+        "removed_extra": removed_extra,
+        "remove_failed": remove_failed,
+      }
+    )
+
+  async def _handle_admin_query_records(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    field = str(payload.get("field", "auto") or "auto").strip().lower()
+    value = str(payload.get("value", "") or "").strip()
+    limit = min(max(int(payload.get("limit", 200) or 200), 1), 1000)
+
+    if not value:
+      return web.json_response({"error": "invalid_query", "message": "Query value is required."}, status=400)
+
+    if field not in {"auto", "ip", "asn", "user"}:
+      return web.json_response({"error": "invalid_field", "message": "Field must be one of: auto, ip, asn, user."}, status=400)
+
+    if field == "auto":
+      try:
+        ipaddress.ip_address(value)
+        resolved_field = "ip"
+      except Exception:
+        normalized = value.upper().strip()
+        if normalized.startswith("AS") and normalized[2:].isdigit():
+          resolved_field = "asn"
+        elif normalized.isdigit():
+          resolved_field = "asn"
+        else:
+          resolved_field = "user"
+    else:
+      resolved_field = field
+
+    event_query = """
+      SELECT timestamp, source_ip, player_name, connection_type,
+             asn_number, asn_org, risk_score, threat_level, details
+      FROM connection_events
+    """
+    event_params: list[object] = []
+
+    if resolved_field == "ip":
+      event_query += " WHERE source_ip = ?"
+      event_params.append(value)
+    elif resolved_field == "asn":
+      normalized = value.upper().strip()
+      asn_number: Optional[int] = None
+      if normalized.startswith("AS"):
+        normalized = normalized[2:]
+      if normalized.isdigit():
+        asn_number = int(normalized)
+      if asn_number is not None:
+        event_query += " WHERE asn_number = ? OR LOWER(COALESCE(asn_org, '')) LIKE ?"
+        event_params.extend([asn_number, f"%{value.lower()}%"])
+      else:
+        event_query += " WHERE LOWER(COALESCE(asn_org, '')) LIKE ?"
+        event_params.append(f"%{value.lower()}%")
+    else:
+      event_query += " WHERE LOWER(COALESCE(player_name, '')) LIKE ?"
+      event_params.append(f"%{value.lower()}%")
+
+    event_query += " ORDER BY timestamp DESC LIMIT ?"
+    event_params.append(limit)
+
+    records: list[dict[str, object]] = []
+
+    async with self._db._lock:
+      async with self._db._db.execute(event_query, event_params) as cursor:
+        rows = await cursor.fetchall()
+      for timestamp, source_ip, player_name, connection_type, asn_number, asn_org, risk_score, threat_level, details_value in rows:
+        details_obj = {}
+        if isinstance(details_value, str) and details_value:
+          try:
+            details_obj = json.loads(details_value)
+          except Exception:
+            details_obj = {}
+        elif isinstance(details_value, dict):
+          details_obj = details_value
+        records.append(
+          {
+            "kind": "event",
+            "timestamp": timestamp,
+            "source_ip": source_ip,
+            "player_name": player_name,
+            "connection_type": connection_type,
+            "event_type": str(details_obj.get("event_type") or ""),
+            "asn_number": asn_number,
+            "asn_org": asn_org,
+            "risk_score": risk_score,
+            "threat_level": threat_level,
+          }
+        )
+
+      if resolved_field == "ip":
+        async with self._db._db.execute(
+          """
+          SELECT banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
+          FROM ban_history
+          WHERE source_ip = ?
+          ORDER BY banned_at DESC
+          LIMIT ?
+          """,
+          (value, limit),
+        ) as cursor:
+          ban_rows = await cursor.fetchall()
+        for banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active in ban_rows:
+          records.append(
+            {
+              "kind": "ban",
+              "timestamp": banned_at,
+              "source_ip": source_ip,
+              "reason": reason,
+              "risk_score": risk_score,
+              "ban_duration": ban_duration,
+              "expires_at": expires_at,
+              "is_active": bool(is_active),
+            }
+          )
+
+    records.sort(
+      key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
+      reverse=True,
+    )
+    if len(records) > limit:
+      records = records[:limit]
+
+    await self._log_audit(
+      request,
+      "admin.query_records",
+      actor_username=actor,
+      details={"field": resolved_field, "value": value, "count": len(records), "limit": limit},
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "field": resolved_field,
+        "value": value,
+        "count": len(records),
+        "records": records,
       }
     )
 
@@ -2219,7 +2530,7 @@ footer a:hover{text-decoration:underline}
       <div class="pb"><div class="cb" id="coc"></div></div>
     </div>
     <div class="pl ai d3">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Attackers</h2><span class="pill" id="ac">0</span></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span></div>
       <div class="pb"><div class="cb" id="atc"></div></div>
     </div>
     <div class="pl ai d4">
@@ -2433,7 +2744,7 @@ async function refresh(){
   var co=await A('/api/asn-stats');
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
-  var at=await A('/api/top-attackers?limit=10');
+  var at=await A('/api/top-portscanned-ports?limit=10');
   var ti=await A('/api/blocklist');
   var gh=await A('/api/geo-heatmap?hours=24');
 
@@ -2517,10 +2828,10 @@ async function refresh(){
   // Plugins
   bars('plc',pg?pg.plugins:null,'plugin','count',3);
 
-  // Attackers
+  // Top scanned ports
   var ap=$('#ac');
-  if(at&&at.attackers){ap.textContent=at.attackers.length;
-    var ait=at.attackers.map(function(a){return{label:(a.source_ip||'').substring(0,16)+'…',count:a.ban_count}});
+  if(at&&at.ports){ap.textContent=at.ports.length;
+    var ait=at.ports.map(function(p){return{label:'Port '+String(p.port||'-'),count:p.scan_count||0}});
     bars('atc',ait,'label','count',1)}
   else{ap.textContent='0';bars('atc',[],'label','count',1)}
 
@@ -2690,7 +3001,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         </div>
         <div class="toolbar-grid three">
           <input id="manualBanIp" class="ctrl search" placeholder="Enter an IP address to ban manually">
-          <input id="manualBanDuration" class="ctrl" type="number" min="0" value="3600" placeholder="Duration (sec, 0=permanent)">
+          <input id="manualBanDuration" class="ctrl" type="number" min="0" value="0" placeholder="Duration (sec, 0=permanent)">
           <button id="banManualBtn" class="btn warn">Ban IP</button>
         </div>
         <div class="toolbar-grid">
@@ -2711,8 +3022,28 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <button id="addWhitelistBtn" class="btn cyan">Add Whitelist</button>
           <button id="removeWhitelistBtn" class="btn ghost">Remove From Whitelist</button>
         </div>
+        <div class="toolbar-grid stack-label">
+          <div class="sub">Record Query (IP / ASN / Username)</div>
+        </div>
+        <div class="toolbar-grid three">
+          <select id="queryField" class="ctrl">
+            <option value="auto">Auto Detect</option>
+            <option value="ip">IP</option>
+            <option value="asn">ASN</option>
+            <option value="user">Username</option>
+          </select>
+          <input id="queryValue" class="ctrl search" placeholder="Example: 203.0.113.4, AS15169, notch">
+          <button id="queryRunBtn" class="btn ghost">Run Query</button>
+        </div>
+        <div class="table-wrap" style="max-height:240px">
+          <table>
+            <thead><tr><th>Type</th><th>Time</th><th>IP</th><th>Details</th><th>Risk</th></tr></thead>
+            <tbody id="queryRows"></tbody>
+          </table>
+        </div>
         <div class="action-grid">
           <button id="enforceSimBansBtn" class="btn primary" hidden>Apply Simulated Bans To Firewall</button>
+          <button id="reconcileBansBtn" class="btn cyan">Reconcile DB Bans ↔ Firewall</button>
           <button id="deactivateAllBansBtn" class="btn ghost">Deactivate All DB Bans</button>
           <button id="flushFirewallBtn" class="btn warn">Flush Firewall Bans</button>
           <button id="clearEventsBtn" class="btn ghost">Clear Event History</button>
@@ -2762,7 +3093,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
       <div class="card"><h2>Blocklist Protection</h2><div class="list" id="meshList"></div></div>
-      <div class="card"><h2>Top Attackers</h2><div class="list" id="attackerList"></div></div>
+      <div class="card"><h2>Top Portscanned Ports</h2><div class="list" id="topPortsList"></div></div>
     </div>
   </div>
 
@@ -2930,7 +3261,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], attackers:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[]};
+var state = {events:[], bans:[], firewall:[], topPorts:[], mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[]};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -3138,7 +3469,39 @@ function renderFirewall(){
   rows=rows.filter(function(item){ return (!q||[item.ip,item.family].join(' ').toLowerCase().indexOf(q)!==-1)&&(!family||item.family===family); });
   $('#firewallRows').innerHTML = rows.length ? rows.map(function(item){ return '<tr><td class="mono">'+E(item.ip)+'</td><td>'+E(item.family)+'</td><td><button class="btn small primary fw-action" data-ip="'+E(item.ip)+'">Unban</button></td></tr>'; }).join('') : '<tr><td colspan="3" class="empty">No firewall IPs match the current filters.</td></tr>';
 }
-function renderAttackers(){ $('#attackerList').innerHTML = state.attackers.length ? state.attackers.map(function(a){ return '<div class="list-item"><strong class="mono">'+E(a.source_ip||'-')+'</strong><div class="sub">Bans: '+N(a.ban_count)+' · Max risk: '+N(a.max_risk||0)+' · Last: '+ago(a.last_ban)+'</div></div>'; }).join('') : '<div class="empty">No attacker history yet.</div>'; }
+function renderQueryResults(rows){
+  var target=$('#queryRows');
+  if(!rows||!rows.length){
+    target.innerHTML='<tr><td colspan="5" class="empty">No records found for this query.</td></tr>';
+    return;
+  }
+  target.innerHTML=rows.map(function(r){
+    var kind=String(r.kind||'event').toUpperCase();
+    var ts=ago(r.timestamp);
+    var ip=E(r.source_ip||'-');
+    var details='-';
+    if(r.kind==='ban'){
+      details=E((r.reason||'-')+' · '+(r.ban_duration&&r.ban_duration>0?(''+r.ban_duration+'s'):'Permanent')+' · '+(r.is_active?'Active':'Inactive'));
+    }else{
+      var bits=[r.connection_type||'-', r.event_type||'', r.player_name||'', r.asn_org||''];
+      details=E(bits.filter(function(v){ return !!v; }).join(' · ')||'-');
+    }
+    return '<tr><td>'+E(kind)+'</td><td>'+E(ts)+'</td><td class="mono">'+ip+'</td><td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+details+'">'+details+'</td><td>'+E(String(r.risk_score||0))+'</td></tr>';
+  }).join('');
+}
+async function runRecordQuery(){
+  var value=$('#queryValue').value.trim();
+  if(!value){
+    setStatus('err','Missing query','Enter an IP, ASN, or username to search.');
+    return;
+  }
+  var field=$('#queryField').value||'auto';
+  var payload=await api('/api/admin/query-records', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({field:field, value:value, limit:300})});
+  if(!payload){ return; }
+  renderQueryResults(payload.records||[]);
+  setStatus('ok','Query complete', 'Found '+N(payload.count||0)+' record(s) for '+(payload.field||field).toUpperCase()+'.');
+}
+function renderTopPortscannedPorts(){ $('#topPortsList').innerHTML = state.topPorts.length ? state.topPorts.map(function(p){ return '<div class="list-item"><strong class="mono">Port '+E(String(p.port||'-'))+'</strong><div class="sub">Scans: '+N(p.scan_count||0)+' · Last seen: '+ago(p.last_seen)+'</div></div>'; }).join('') : '<div class="empty">No portscan history yet.</div>'; }
 function renderBlocklistAdmin(){ var bl=state.blocklist; if(!bl||!bl.enabled){ $('#meshList').innerHTML='<div class="empty">Blocklist protection is disabled.</div>'; return; } var items=[]; if(bl.first_setup){ items.push('<div class="list-item"><strong>First Setup ('+E(bl.first_setup.mode)+')</strong><div class="sub">Status: '+(bl.first_setup.completed?'Completed':'Active — '+E(bl.first_setup.remaining||'unknown')+' remaining')+' · IPs loaded: '+N(bl.first_setup.ips_loaded||0)+'</div></div>'); } if(bl.active){ items.push('<div class="list-item"><strong>Active Blocklist</strong><div class="sub">Total IPs loaded: '+N(bl.active.total_ips_loaded||0)+' · Last fetch: '+ago(bl.active.last_fetch_at)+' · Last count: '+N(bl.active.last_fetch_count||0)+'</div></div>'); } if(bl.last_error){ items.push('<div class="list-item"><strong>Last Error</strong><div class="sub">'+E(bl.last_error)+'</div></div>'); } $('#meshList').innerHTML=items.join('')||'<div class="empty">Blocklist enabled, awaiting first fetch.</div>'; }
 function renderConfigStudio(){
   $('#cfgLogLevel').value=String(getConfigValue('general.log_level','INFO'));
@@ -3150,7 +3513,8 @@ function renderConfigStudio(){
   $('#cfgLoginRate').value=String(getConfigValue('dashboard.login_rate_limit_per_minute',10));
   $('#cfgSimulationMode').checked=!!getConfigValue('firewall.simulation_mode',false);
   $('#cfgBanThreshold').value=String(getConfigValue('firewall.ban_threshold',70));
-  $('#cfgBanDuration').value=String(getConfigValue('firewall.ipset.default_ban_duration',3600));
+  $('#cfgBanDuration').value=String(getConfigValue('firewall.ipset.default_ban_duration',0));
+  $('#manualBanDuration').value=String(getConfigValue('firewall.ipset.default_ban_duration',0));
   $('#cfgTelegramEnabled').checked=!!getConfigValue('notifications.telegram.enabled',false);
   $('#cfgTelegramChatId').value=String(getConfigValue('notifications.telegram.chat_id',''));
   $('#cfgDiscordEnabled').checked=!!getConfigValue('notifications.discord.enabled',false);
@@ -3201,7 +3565,7 @@ async function saveConfigForm(){
     'dashboard.login_rate_limit_per_minute': parseInt($('#cfgLoginRate').value,10)||10,
     'firewall.simulation_mode': $('#cfgSimulationMode').checked,
     'firewall.ban_threshold': parseInt($('#cfgBanThreshold').value,10)||70,
-    'firewall.ipset.default_ban_duration': parseInt($('#cfgBanDuration').value,10)||3600,
+    'firewall.ipset.default_ban_duration': parseInt($('#cfgBanDuration').value,10)||0,
     'notifications.telegram.enabled': $('#cfgTelegramEnabled').checked,
     'notifications.telegram.chat_id': $('#cfgTelegramChatId').value.trim(),
     'notifications.discord.enabled': $('#cfgDiscordEnabled').checked,
@@ -3246,10 +3610,10 @@ function renderAdvice(){
 function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return e.connection_type||'unknown'; }))).sort(); select.innerHTML='<option value="">All Plugins</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v.toUpperCase())+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 function syncCountryFilter(){ var select=$('#eventCountryFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return String(e.country_code||'').toUpperCase(); }).filter(function(v){ return v && v!=='ZZ'; }))).sort(); select.innerHTML='<option value="">All Countries</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v)+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 async function refresh(){
-  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-attackers?limit=12'),api('/api/blocklist')]);
+  var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api('/api/top-portscanned-ports?limit=12'),api('/api/blocklist')]);
   if(results.some(function(item){ return item===null; })){ return; }
-  state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.attackers=results[5]&&results[5].attackers?results[5].attackers:[]; state.blocklist=results[6]||null;
-  syncPluginFilter(); syncCountryFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderAttackers(); renderBlocklistAdmin(); renderAdvice();
+  state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.topPorts=results[5]&&results[5].ports?results[5].ports:[]; state.blocklist=results[6]||null;
+  syncPluginFilter(); syncCountryFilter(); renderSummary(); renderEvents(); renderBans(); renderFirewall(); renderTopPortscannedPorts(); renderBlocklistAdmin(); renderAdvice();
 }
 async function performAction(path, body, successTitle, successMessage){ var payload = await api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); if(!payload){ return false; } setStatus('ok', successTitle, successMessage(payload)); await refresh(); return true; }
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
@@ -3266,12 +3630,15 @@ function bind(){
   $('#refreshNow').addEventListener('click', function(){ handleUserActivity(); refresh(); });
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
-  $('#banManualBtn').addEventListener('click', async function(){ var ip=$('#manualBanIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the ban action.'); return; } var duration=parseInt($('#manualBanDuration').value,10); if(!Number.isFinite(duration)||duration<0){ duration=3600; } var reason=$('#manualBanReason').value.trim(); handleUserActivity(); await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:reason}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); }); $('#manualBanIp').value=''; });
+  $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
+  $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
+  $('#banManualBtn').addEventListener('click', async function(){ var ip=$('#manualBanIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the ban action.'); return; } var duration=parseInt($('#manualBanDuration').value,10); if(!Number.isFinite(duration)||duration<0){ duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10); } if(!Number.isFinite(duration)||duration<0){ duration=0; } var reason=$('#manualBanReason').value.trim(); handleUserActivity(); await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:reason}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); }); $('#manualBanIp').value=''; });
   $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
   $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); });
   $('#removeWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before removing from whitelist.'); return; } handleUserActivity(); await performAction('/api/admin/whitelist/remove', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Removed '+value+' from whitelist.'); }); $('#manualWhitelist').value=''; });
   $('#deactivateAllBansBtn').addEventListener('click', async function(){ if(!confirm('Deactivate every active database ban record?')){ return; } handleUserActivity(); await performAction('/api/admin/deactivate-all-bans', {}, 'Database bans updated', function(payload){ return 'Deactivated '+N(payload.updated||0)+' active ban records.'; }); });
   $('#enforceSimBansBtn').addEventListener('click', async function(){ if(!confirm('Apply current simulated ban records to the real firewall now?')){ return; } handleUserActivity(); await performAction('/api/admin/enforce-simulated-bans', {}, 'Simulated bans applied', function(payload){ return 'Applied '+N(payload.applied||0)+' ban(s) to firewall. Failed: '+N(payload.failed||0)+', skipped: '+N(payload.skipped||0)+'.'; }); });
+  $('#reconcileBansBtn').addEventListener('click', async function(){ if(!confirm('Reconcile firewall with active DB bans now? This will remove firewall IPs that are not active in DB.')){ return; } handleUserActivity(); await performAction('/api/admin/reconcile-bans', {}, 'Firewall reconciled', function(payload){ return 'DB active: '+N(payload.db_active_considered||0)+' · Reapplied: '+N(payload.reapplied||0)+' · Removed extras: '+N(payload.removed_extra||0)+' · Apply failed: '+N(payload.apply_failed||0)+' · Remove failed: '+N(payload.remove_failed||0)+' · Expired deactivated: '+N(payload.expired_deactivated||0)+'.'; }); });
   $('#flushFirewallBtn').addEventListener('click', async function(){ if(!confirm('Flush every active firewall IP and deactivate matching DB bans?')){ return; } handleUserActivity(); await performAction('/api/admin/flush-firewall', {}, 'Firewall flushed', function(payload){ return 'Removed active firewall entries and deactivated '+N(payload.deactivated_records||0)+' database records.'; }); });
   $('#clearEventsBtn').addEventListener('click', async function(){ if(!confirm('Delete all stored event history? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-events', {}, 'Event history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' event records.'; }); });
   $('#clearBanHistoryBtn').addEventListener('click', async function(){ if(!confirm('Delete all ban history records? This cannot be undone.')){ return; } handleUserActivity(); await performAction('/api/admin/clear-ban-history', {}, 'Ban history cleared', function(payload){ return 'Deleted '+N(payload.deleted||0)+' ban history records.'; }); });
