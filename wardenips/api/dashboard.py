@@ -2838,9 +2838,9 @@ button.admin-link{font:inherit;cursor:pointer}
 .st.ok{background:var(--grn-d);color:var(--grn)}
 .st.bad{background:var(--red-d);color:var(--red)}
 .desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
-.geo-map{position:relative;aspect-ratio:2/1;min-height:240px;max-height:460px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
+.geo-map{position:relative;width:100%;aspect-ratio:2/1;min-height:240px;max-height:460px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
 .geo-grid{position:absolute;inset:0;z-index:1;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
-.geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.32}
+.geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.32;width:100%;height:100%;transform:translateX(2%) scale(1.14,1.06);transform-origin:center center}
 .geo-world .land{fill:color-mix(in srgb,var(--cyan) 15%,transparent);stroke:color-mix(in srgb,var(--cyan) 26%,var(--bdr));stroke-width:1.1;stroke-linejoin:round}
 .geo-world .island{fill:color-mix(in srgb,var(--cyan) 13%,transparent);stroke:color-mix(in srgb,var(--cyan) 24%,var(--bdr));stroke-width:.9}
 .geo-point{position:absolute;z-index:3;transform:translate(-50%,-50%);border-radius:999px;border:1px solid color-mix(in srgb,var(--red) 65%,white);background:color-mix(in srgb,var(--red) 42%,transparent);cursor:pointer;box-shadow:0 0 0 1px #00000033,0 0 18px color-mix(in srgb,var(--red) 45%,transparent)}
@@ -2849,6 +2849,11 @@ button.admin-link{font:inherit;cursor:pointer}
 .geo-legend{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.75rem;font-size:.72rem;color:var(--dim)}
 .geo-legend .bar{flex:1;height:8px;border-radius:999px;background:linear-gradient(90deg,color-mix(in srgb,var(--red) 18%,transparent),color-mix(in srgb,var(--red) 75%,white))}
 .geo-meta{margin-top:.55rem;font-size:.76rem;color:var(--dim)}
+.toggle-chip{display:inline-flex;align-items:center;gap:.45rem;padding:.32rem .58rem;border:1px solid var(--bdr);border-radius:999px;background:var(--card-h);font-size:.72rem;color:var(--dim)}
+.toggle-chip input{appearance:none;width:30px;height:18px;border-radius:999px;border:1px solid var(--bdr);background:var(--surface2);position:relative;cursor:pointer;transition:background .18s ease,border-color .18s ease}
+.toggle-chip input::after{content:'';position:absolute;top:1px;left:1px;width:14px;height:14px;border-radius:50%;background:var(--muted);transition:transform .18s ease,background .18s ease}
+.toggle-chip input:checked{background:color-mix(in srgb,var(--accent) 26%,var(--surface2));border-color:var(--accent)}
+.toggle-chip input:checked::after{transform:translateX(12px);background:#fff3eb}
 .advice-tip{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;border:1px solid var(--bdr);background:var(--card-h);font-size:.72rem;font-weight:800;cursor:help}
 footer{text-align:center;padding:2rem 0 1rem;color:var(--dim2);font-size:.75rem}
 footer a{color:var(--accent);text-decoration:none}
@@ -2925,7 +2930,7 @@ footer a:hover{text-decoration:underline}
       <div class="pb"><div class="cb" id="coc"></div></div>
     </div>
     <div class="pl ai d3">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span><label style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:.7rem;color:var(--dim)"><input id="atHoneypotToggle" type="checkbox" checked style="accent-color:var(--accent)">Include Honeypot</label><select id="atTimeRange" style="font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span><label class="toggle-chip" style="margin-left:auto"><input id="atHoneypotToggle" type="checkbox" checked><span>Include Honeypot</span></label><select id="atTimeRange" style="font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
       <div class="pb"><div class="cb" id="atc"></div></div>
     </div>
     <div class="pl ai d4">
@@ -3137,7 +3142,7 @@ function renderGeoHeatmap(payload){
 
 function renderEventsTable(events){
   var etb=$('#evb'),ee=$('#eve'),ep=$('#ec');
-  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !(e.is_post_ban||e.is_ban_trigger_event||e.is_firewall_blocked); });
+  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !(e.is_post_ban||e.is_firewall_blocked); });
   if(!eventsToShow.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0';return;}
   ee.style.display='none';ep.textContent=eventsToShow.length;
   etb.innerHTML=eventsToShow.map(function(e){
@@ -3174,7 +3179,7 @@ function renderTimelineFromEvents(events){
     buckets.push({hour:hour,count:0});
   }
   (events||[]).forEach(function(e){
-    if(!evShowBanned && (e.is_post_ban||e.is_ban_trigger_event||e.is_firewall_blocked)){ return; }
+    if(!evShowBanned && (e.is_post_ban||e.is_firewall_blocked)){ return; }
     var ts=parseTs(e.timestamp_unix||e.timestamp);
     if(ts===null){ return; }
     var diff=Math.floor((Date.now()-ts)/3600000);
@@ -3342,10 +3347,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-field{min-width:0;padding:0}
 .config-field label{white-space:normal;line-height:1.4;font-size:.8rem;margin-bottom:4px}
 .config-input,.config-select{width:100%;min-width:0;padding:10px 14px;min-height:40px}
-.toolbar-grid.three{align-items:stretch;grid-template-columns:minmax(0,1fr) minmax(135px,170px) minmax(130px,170px)}
-.toolbar-grid.query-grid{grid-template-columns:170px minmax(0,1fr) 150px}
+.toolbar-grid.three{align-items:stretch;grid-template-columns:minmax(0,1.35fr) minmax(110px,.55fr) minmax(140px,.7fr)}
+.toolbar-grid.query-grid{grid-template-columns:minmax(128px,170px) minmax(0,1fr) minmax(130px,170px)}
 .toolbar-grid.dual-actions{grid-template-columns:minmax(0,1fr) auto auto}
 .toolbar-grid.stack-label{margin-bottom:6px}
+.toolbar-grid.three .ctrl,.toolbar-grid.query-grid .ctrl{width:100%;min-width:0}
 .ip-link-btn{all:unset;cursor:pointer;color:var(--blue);text-decoration:underline;text-underline-offset:2px;font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}
 .ip-link-btn:hover{color:color-mix(in srgb,var(--blue) 70%,white)}
 .action-center-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
@@ -3366,9 +3372,30 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .chip button:hover{color:var(--txt)}
 .primary-actions{position:sticky;bottom:0;z-index:3;background:linear-gradient(180deg,color-mix(in srgb,var(--panel2) 80%,transparent),var(--panel2));padding:12px;border:1px solid var(--b);border-radius:14px;backdrop-filter:blur(2px)}
 .advanced-wrap{margin-top:2px}
+.config-toggle input[type="checkbox"],.config-kv-toggle input[type="checkbox"]{appearance:none;-webkit-appearance:none;width:46px;height:26px;border-radius:999px;border:1px solid color-mix(in srgb,var(--accent) 30%,var(--b));background:color-mix(in srgb,var(--surface2) 88%,var(--surface));position:relative;cursor:pointer;transition:background .2s ease,border-color .2s ease,box-shadow .2s ease}
+.config-toggle input[type="checkbox"]::before,.config-kv-toggle input[type="checkbox"]::before{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:999px;background:var(--txt);box-shadow:0 2px 8px #00000035;transition:transform .2s ease,background .2s ease}
+.config-toggle input[type="checkbox"]:checked,.config-kv-toggle input[type="checkbox"]:checked{background:linear-gradient(135deg,var(--accent),#ff6f61);border-color:color-mix(in srgb,var(--accent) 65%,white)}
+.config-toggle input[type="checkbox"]:checked::before,.config-kv-toggle input[type="checkbox"]:checked::before{transform:translateX(20px);background:#fff}
+.config-toggle input[type="checkbox"]:focus-visible,.config-kv-toggle input[type="checkbox"]:focus-visible{outline:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 34%,transparent)}
+.config-all-wrap{display:grid;gap:12px}
+.config-all-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.config-all-head .sub{margin:0}
+.config-all-list{display:grid;gap:10px;max-height:420px;overflow:auto;padding-right:4px}
+.config-kv-item{padding:11px 12px;border:1px solid var(--b);border-radius:13px;background:linear-gradient(180deg,var(--surface),var(--surface2));display:grid;gap:8px}
+.config-kv-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.config-kv-path{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem;line-height:1.4;word-break:break-all}
+.config-kv-kind{font-size:.66rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding:3px 7px;border:1px solid var(--b);border-radius:999px;background:var(--surface2);white-space:nowrap}
+.config-kv-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border:1px solid var(--b);border-radius:13px;background:linear-gradient(180deg,var(--surface),var(--surface2))}
+.config-group{border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2));overflow:hidden}
+.config-group summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;font-size:.84rem;font-weight:800;border-bottom:1px solid color-mix(in srgb,var(--b) 76%,transparent);background:color-mix(in srgb,var(--surface2) 88%,var(--surface));user-select:none}
+.config-group summary::-webkit-details-marker{display:none}
+.config-group summary::after{content:'+';font-size:1rem;color:var(--muted)}
+.config-group[open] summary::after{content:'-'}
+.config-group-count{font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.config-group-body{padding:10px;display:grid;gap:10px}
 @media(max-width:1280px){.config-sections{column-count:2}}
 @media(max-width:900px){.config-sections{column-count:1}}
-@media(max-width:1180px){.toolbar-grid.three{grid-template-columns:minmax(0,1fr) minmax(135px,170px)}.toolbar-grid.three button{grid-column:1/-1}}
+@media(max-width:1180px){.toolbar-grid.three{grid-template-columns:minmax(0,1fr) minmax(125px,170px)}.toolbar-grid.three button{grid-column:1/-1}.toolbar-grid.query-grid{grid-template-columns:1fr 1fr}.toolbar-grid.query-grid button{grid-column:1/-1}}
 @media(max-width:680px){.modal-header-actions,.primary-actions{width:100%}.config-filter{min-width:0;width:100%}.toolbar-grid.three,.toolbar-grid.dual-actions{grid-template-columns:1fr}}
 @media(max-width:680px){.toolbar-grid.query-grid{grid-template-columns:1fr}}
 @media(max-width:980px){.action-center-grid{grid-template-columns:1fr}.intel-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -3526,7 +3553,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
             <div class="toolbar-grid stack-label"><div class="sub">Admin Security</div></div>
             <div class="toolbar-grid query-grid" style="margin-bottom:0">
               <div id="adminTotpLabel" class="sub">Require TOTP on login for this admin account</div>
-              <input id="adminTotpEnabled" class="ctrl" type="checkbox" aria-label="Require TOTP for this admin account" style="width:1.15rem;height:1.15rem;justify-self:start;align-self:center">
+              <label class="theme-chip" style="justify-self:start;align-self:center;padding:6px 10px"><input id="adminTotpEnabled" type="checkbox" aria-label="Require TOTP for this admin account" style="accent-color:var(--accent);width:1rem;height:1rem"><span>TOTP Required</span></label>
               <button id="saveAdminTotpBtn" class="btn ghost">Save TOTP Setting</button>
             </div>
           </div>
@@ -3585,7 +3612,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
       <div class="card"><h2>Blocklist Protection</h2><div class="list" id="meshList"></div></div>
-      <div class="card"><h2>Top Portscanned Ports</h2><div class="toolbar" style="margin-bottom:8px"><select id="adminAtTimeRange" class="ctrl" style="font-size:.78rem;padding:6px 10px"><option value="0">All Time</option><option value="24" selected>Last 24h</option><option value="72">Last 3 Days</option><option value="168">Last 7 Days</option><option value="720">Last 30 Days</option></select><label class="theme-chip" style="padding:6px 10px"><input id="adminIncludeHoneypot" type="checkbox" checked style="accent-color:var(--accent)"> Include Honeypot</label></div><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
+      <div class="card"><h2>Top Portscanned Ports</h2><div class="toolbar" style="margin-bottom:8px"><select id="adminAtTimeRange" class="ctrl" style="font-size:.78rem;padding:6px 10px"><option value="0">All Time</option><option value="24" selected>Last 24h</option><option value="72">Last 3 Days</option><option value="168">Last 7 Days</option><option value="720">Last 30 Days</option></select><label class="theme-chip" style="padding:6px 10px"><input id="adminIncludeHoneypot" type="checkbox" checked style="accent-color:var(--accent);width:1rem;height:1rem"><span>Include Honeypot</span></label></div><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
     </div>
   </div>
 
@@ -3711,6 +3738,16 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <input id="cfgPortscanIgnoredPortsEntry" class="config-input" type="text" spellcheck="false" placeholder="Type port and press Enter (example: 19132)">
               <div class="sub">Press Enter or comma to add. Click x on a chip to remove.</div>
             </div>
+          </div>
+        </section>
+        <section class="config-section">
+          <h3>All Settings</h3>
+          <p>Every config key is editable here. Use this section for full control without opening YAML.</p>
+          <div class="config-all-wrap">
+            <div class="config-all-head">
+              <div class="sub">Fields are generated automatically from current config.yaml values.</div>
+            </div>
+            <div id="cfgAllSettings" class="config-all-list"></div>
           </div>
         </section>
       </div>
@@ -3956,6 +3993,92 @@ function addPortscanIgnoredPortsFromInput(raw){
   renderPortscanIgnoredPortChips();
   return true;
 }
+function flattenConfigEntries(node, prefix, output){
+  var path=String(prefix||'');
+  if(Array.isArray(node) || node===null || typeof node!=='object'){
+    if(path){ output.push({path:path, value:node}); }
+    return;
+  }
+  Object.keys(node).sort().forEach(function(key){
+    var nextPath=path?path+'.'+key:key;
+    flattenConfigEntries(node[key], nextPath, output);
+  });
+}
+function renderAllConfigControls(){
+  var host=$('#cfgAllSettings');
+  if(!host){ return; }
+  var entries=[];
+  flattenConfigEntries(state.config||{}, '', entries);
+  if(!entries.length){
+    host.innerHTML='<div class="empty">No config keys found.</div>';
+    return;
+  }
+  var groups={};
+  entries.forEach(function(entry){
+    var path=String(entry.path||'');
+    var root=path.indexOf('.')===-1?path:path.split('.')[0];
+    if(!groups[root]){ groups[root]=[]; }
+    groups[root].push(entry);
+  });
+  function renderEntryControl(entry){
+    var path=String(entry.path||'');
+    var value=entry.value;
+    var kind=Array.isArray(value)?'array':(value===null?'null':typeof value);
+    if(kind==='boolean'){
+      return '<label class="config-kv-toggle"><div><div class="config-kv-path">'+E(path)+'</div><div class="sub">boolean</div></div><input type="checkbox" data-allcfg-path="'+E(path)+'" data-allcfg-kind="boolean" '+(value?'checked':'')+'></label>';
+    }
+    if(kind==='number'){
+      return '<div class="config-kv-item"><div class="config-kv-top"><div class="config-kv-path">'+E(path)+'</div><span class="config-kv-kind">number</span></div><input class="config-input" type="number" data-allcfg-path="'+E(path)+'" data-allcfg-kind="number" value="'+E(String(value))+'"></div>';
+    }
+    if(kind==='array'){
+      var rawArray=JSON.stringify(value);
+      return '<div class="config-kv-item"><div class="config-kv-top"><div class="config-kv-path">'+E(path)+'</div><span class="config-kv-kind">array</span></div><textarea class="config-editor" rows="3" style="min-height:88px" data-allcfg-path="'+E(path)+'" data-allcfg-kind="json">'+E(rawArray)+'</textarea></div>';
+    }
+    if(kind==='null'){
+      return '<div class="config-kv-item"><div class="config-kv-top"><div class="config-kv-path">'+E(path)+'</div><span class="config-kv-kind">null</span></div><input class="config-input" type="text" data-allcfg-path="'+E(path)+'" data-allcfg-kind="null-or-string" value="" placeholder="Leave empty to keep null"></div>';
+    }
+    return '<div class="config-kv-item"><div class="config-kv-top"><div class="config-kv-path">'+E(path)+'</div><span class="config-kv-kind">string</span></div><input class="config-input" type="text" data-allcfg-path="'+E(path)+'" data-allcfg-kind="string" value="'+E(String(value||''))+'"></div>';
+  }
+  var roots=Object.keys(groups).sort();
+  host.innerHTML=roots.map(function(root){
+    var items=groups[root].slice().sort(function(a,b){ return String(a.path||'').localeCompare(String(b.path||'')); });
+    return '<details class="config-group" open><summary><span>'+E(root||'root')+'</span><span class="config-group-count">'+N(items.length)+' keys</span></summary><div class="config-group-body">'+items.map(renderEntryControl).join('')+'</div></details>';
+  }).join('');
+}
+function collectAllConfigControlChanges(){
+  var controls=Array.from(document.querySelectorAll('[data-allcfg-path]'));
+  var changes={};
+  controls.forEach(function(control){
+    var path=String(control.getAttribute('data-allcfg-path')||'').trim();
+    var kind=String(control.getAttribute('data-allcfg-kind')||'string');
+    if(!path){ return; }
+    if(kind==='boolean'){
+      changes[path]=!!control.checked;
+      return;
+    }
+    var raw=String(control.value||'');
+    if(kind==='number'){
+      var parsed=Number(raw);
+      if(!Number.isFinite(parsed)){ throw new Error('Invalid number for '+path); }
+      changes[path]=parsed;
+      return;
+    }
+    if(kind==='json'){
+      try{
+        changes[path]=raw.trim()?JSON.parse(raw):[];
+      }catch(error){
+        throw new Error('Invalid JSON array for '+path);
+      }
+      return;
+    }
+    if(kind==='null-or-string'){
+      changes[path]=raw.trim()===''?null:raw;
+      return;
+    }
+    changes[path]=raw;
+  });
+  return changes;
+}
 function getDismissKey(info){ return info&&info.update_available&&info.latest_version ? 'wardenips_update_dismissed_'+info.latest_version : info&&info.current_version ? 'wardenips_whatsnew_seen_'+info.current_version : ''; }
 function applyTheme(theme){ state.theme = theme==='light' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', state.theme); try{ localStorage.setItem('wardenips_admin_theme', state.theme); }catch(error){} $('#themeToggle').textContent = state.theme==='light' ? 'Dark Mode' : 'Light Mode'; $('#themeChip').textContent = 'Theme: ' + (state.theme==='light' ? 'Light' : 'Dark'); }
 function initTheme(){ var saved='dark'; try{ saved = localStorage.getItem('wardenips_admin_theme') || 'dark'; }catch(error){} applyTheme(saved); }
@@ -4044,15 +4167,25 @@ function handleUserActivity(){
   sendActivityPing();
 }
 function renderSummary(){
-  var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
+  var runtimeSimulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
+  var configSimulation = isSimulationEnabled(getConfigValue('firewall.simulation_mode', runtimeSimulation));
+  var simulation = configSimulation;
   $('#mEvents').textContent = N(state.stats&&state.stats.total_events);
   $('#mDbBans').textContent = N(state.stats&&state.stats.active_bans);
-  $('#mFwBans').textContent = N(state.firewall.length);
+  var fwCount = (state.stats&&state.stats.firewall_active_bans!==undefined&&state.stats.firewall_active_bans!==null) ? state.stats.firewall_active_bans : state.firewall.length;
+  $('#mFwBans').textContent = N(fwCount);
   $('#mPeers').textContent = state.blocklist&&state.blocklist.enabled ? (state.blocklist.first_setup&&state.blocklist.first_setup.completed?'Active Only':'First Setup + Active') : 'Disabled';
   $('#runtimeMode').textContent = 'Mode: '+(simulation?'Monitor':'Live');
   $('#runtimeUptime').textContent = 'Service: '+((state.health&&state.health.uptime)||'--')+' | System: '+((state.health&&state.health.system_uptime)||'--');
   $('#lastUpdated').textContent = 'Last updated: '+new Date().toLocaleTimeString();
-  $('#simulationTopNotice').hidden = !simulation;
+  var simNotice = $('#simulationTopNotice');
+  if(runtimeSimulation!==configSimulation){
+    simNotice.hidden = false;
+    simNotice.textContent = 'Simulation mode config changed. Runtime mode will sync after refresh/reload.';
+  }else{
+    simNotice.hidden = !simulation;
+    simNotice.textContent = 'Monitor Mode active — events are recorded but no firewall actions applied. Disable to switch to enforcement.';
+  }
   $('#enforceSimBansBtn').hidden = !simulation;
 }
 function renderEvents(){
@@ -4309,6 +4442,7 @@ function renderConfigStudio(){
   $('#cfgMinecraftBurstWindow').value=String(getConfigValue('plugins.minecraft.global_connection_burst_window_seconds',15));
   setPortscanIgnoredPorts(getConfigValue('plugins.portscan.ignored_ports',[]));
   $('#cfgPortscanIgnoredPortsEntry').value='';
+  renderAllConfigControls();
   $('#configEditor').value=state.configYaml||'';
   syncAdvancedYaml();
   filterConfigSections();
@@ -4360,6 +4494,12 @@ async function saveConfigForm(){
     'plugins.minecraft.global_connection_burst_window_seconds': parseInt($('#cfgMinecraftBurstWindow').value,10)||15,
     'plugins.portscan.ignored_ports': (state.portscanIgnoredPorts||[])
   };
+  try{
+    Object.assign(changes, collectAllConfigControlChanges());
+  }catch(error){
+    setStatus('err','Invalid config input', error && error.message ? error.message : 'Please check your config inputs.');
+    return false;
+  }
   var payload=await api('/api/admin/config/patch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({changes:changes})});
   if(!payload){ return false; }
   state.config=payload.config||{};
