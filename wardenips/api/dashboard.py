@@ -632,7 +632,12 @@ class DashboardAPI:
                      OR bh.expires_at = ''
                      OR COALESCE(strftime('%s', bh.expires_at), 0) > strftime('%s', 'now')
                    )
-               ) AS is_banned
+               ) AS is_banned_current,
+               (
+                 SELECT MIN(COALESCE(strftime('%s', bh_first.banned_at), 0))
+                 FROM ban_history bh_first
+                 WHERE bh_first.source_ip = connection_events.source_ip
+               ) AS first_ban_unix
           FROM connection_events
           ORDER BY id DESC
           LIMIT ?
@@ -642,6 +647,18 @@ class DashboardAPI:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
           events = [dict(zip(columns, row)) for row in rows]
+
+      firewall_banned_ips: set[str] = set()
+      try:
+        firewall_items = await self._firewall.list_banned_ips(limit=20000)
+        for item in firewall_items:
+          if isinstance(item, dict):
+            candidate = str(item.get("ip", "")).strip()
+            if candidate:
+              firewall_banned_ips.add(candidate)
+      except Exception:
+        firewall_banned_ips = set()
+
       for event in events:
         details_obj = {}
         details_value = event.get("details")
@@ -653,7 +670,9 @@ class DashboardAPI:
         elif isinstance(details_value, dict):
           details_obj = details_value
         event["event_type"] = str(details_obj.get("event_type") or "")
-        event["is_banned"] = bool(event.get("is_banned"))
+        event["is_banned_current"] = bool(event.get("is_banned_current"))
+        event["is_post_ban"] = False
+        event["is_ban_trigger_event"] = False
         event["country_code"] = self._resolve_country_code(
           details_obj,
           event.get("source_ip"),
@@ -662,6 +681,62 @@ class DashboardAPI:
         event["timestamp_unix"] = self._parse_timestamp_unix(event.get("timestamp"))
         event["operator_advice"] = self._build_operator_advice(event)
         event["event_port"] = self._extract_event_port(event, details_obj)
+        source_ip = str(event.get("source_ip") or "").strip()
+        event["is_firewall_blocked"] = bool(source_ip and source_ip in firewall_banned_ips)
+
+      events_by_ip: dict[str, list[int]] = {}
+      for index, event in enumerate(events):
+        source_ip = str(event.get("source_ip") or "").strip()
+        if source_ip:
+          events_by_ip.setdefault(source_ip, []).append(index)
+
+      for source_ip, indices in events_by_ip.items():
+        _ = source_ip
+        first_ban_unix = 0
+        for idx in indices:
+          raw_first_ban = events[idx].get("first_ban_unix")
+          try:
+            candidate = int(raw_first_ban or 0)
+          except Exception:
+            candidate = 0
+          if candidate > 0 and (first_ban_unix == 0 or candidate < first_ban_unix):
+            first_ban_unix = candidate
+
+        if first_ban_unix <= 0:
+          continue
+
+        post_ban_indices: list[int] = []
+        for idx in indices:
+          event_unix = events[idx].get("timestamp_unix")
+          if event_unix is None:
+            continue
+          if int(event_unix) >= first_ban_unix:
+            post_ban_indices.append(idx)
+
+        if not post_ban_indices:
+          continue
+
+        trigger_idx = min(
+          post_ban_indices,
+          key=lambda idx: int(events[idx].get("timestamp_unix") or 0),
+        )
+        for idx in post_ban_indices:
+          events[idx]["is_post_ban"] = True
+        events[trigger_idx]["is_ban_trigger_event"] = True
+
+      for event in events:
+        is_firewall_blocked = bool(event.get("is_firewall_blocked"))
+        is_ban_trigger_event = bool(event.get("is_ban_trigger_event"))
+        is_post_ban = bool(event.get("is_post_ban"))
+        event["is_banned"] = is_firewall_blocked or is_ban_trigger_event or is_post_ban
+        if is_ban_trigger_event:
+          event["ban_state"] = "ban_triggered"
+        elif is_post_ban:
+          event["ban_state"] = "post_ban"
+        elif is_firewall_blocked:
+          event["ban_state"] = "firewall_blocked"
+        else:
+          event["ban_state"] = "pre_ban"
       return web.json_response({"events": events, "count": len(events)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -719,8 +794,18 @@ class DashboardAPI:
       return self._json_auth_error()
     limit = min(int(request.query.get("limit", "10")), 100)
     hours = max(int(request.query.get("hours", "0")), 0)
+    include_honeypot = str(request.query.get("include_honeypot", "1")).strip().lower() not in {"0", "false", "no", "off"}
     try:
-      time_clause = "AND COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
+      trap_ports_raw = self._config.get("plugins.portscan.trap_ports", [])
+      trap_ports = set()
+      for value in trap_ports_raw:
+        try:
+          trap_ports.add(str(int(value)))
+        except Exception:
+          continue
+
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      time_clause = f"AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
       time_params: list = [f"-{hours}"] if hours > 0 else []
       async with self._db._lock:
         async with self._db._db.execute(
@@ -743,14 +828,20 @@ class DashboardAPI:
           tuple(time_params + [limit]),
         ) as cursor:
           rows = await cursor.fetchall()
-          ports = [
-            {
-              "port": str(row[0]),
-              "scan_count": int(row[1]),
-              "last_seen": row[2],
-            }
-            for row in rows
-          ]
+          ports = []
+          for row in rows:
+            port_value = str(row[0])
+            is_honeypot = port_value in trap_ports
+            if not include_honeypot and is_honeypot:
+              continue
+            ports.append(
+              {
+                "port": port_value,
+                "scan_count": int(row[1]),
+                "last_seen": row[2],
+                "is_honeypot": is_honeypot,
+              }
+            )
       return web.json_response({"ports": ports, "count": len(ports), "hours": hours})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -784,7 +875,8 @@ class DashboardAPI:
       return self._json_auth_error()
     hours = max(int(request.query.get("hours", "0")), 0)
     try:
-      time_clause = "AND COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      time_clause = f"AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
       time_params: list = [f"-{hours}"] if hours > 0 else []
       async with self._db._lock:
         async with self._db._db.execute(
@@ -2670,7 +2762,7 @@ button.admin-link{font:inherit;cursor:pointer}
 .sc .sb{font-size:.7rem;color:var(--dim2);margin-top:.35rem}
 
 /* Panels */
-.pn{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2rem;align-items:start}
+.pn{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.5rem;margin-bottom:2rem;align-items:start;grid-auto-flow:dense}
 @media(max-width:900px){.pn{grid-template-columns:1fr}}
 .pl{background:linear-gradient(180deg,var(--card),color-mix(in srgb,var(--card) 92%,#000 8%));border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;transition:all .25s ease;box-shadow:var(--shadow);height:auto}
 .pl:hover{border-color:var(--bdr-g)}
@@ -2709,6 +2801,9 @@ button.admin-link{font:inherit;cursor:pointer}
 .t th{text-align:left;font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);padding:.6rem .75rem;border-bottom:1px solid var(--bdr);position:sticky;top:0;background:var(--card);z-index:2}
 .t td{padding:.55rem .75rem;font-size:.8rem;border-bottom:1px solid #1e293b10;vertical-align:middle}
 .t tr:hover td{background:var(--card-h)}
+.t tr.tr-ban-trigger td{background:color-mix(in srgb,var(--red) 22%,var(--card-h))}
+.t tr.tr-post-ban td{background:color-mix(in srgb,var(--red) 12%,var(--card))}
+.t tr.tr-firewall-block td{background:color-mix(in srgb,var(--warn) 12%,var(--card))}
 .h{font-family:'Fira Code','Cascadia Code',monospace;font-size:.7rem;color:var(--dim);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rb{display:inline-block;padding:.15rem .5rem;border-radius:4px;font-size:.7rem;font-weight:700;min-width:38px;text-align:center}
 .rh{background:var(--red-d);color:var(--red)}.rm{background:var(--warn-d);color:var(--warn)}.rl{background:var(--grn-d);color:var(--grn)}
@@ -2743,7 +2838,7 @@ button.admin-link{font:inherit;cursor:pointer}
 .st.ok{background:var(--grn-d);color:var(--grn)}
 .st.bad{background:var(--red-d);color:var(--red)}
 .desc{font-size:.78rem;line-height:1.5;color:var(--dim);margin-bottom:.9rem}
-.geo-map{position:relative;min-height:240px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
+.geo-map{position:relative;aspect-ratio:2/1;min-height:240px;max-height:460px;border:1px solid var(--bdr);border-radius:14px;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--cyan) 8%,transparent) 0%,transparent 55%),linear-gradient(180deg,color-mix(in srgb,var(--card-h) 86%,transparent),color-mix(in srgb,var(--card) 88%,transparent));overflow:hidden}
 .geo-grid{position:absolute;inset:0;z-index:1;opacity:.22;background-image:linear-gradient(to right,var(--bdr) 1px,transparent 1px),linear-gradient(to bottom,var(--bdr) 1px,transparent 1px);background-size:32px 32px}
 .geo-world{position:absolute;inset:0;z-index:2;pointer-events:none;opacity:.32}
 .geo-world .land{fill:color-mix(in srgb,var(--cyan) 15%,transparent);stroke:color-mix(in srgb,var(--cyan) 26%,var(--bdr));stroke-width:1.1;stroke-linejoin:round}
@@ -2815,7 +2910,7 @@ footer a:hover{text-decoration:underline}
 
   <div class="pn">
     <div class="pl fw ai d2">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Recent Events</h2><span class="pill" id="ec">0</span><button id="evBannedToggle" style="margin-left:auto;font-size:.7rem;font-weight:700;padding:.2rem .6rem;border-radius:8px;border:1px solid var(--bdr);background:color-mix(in srgb,var(--warn) 18%,var(--card-h));color:var(--warn);cursor:pointer" title="Toggle events from already-banned IPs">Hide Banned IPs</button></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Recent Events</h2><span class="pill" id="ec">0</span><button id="evBannedToggle" style="margin-left:auto;font-size:.7rem;font-weight:700;padding:.2rem .6rem;border-radius:8px;border:1px solid var(--bdr);background:color-mix(in srgb,var(--warn) 18%,var(--card-h));color:var(--warn);cursor:pointer" title="Hide events after a source enters ban/firewall-block state">Hide Post-Ban Traffic</button></div>
       <div class="pb" style="max-height:400px">
         <table class="t" id="evt"><thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>User</th><th>Origin</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead><tbody id="evb"></tbody></table>
         <div class="em" id="eve" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><div>No events recorded yet</div></div>
@@ -2830,7 +2925,7 @@ footer a:hover{text-decoration:underline}
       <div class="pb"><div class="cb" id="coc"></div></div>
     </div>
     <div class="pl ai d3">
-      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span><select id="atTimeRange" style="margin-left:auto;font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
+      <div class="ph"><h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6m3-3h-6"/></svg>Top Portscanned Ports</h2><span class="pill" id="ac">0</span><label style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:.7rem;color:var(--dim)"><input id="atHoneypotToggle" type="checkbox" checked style="accent-color:var(--accent)">Include Honeypot</label><select id="atTimeRange" style="font-size:.7rem;padding:.2rem .5rem;border-radius:8px;border:1px solid var(--bdr);background:var(--card-h);color:var(--txt);cursor:pointer"><option value="24">24h</option><option value="72">3 Days</option><option value="168">7 Days</option><option value="720">30 Days</option><option value="0">All Time</option></select></div>
       <div class="pb"><div class="cb" id="atc"></div></div>
     </div>
     <div class="pl ai d4">
@@ -2937,6 +3032,7 @@ var CC=['c0','c1','c2','c3','c4','c5'];
 var GEO_COUNTS={};
 var GEO_SEEN=false;
 var evShowBanned=true;
+var includeHoneypotPorts=true;
 var lastEvData=[];
 var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
@@ -3041,7 +3137,7 @@ function renderGeoHeatmap(payload){
 
 function renderEventsTable(events){
   var etb=$('#evb'),ee=$('#eve'),ep=$('#ec');
-  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !e.is_banned; });
+  var eventsToShow=evShowBanned?events:events.filter(function(e){ return !(e.is_post_ban||e.is_ban_trigger_event||e.is_firewall_blocked); });
   if(!eventsToShow.length){etb.innerHTML='';ee.style.display='block';ep.textContent='0';return;}
   ee.style.display='none';ep.textContent=eventsToShow.length;
   etb.innerHTML=eventsToShow.map(function(e){
@@ -3051,8 +3147,49 @@ function renderEventsTable(events){
     var advice=e.operator_advice||'No specific operator advice for this event.';
     var cc=(e.country_code||'').toUpperCase();
     var origin=cc?CF(cc)+' '+cc:'-';
-    var bannedMark=e.is_banned?'<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BAN</span>':'';
-    return '<tr><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;'+bannedMark+'</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
+    var isBanTrigger=!!e.is_ban_trigger_event;
+    var isPostBan=!!e.is_post_ban;
+    var isFirewallBlocked=!!e.is_firewall_blocked;
+    var rowClass=isBanTrigger?'tr-ban-trigger':(isPostBan?'tr-post-ban':(isFirewallBlocked?'tr-firewall-block':''));
+    var bannedMark='';
+    if(isBanTrigger){
+      bannedMark='<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BANNED NOW</span>';
+    }else if(isPostBan){
+      bannedMark='<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--red-d);color:var(--red);margin-left:4px">BANNED</span>';
+    }else if(isFirewallBlocked){
+      bannedMark='<span style="font-size:.6rem;font-weight:700;padding:.1rem .4rem;border-radius:4px;background:var(--warn-d);color:var(--warn);margin-left:4px">FIREWALL-BLOCKED</span>';
+    }
+    return '<tr class="'+rowClass+'"><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;'+bannedMark+'</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
+  }).join('');
+}
+function renderTimelineFromEvents(events){
+  var tc2=$('#tlc'),tl2=$('#tll');
+  if(!tc2||!tl2){ return; }
+  var buckets=[];
+  var labels=[];
+  for(var i=23;i>=0;i--){
+    var d=new Date(Date.now()-(i*3600000));
+    var hour=String(d.getHours()).padStart(2,'0')+':00';
+    labels.push(hour);
+    buckets.push({hour:hour,count:0});
+  }
+  (events||[]).forEach(function(e){
+    if(!evShowBanned && (e.is_post_ban||e.is_ban_trigger_event||e.is_firewall_blocked)){ return; }
+    var ts=parseTs(e.timestamp_unix||e.timestamp);
+    if(ts===null){ return; }
+    var diff=Math.floor((Date.now()-ts)/3600000);
+    if(diff<0||diff>23){ return; }
+    var idx=23-diff;
+    buckets[idx].count+=1;
+  });
+  var mx=Math.max.apply(null,buckets.map(function(t){ return t.count; }).concat([1]));
+  tc2.innerHTML=buckets.map(function(t){
+    var pct=Math.max((t.count/mx)*100,2);
+    return '<div class="tb" style="height:'+pct+'%" data-t="'+t.hour+': '+t.count+' events"></div>';
+  }).join('');
+  tl2.innerHTML=labels.map(function(hr,i){
+    var show=i%2===0;
+    return '<span>'+(show?hr:'')+'</span>';
   }).join('');
 }
 async function refreshCountry(){
@@ -3066,10 +3203,11 @@ async function refreshCountry(){
 }
 async function refreshTopPorts(){
   var hours=parseInt(($('#atTimeRange')||{value:'24'}).value,10)||0;
-  var at=await A('/api/top-portscanned-ports?limit=10'+(hours>0?'&hours='+hours:''));
+  includeHoneypotPorts=!!($('#atHoneypotToggle')&&$('#atHoneypotToggle').checked);
+  var at=await A('/api/top-portscanned-ports?limit=10'+(hours>0?'&hours='+hours:'')+(includeHoneypotPorts?'':'&include_honeypot=0'));
   var ap=$('#ac');
   if(at&&at.ports){ap.textContent=at.ports.length;
-    var ait=at.ports.map(function(p){return{label:'Port '+String(p.port||'-'),count:p.scan_count||0}});
+    var ait=at.ports.map(function(p){return{label:'Port '+String(p.port||'-')+(p.is_honeypot?' (H)':''),count:p.scan_count||0}});
     bars('atc',ait,'label','count',1)}
   else{ap.textContent='0';bars('atc',[],'label','count',1)}
 }
@@ -3077,8 +3215,7 @@ async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
   var bn=await A('/api/bans');
-  var ev=await A('/api/events?limit=50');
-  var tl=await A('/api/events-timeline?hours=24');
+  var ev=await A('/api/events?limit=300');
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var ti=await A('/api/blocklist');
@@ -3116,22 +3253,7 @@ async function refresh(){
   // Events Table
   lastEvData=ev&&ev.events?ev.events:[];
   renderEventsTable(lastEvData);
-
-  // Timeline
-  var tc2=$('#tlc'),tl2=$('#tll');
-  if(!tl||!tl.timeline||!tl.timeline.length){tc2.innerHTML='<div class="em" style="width:100%;padding:2rem 0"><div>No timeline data</div></div>';tl2.innerHTML=''}
-  else{
-    var mx=Math.max(...tl.timeline.map(function(t){return t.count}),1);
-    tc2.innerHTML=tl.timeline.map(function(t){
-      var pct=Math.max((t.count/mx)*100,2);
-      var hr=t.hour?(t.hour.split(' ')[1]||t.hour):'';
-      return '<div class="tb" style="height:'+pct+'%" data-t="'+hr+': '+t.count+' events"></div>';
-    }).join('');
-    tl2.innerHTML=tl.timeline.map(function(t,i){
-      var hr=t.hour?(t.hour.split(' ')[1]||''):'';
-      var show=i%Math.max(1,Math.floor(tl.timeline.length/12))===0;
-      return '<span>'+(show?hr:'')+'</span>';
-    }).join('')}
+  renderTimelineFromEvents(lastEvData);
 
   // Threat Distribution
   if(th&&th.distribution){
@@ -3163,13 +3285,15 @@ $('#themeToggle').addEventListener('click',function(){
 });
 $('#evBannedToggle').addEventListener('click',function(){
   evShowBanned=!evShowBanned;
-  this.textContent=evShowBanned?'Hide Banned IPs':'Show Banned IPs';
+  this.textContent=evShowBanned?'Hide Post-Ban Traffic':'Show Post-Ban Traffic';
   this.style.background=evShowBanned?'color-mix(in srgb,var(--warn) 18%,var(--card-h))':'color-mix(in srgb,var(--grn) 18%,var(--card-h))';
   this.style.color=evShowBanned?'var(--warn)':'var(--grn)';
   renderEventsTable(lastEvData);
+  renderTimelineFromEvents(lastEvData);
 });
 $('#coTimeRange').addEventListener('change',function(){ refreshCountry(); });
 $('#atTimeRange').addEventListener('change',function(){ refreshTopPorts(); });
+$('#atHoneypotToggle').addEventListener('change',function(){ refreshTopPorts(); });
 refresh();
 setInterval(refresh,R);
 })();
@@ -3194,7 +3318,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .app{max-width:1600px;margin:0 auto;padding:26px;position:relative;z-index:1}.top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:18px;margin-bottom:22px}.brand h1{font-size:2rem;font-weight:800;letter-spacing:-.04em}.brand p{font-size:.95rem;color:var(--muted);margin-top:6px;max-width:58ch;line-height:1.5}.utility-strip{display:grid;grid-template-columns:1.45fr .95fr;gap:16px;margin-bottom:16px}.utility-card,.hero-card,.side-card,.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:20px;padding:18px;box-shadow:var(--shadow)}.utility-card strong{display:block;font-size:.9rem;margin-bottom:6px}.utility-card p{font-size:.82rem;color:var(--muted);line-height:1.6}.utility-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.utility-metrics div{padding:12px;border-radius:14px;background:var(--surface);border:1px solid var(--b)}.utility-metrics span{display:block;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
 .actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}.toolbar,.action-grid,.notification-grid,.config-actions,.quick-toggle-grid,.action-columns,.modal-header{display:flex;gap:10px;flex-wrap:wrap}.toolbar-grid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;margin-bottom:12px}.ctrl,.btn,.config-editor,.config-input,.config-select{background:var(--surface2);border:1px solid var(--b);color:var(--txt);border-radius:14px;padding:10px 13px;font-size:.88rem;transition:transform .18s ease,background .18s ease,border-color .18s ease}.btn{cursor:pointer;font-weight:700}.btn:hover{transform:translateY(-1px)}.btn.primary{background:linear-gradient(135deg,var(--accent),#ff6f61);border-color:color-mix(in srgb,var(--accent) 60%,white)}.btn.warn{background:linear-gradient(135deg,#b45309,#ea580c);border-color:#fb923c}.btn.danger{background:linear-gradient(135deg,#9f1239,#e11d48);border-color:#fb7185}.btn.ghost{background:var(--surface)}.btn.cyan{background:linear-gradient(135deg,var(--cyan),#0f9ea6);border-color:color-mix(in srgb,var(--cyan) 70%,white)}.btn.theme{background:linear-gradient(135deg,var(--blue),#6d78ff);border-color:color-mix(in srgb,var(--blue) 65%,white)}.btn.small{padding:7px 10px;font-size:.78rem}.search{flex:1;min-width:220px}.action-grid button,.notification-grid button,.quick-toggle-grid label{flex:1 1 220px}
 .hero{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:18px;align-items:start}.hero-card h2,.card h2,.side-card h2{font-size:1rem;font-weight:800;margin-bottom:10px}.hero-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:14px;border:1px solid var(--b);border-radius:16px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.metric .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}.metric .v{font-size:1.65rem;font-weight:800}
-.layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 13px;border-bottom:1px solid var(--b);font-size:.88rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}td:first-child{font-size:.9rem;font-weight:650}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}
+.layout{display:grid;grid-template-columns:1.45fr 1fr;gap:16px}.stack{display:grid;gap:16px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.table-wrap{max-height:420px;overflow:auto;border:1px solid var(--b);border-radius:14px;background:var(--surface)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 13px;border-bottom:1px solid var(--b);font-size:.88rem;vertical-align:middle}th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}td:first-child{font-size:.9rem;font-weight:650}tr:hover td{background:color-mix(in srgb,var(--surface2) 82%,var(--blue) 18%)}tr.ev-row-ban-trigger td{background:color-mix(in srgb,var(--red) 20%,var(--surface))}tr.ev-row-post-ban td{background:color-mix(in srgb,var(--red) 12%,var(--surface))}tr.ev-row-firewall td{background:color-mix(in srgb,var(--yellow) 12%,var(--surface))}
 .mono{font-family:Cascadia Code,Fira Code,monospace;font-size:.76rem}.tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-size:.72rem;font-weight:800}.t-red{background:color-mix(in srgb,var(--red) 20%,transparent);color:#ffd3d7}.t-green{background:color-mix(in srgb,var(--green) 18%,transparent);color:#b8ffe0}.t-yellow{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:#ffe1a7}.t-blue{background:color-mix(in srgb,var(--blue) 18%,transparent);color:#c9deff}
 .advice-tip{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:999px;border:1px solid var(--b);background:var(--surface2);font-size:.72rem;font-weight:800;cursor:help}
 .list,.advice{display:grid;gap:10px}.list-item,.advice-item,.panel-box{padding:13px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.list-item strong,.advice-item strong,.panel-box strong{display:block;margin-bottom:6px}.sub{font-size:.78rem;color:var(--muted);line-height:1.5}.status{min-height:52px}.status.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:color-mix(in srgb,var(--green) 14%,var(--surface))}.status.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:color-mix(in srgb,var(--red) 14%,var(--surface))}.status strong{margin-bottom:4px}.linkbar{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}.linkbar a{color:var(--blue);text-decoration:none;font-size:.82rem}.linkbar a:hover{text-decoration:underline}.empty{padding:24px;text-align:center;color:var(--muted)}.admin-footer{margin-top:16px;text-align:center;color:var(--muted);font-size:.76rem}.admin-footer a{color:var(--blue);text-decoration:none}.notification-grid{margin-top:4px}.theme-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:var(--surface);border:1px solid var(--b);font-size:.76rem;color:var(--muted)}.toast-stack{position:fixed;top:22px;right:22px;display:grid;gap:10px;z-index:45;max-width:min(420px,calc(100vw - 28px))}.toast{padding:14px 16px;border-radius:16px;border:1px solid var(--b);background:linear-gradient(180deg,var(--panel),var(--surface));box-shadow:var(--shadow);backdrop-filter:blur(10px);transform:translateY(-6px);opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease}.toast.show{opacity:1;transform:translateY(0);pointer-events:auto}.toast.ok{border-color:color-mix(in srgb,var(--green) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--green) 16%,var(--panel)),var(--surface))}.toast.err{border-color:color-mix(in srgb,var(--red) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--red) 18%,var(--panel)),var(--surface))}.toast.info{border-color:color-mix(in srgb,var(--blue) 45%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--blue) 10%,var(--panel)),var(--surface))}.toast-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:4px}.toast-close{appearance:none;border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:1rem;line-height:1}.update-banner{margin-bottom:16px;padding:16px 18px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--panel),var(--surface));box-shadow:var(--shadow)}.update-banner[hidden]{display:none}.update-banner.warn{border-color:color-mix(in srgb,var(--accent) 55%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 16%,var(--panel)),var(--surface))}.update-banner.info{border-color:color-mix(in srgb,var(--cyan) 45%,var(--b));background:linear-gradient(180deg,color-mix(in srgb,var(--cyan) 10%,var(--panel)),var(--surface))}.update-banner-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}.update-banner-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.update-banner-list{display:grid;gap:6px;margin-top:10px;padding-left:18px;color:var(--txt)}.config-editor{width:100%;min-height:280px;resize:vertical;font-family:Cascadia Code,Fira Code,monospace;line-height:1.55}.field-switch{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 14px;border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.field-switch strong{display:block;font-size:.84rem;margin-bottom:4px}.field-switch span{display:block}.field-switch input{width:18px;height:18px;accent-color:var(--accent)}.toolbar-note{margin-bottom:12px;color:var(--muted);font-size:.8rem}.config-actions{margin-top:12px}.utility-note{display:flex;align-items:center;justify-content:space-between;gap:14px}.utility-note .sub{max-width:58ch}.modal-backdrop{position:fixed;inset:0;background:#09060f88;backdrop-filter:blur(8px);display:grid;place-items:center;padding:22px;z-index:30}.modal-backdrop[hidden]{display:none}.modal-card{width:min(100%,1080px);max-height:min(88vh,920px);overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:22px;padding:20px;box-shadow:var(--shadow)}.modal-header{align-items:center;justify-content:space-between;margin-bottom:12px}.modal-header p{margin:0;color:var(--muted);font-size:.84rem;line-height:1.5}.modal-body{display:grid;gap:14px}.config-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.config-section{padding:16px;border:1px solid var(--b);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--surface2))}.config-section h3{font-size:.92rem;margin-bottom:6px}.config-section p{color:var(--muted);font-size:.78rem;line-height:1.5;margin-bottom:12px}.config-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px}.config-field{display:grid;gap:6px}.config-field label{font-size:.76rem;color:var(--muted);font-weight:700}.config-field.full,.config-toggle.full{grid-column:1/-1}.config-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--b);border-radius:14px;background:var(--surface2)}.config-toggle span{font-size:.8rem}.advanced-wrap{border-top:1px solid var(--b);padding-top:14px}.advanced-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.advanced-body[hidden]{display:none}.kofi-fab{position:fixed;right:18px;bottom:18px;z-index:20;display:inline-flex;align-items:center;gap:.45rem;padding:.55rem .9rem;border-radius:999px;background:linear-gradient(135deg,var(--surface2),var(--surface));border:1px solid var(--b);color:var(--txt);text-decoration:none;font-size:.78rem;font-weight:700;box-shadow:0 10px 30px #00000055;transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease;backdrop-filter:blur(4px)}.kofi-fab .heart{font-size:.9rem;line-height:1;color:#fb7185}.kofi-fab .sub{font-size:.68rem;color:var(--muted);font-weight:600}.kofi-fab:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 14px 34px #00000070;text-decoration:none}
@@ -3424,6 +3548,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
           <select id="eventPluginFilter" class="ctrl"><option value="">All Plugins</option></select>
           <select id="eventThreatFilter" class="ctrl"><option value="">All Threats</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="SUCCESS">Successful Login</option><option value="NONE">None</option></select>
           <select id="eventCountryFilter" class="ctrl"><option value="">All Countries</option></select>
+          <select id="eventBanStateFilter" class="ctrl"><option value="all">All Ban States</option><option value="preban">Pre-Ban Only</option><option value="postban">Post-Ban / Blocked</option></select>
         </div>
         <div class="table-wrap">
           <table>
@@ -3460,7 +3585,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
     <div class="stack">
       <div class="card"><h2>Operator Advice</h2><div class="advice" id="adviceList"></div></div>
       <div class="card"><h2>Blocklist Protection</h2><div class="list" id="meshList"></div></div>
-      <div class="card"><h2>Top Portscanned Ports</h2><div class="toolbar" style="margin-bottom:8px"><select id="adminAtTimeRange" class="ctrl" style="font-size:.78rem;padding:6px 10px"><option value="0">All Time</option><option value="24" selected>Last 24h</option><option value="72">Last 3 Days</option><option value="168">Last 7 Days</option><option value="720">Last 30 Days</option></select></div><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
+      <div class="card"><h2>Top Portscanned Ports</h2><div class="toolbar" style="margin-bottom:8px"><select id="adminAtTimeRange" class="ctrl" style="font-size:.78rem;padding:6px 10px"><option value="0">All Time</option><option value="24" selected>Last 24h</option><option value="72">Last 3 Days</option><option value="168">Last 7 Days</option><option value="720">Last 30 Days</option></select><label class="theme-chip" style="padding:6px 10px"><input id="adminIncludeHoneypot" type="checkbox" checked style="accent-color:var(--accent)"> Include Honeypot</label></div><div class="list" id="topPortsList"></div><div class="toolbar-grid" style="margin-top:10px;margin-bottom:0"><button id="topPortsToggleBtn" class="btn ghost" hidden>Show More</button></div></div>
     </div>
   </div>
 
@@ -3676,7 +3801,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:''};
+var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:'', adminIncludeHoneypot:true};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -3932,14 +4057,14 @@ function renderSummary(){
 }
 function renderEvents(){
   var simulation = isSimulationEnabled(state.stats&&state.stats.simulation_mode);
-  var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var country=$('#eventCountryFilter').value;
-  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var eventCountry=String(e.country_code||'').toUpperCase(); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.asn_number,e.player_name,eventCountry].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat)&&(!country||eventCountry===country); });
+  var rows=state.events.slice(); var q=filterText(); var plugin=$('#eventPluginFilter').value; var threat=$('#eventThreatFilter').value; var country=$('#eventCountryFilter').value; var banState=$('#eventBanStateFilter').value||'all';
+  rows=rows.filter(function(e){ var effectiveThreat=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var eventCountry=String(e.country_code||'').toUpperCase(); var isBanPhase=!!(e.is_post_ban||e.is_ban_trigger_event||e.is_firewall_blocked); var blob=[e.source_ip,e.connection_type,e.threat_level,e.threat_label,e.asn_org,e.asn_number,e.player_name,eventCountry,e.ban_state].join(' ').toLowerCase(); return (!q||blob.indexOf(q)!==-1)&&(!plugin||e.connection_type===plugin)&&(!threat||effectiveThreat===threat)&&(!country||eventCountry===country)&&((banState==='all')||(banState==='preban'?!isBanPhase:isBanPhase)); });
   rows.sort(function(a,b){
     var ta=Date.parse(String(a.timestamp||'')); var tb=Date.parse(String(b.timestamp||''));
     if(Number.isFinite(ta)&&Number.isFinite(tb)&&ta!==tb){ return tb-ta; }
     return (Number(b.id)||0)-(Number(a.id)||0);
   });
-  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var bannedBadge=e.is_banned?'<span class="tag t-red" style="margin-left:6px">BAN</span>':''; var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'+bannedBadge; var pluginName=String((e.connection_type||'unknown')).toUpperCase(); var port=detectPortFromEvent(e); var pluginLabel=(port&&String(e.connection_type||'').toLowerCase()==='portscan')?(pluginName+' · Port '+port):pluginName; return '<tr><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E(pluginLabel)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
+  $('#eventsRows').innerHTML = rows.length ? rows.map(function(e){ var advice=e.operator_advice||'No specific operator advice for this event.'; if(simulation){ advice += ' Monitor mode is active, so no firewall blocking is applied.'; } var cc=(e.country_code||'').toUpperCase(); var country=cc?cc:'-'; var threatLabel=(e.threat_label||e.threat_level||'NONE').toUpperCase(); var rawAsnNum=String(e.asn_number||'').trim(); var asnNum=rawAsnNum ? ('AS'+rawAsnNum.replace(/^AS/i,'')) : ''; var asnOrg=String(e.asn_org||'').trim(); var asnText=asnOrg||asnNum||'-'; if(asnNum&&asnOrg){ asnText=asnNum+' · '+asnOrg; } var asnBadge=e.is_suspicious_asn?'<span class="badge susp" title="Suspicious ASN">⚠</span> ':''; var asnTitle=asnText+(e.is_suspicious_asn?' (Suspicious ASN)':''); var src=String(e.source_ip||'-'); var rowClass=e.is_ban_trigger_event?'ev-row-ban-trigger':(e.is_post_ban?'ev-row-post-ban':(e.is_firewall_blocked?'ev-row-firewall':'')); var bannedBadge=''; if(e.is_ban_trigger_event){ bannedBadge='<span class="tag t-red" style="margin-left:6px">BANNED NOW</span>'; } else if(e.is_post_ban){ bannedBadge='<span class="tag t-red" style="margin-left:6px">BANNED</span>'; } else if(e.is_firewall_blocked){ bannedBadge='<span class="tag t-yellow" style="margin-left:6px">FIREWALL</span>'; } var sourceHtml=src==='-'?'-':'<button class="ip-link-btn" data-ip="'+E(src)+'" title="Open IP details">'+E(src)+'</button>'+bannedBadge; var pluginName=String((e.connection_type||'unknown')).toUpperCase(); var port=detectPortFromEvent(e); var pluginLabel=(port&&String(e.connection_type||'').toLowerCase()==='portscan')?(pluginName+' · Port '+port):pluginName; return '<tr class="'+rowClass+'"><td>'+ago(e.timestamp_unix||e.timestamp)+'</td><td>'+sourceHtml+'</td><td>'+E(pluginLabel)+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(country)+'">'+E(country)+'</td><td><span class="tag '+tagRisk(e.risk_score||0)+'">'+E(String(e.risk_score||0))+'</span></td><td><span class="tag '+tagThreat(threatLabel)+'">'+E(threatLabel)+'</span></td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(asnTitle)+'">'+asnBadge+E(asnText)+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>'; }).join('') : '<tr><td colspan="8" class="empty">No events match the current filters.</td></tr>';
 }
 function renderWhitelistSnapshot(){
   var target=$('#whitelistRows');
@@ -4131,7 +4256,7 @@ function renderTopPortscannedPorts(){
   var allPorts=Array.isArray(state.topPorts)?state.topPorts:[];
   var limit=state.topPortsExpanded?allPorts.length:8;
   var visible=allPorts.slice(0,limit);
-  $('#topPortsList').innerHTML = visible.length ? visible.map(function(p){ return '<div class="list-item"><strong class="mono">Port '+E(String(p.port||'-'))+'</strong><div class="sub">Scans: '+N(p.scan_count||0)+' · Last seen: '+ago(p.last_seen)+'</div></div>'; }).join('') : '<div class="empty">No portscan history yet.</div>';
+  $('#topPortsList').innerHTML = visible.length ? visible.map(function(p){ var hp=p.is_honeypot?'<span class="tag t-yellow" style="margin-left:8px">HONEYPOT</span>':''; return '<div class="list-item"><strong class="mono">Port '+E(String(p.port||'-'))+hp+'</strong><div class="sub">Scans: '+N(p.scan_count||0)+' · Last seen: '+ago(p.last_seen)+'</div></div>'; }).join('') : '<div class="empty">No portscan history yet.</div>';
   var btn=$('#topPortsToggleBtn');
   if(!btn){ return; }
   if(allPorts.length<=8){
@@ -4265,7 +4390,8 @@ function syncPluginFilter(){ var select=$('#eventPluginFilter'); var current=sel
 function syncCountryFilter(){ var select=$('#eventCountryFilter'); var current=select.value; var values=Array.from(new Set(state.events.map(function(e){ return String(e.country_code||'').toUpperCase(); }).filter(function(v){ return v && v!=='ZZ'; }))).sort(); select.innerHTML='<option value="">All Countries</option>'+values.map(function(v){ return '<option value="'+E(v)+'">'+E(v)+'</option>'; }).join(''); select.value=values.indexOf(current)!==-1?current:''; }
 async function refresh(){
   var adminPortsHours=parseInt(($('#adminAtTimeRange')||{value:'24'}).value,10)||0;
-  var portsQuery='/api/top-portscanned-ports?limit=12'+(adminPortsHours>0?'&hours='+adminPortsHours:'');
+  state.adminIncludeHoneypot=!!($('#adminIncludeHoneypot')&&$('#adminIncludeHoneypot').checked);
+  var portsQuery='/api/top-portscanned-ports?limit=12'+(adminPortsHours>0?'&hours='+adminPortsHours:'')+(state.adminIncludeHoneypot?'':'&include_honeypot=0');
   var results = await Promise.all([api('/api/health'),api('/api/stats'),api('/api/events?limit=120'),api('/api/bans'),api('/api/firewall-bans?limit=1000'),api(portsQuery),api('/api/blocklist')]);
   if(results.some(function(item){ return item===null; })){ return; }
   state.health=results[0]||null; state.stats=results[1]||null; state.events=results[2]&&results[2].events?results[2].events:[]; state.bans=results[3]&&results[3].bans?results[3].bans:[]; state.firewall=results[4]&&results[4].items?results[4].items:[]; state.topPorts=results[5]&&results[5].ports?results[5].ports:[]; state.blocklist=results[6]||null;
@@ -4275,7 +4401,7 @@ async function performAction(path, body, successTitle, successMessage){ var payl
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
-  ['globalSearch','eventPluginFilter','eventThreatFilter','eventCountryFilter','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventCountryFilter','eventBanStateFilter','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
@@ -4293,6 +4419,7 @@ function bind(){
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
   $('#topPortsToggleBtn').addEventListener('click', function(){ state.topPortsExpanded=!state.topPortsExpanded; renderTopPortscannedPorts(); });
     $('#adminAtTimeRange').addEventListener('change', function(){ handleUserActivity(); refresh(); });
+  $('#adminIncludeHoneypot').addEventListener('change', function(){ handleUserActivity(); refresh(); });
   $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
   $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
   $('#saveAdminTotpBtn').addEventListener('click', async function(){
