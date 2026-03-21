@@ -726,6 +726,79 @@ class WardenIPS:
         except Exception:
             return False
 
+    async def _run_asn_backfill_cycle(
+        self,
+        batch_size: int,
+        connection_types: list[str],
+    ) -> int:
+        """Backfills missing ASN fields in small batches to avoid runtime overhead."""
+        if not self._asn_engine:
+            return 0
+        if not hasattr(self._db, "get_events_missing_asn"):
+            return 0
+        if not hasattr(self._db, "apply_event_asn_backfill"):
+            return 0
+
+        rows = await self._db.get_events_missing_asn(
+            limit=batch_size,
+            connection_types=connection_types,
+        )
+        if not rows:
+            return 0
+
+        ip_cache: dict[str, object] = {}
+        updates: list[dict[str, object]] = []
+        unresolved = 0
+
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            source_ip = str(row.get("source_ip") or "").strip()
+            if row_id <= 0:
+                continue
+
+            # Mark invalid IP rows as attempted to avoid repeated rescans.
+            if not self._is_valid_ip(source_ip):
+                updates.append(
+                    {
+                        "id": row_id,
+                        "asn_number": None,
+                        "asn_org": "",
+                        "is_suspicious_asn": False,
+                    }
+                )
+                unresolved += 1
+                continue
+
+            if source_ip not in ip_cache:
+                ip_cache[source_ip] = self._asn_engine.lookup(source_ip)
+
+            result = ip_cache[source_ip]
+            asn_number = getattr(result, "asn_number", None)
+            asn_org = getattr(result, "asn_org", None)
+            is_suspicious = bool(getattr(result, "is_suspicious", False))
+
+            if asn_number is None and not asn_org:
+                unresolved += 1
+
+            updates.append(
+                {
+                    "id": row_id,
+                    "asn_number": asn_number,
+                    "asn_org": asn_org or "",
+                    "is_suspicious_asn": is_suspicious,
+                }
+            )
+
+        applied = await self._db.apply_event_asn_backfill(updates)
+        if applied > 0:
+            self._logger.info(
+                "ASN backfill cycle: updated=%d unresolved=%d scanned=%d",
+                applied,
+                unresolved,
+                len(rows),
+            )
+        return applied
+
     async def run_forever(self) -> None:
         """Run the main loop — wait until a signal is received."""
 
@@ -794,8 +867,39 @@ class WardenIPS:
                     connection_types=connection_types,
                 )
 
+        async def _asn_backfill_loop():
+            enabled = bool(self._config.get("asn_protection.backfill_missing.enabled", True))
+            if not enabled:
+                return
+            if not hasattr(self._db, "get_events_missing_asn") or not hasattr(self._db, "apply_event_asn_backfill"):
+                self._logger.info("ASN backfill is supported only by sqlite backend; skipping.")
+                return
+
+            batch_size = min(max(int(self._config.get("asn_protection.backfill_missing.batch_size", 200)), 10), 2000)
+            interval = max(int(self._config.get("asn_protection.backfill_missing.interval_seconds", 180)), 30)
+            raw_types = self._config.get("asn_protection.backfill_missing.connection_types", [])
+            if isinstance(raw_types, list):
+                connection_types = [str(item).strip().lower() for item in raw_types if str(item).strip()]
+            else:
+                connection_types = []
+
+            self._logger.info(
+                "ASN backfill enabled: interval=%ss batch=%d types=%s",
+                interval,
+                batch_size,
+                ",".join(connection_types) if connection_types else "all",
+            )
+
+            while self._running:
+                processed = await self._run_asn_backfill_cycle(batch_size, connection_types)
+                if not self._running:
+                    break
+                # If there is backlog, continue quickly in small chunks; otherwise sleep normally.
+                await asyncio.sleep(1 if processed >= batch_size else interval)
+
         stats_task = asyncio.create_task(_stats_loop())
         retention_task = asyncio.create_task(_retention_loop())
+        asn_backfill_task = asyncio.create_task(_asn_backfill_loop())
 
         try:
             await stop_event.wait()
@@ -804,6 +908,7 @@ class WardenIPS:
         finally:
             stats_task.cancel()
             retention_task.cancel()
+            asn_backfill_task.cancel()
             await self.shutdown()
 
     def _log_system_info(self) -> None:

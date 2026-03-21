@@ -47,6 +47,11 @@ asn_protection:
   db_path: "/opt/wardenips/assets/GeoLite2-ASN.mmdb"
   country_db_path: "/var/lib/wardenips/GeoLite2-Country.mmdb"  # Optional; enables dashboard country heatmap enrichment
   auto_update_enabled: true     # Weekly automatic updates from GitHub (Thursdays)
+  backfill_missing:
+    enabled: true               # Fill missing ASN fields in old/manual records using lightweight background batches
+    batch_size: 200
+    interval_seconds: 180
+    connection_types: []        # Empty = all types, or e.g. ["minecraft", "authme"]
   # Mark traffic from suspicious ASNs as high-risk (increases the risk score)
   # Format: "AS<NUMBER>" (e.g., AS16509 = Amazon) or just the number (16509)
   suspicious_asns:

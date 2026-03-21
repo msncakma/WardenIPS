@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -84,6 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_events_authme_ip_ts
 CREATE INDEX IF NOT EXISTS idx_events_authme_player_ts
     ON connection_events(player_name, timestamp)
     WHERE connection_type = 'authme';
+
+CREATE INDEX IF NOT EXISTS idx_events_missing_asn_scan
+    ON connection_events(id)
+    WHERE asn_number IS NULL AND asn_org IS NULL;
 
 -- Ban history table
 CREATE TABLE IF NOT EXISTS ban_history (
@@ -325,10 +329,22 @@ class DatabaseManager:
                             await self._migrate_v6_to_v7_minecraft_player_cache()
                         if current < 8:
                             await self._migrate_v7_to_v8_authme_indexes()
+                        if current < 9:
+                            await self._migrate_v8_to_v9_missing_asn_index()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
                         )
+
+    async def _migrate_v8_to_v9_missing_asn_index(self) -> None:
+        """Adds index for efficient missing-ASN backfill scans."""
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_events_missing_asn_scan
+                ON connection_events(id)
+                WHERE asn_number IS NULL AND asn_org IS NULL
+            """
+        )
 
     async def _migrate_v7_to_v8_authme_indexes(self) -> None:
         """Adds partial indexes to accelerate AuthMe correlation queries."""
@@ -560,6 +576,87 @@ class DatabaseManager:
                 return deleted
             except Exception as exc:
                 logger.error("Retention cleanup failed: %s", exc)
+                return 0
+
+    async def get_events_missing_asn(
+        self,
+        limit: int = 200,
+        connection_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns rows that have not yet received ASN enrichment."""
+        safe_limit = min(max(int(limit), 1), 5000)
+        normalized_types = [
+            str(item).strip().lower()
+            for item in (connection_types or [])
+            if str(item).strip()
+        ]
+
+        try:
+            query = """
+                SELECT id, source_ip, connection_type
+                FROM connection_events
+                WHERE asn_number IS NULL
+                  AND asn_org IS NULL
+                  AND COALESCE(source_ip, '') <> ''
+            """
+            params: List[Any] = []
+            if normalized_types:
+                placeholders = ",".join(["?"] * len(normalized_types))
+                query += f" AND LOWER(COALESCE(connection_type, '')) IN ({placeholders})"
+                params.extend(normalized_types)
+            query += " ORDER BY id ASC LIMIT ?"
+            params.append(safe_limit)
+
+            async with self._db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+        except Exception as exc:
+            logger.error("Missing-ASN query failed: %s", exc)
+            return []
+
+    async def apply_event_asn_backfill(self, updates: List[Dict[str, Any]]) -> int:
+        """Applies ASN enrichment updates in a single transaction."""
+        if not updates:
+            return 0
+
+        payload: List[tuple[Any, Any, Any, int]] = []
+        for item in updates:
+            try:
+                event_id = int(item.get("id"))
+            except Exception:
+                continue
+            asn_number = item.get("asn_number")
+            asn_org = item.get("asn_org")
+            is_suspicious = bool(item.get("is_suspicious_asn", False))
+            payload.append(
+                (
+                    asn_number if asn_number is not None else None,
+                    str(asn_org if asn_org is not None else ""),
+                    1 if is_suspicious else 0,
+                    event_id,
+                )
+            )
+
+        if not payload:
+            return 0
+
+        async with self._lock:
+            try:
+                await self._db.executemany(
+                    """
+                    UPDATE connection_events
+                    SET asn_number = ?,
+                        asn_org = ?,
+                        is_suspicious_asn = ?
+                    WHERE id = ?
+                    """,
+                    payload,
+                )
+                await self._db.commit()
+                return len(payload)
+            except Exception as exc:
+                logger.error("ASN backfill apply failed: %s", exc)
                 return 0
 
     async def mark_authme_login_failed_by_disconnect(
