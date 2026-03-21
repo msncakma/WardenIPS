@@ -471,6 +471,13 @@ class DashboardAPI:
     return int(dt.timestamp())
 
   @staticmethod
+  def _safe_int(value: object, default: int = 0) -> int:
+    try:
+      return int(value)
+    except Exception:
+      return int(default)
+
+  @staticmethod
   def _normalize_country_code(country_value: object) -> str:
     code = str(country_value or "").strip().upper()
     if len(code) == 2 and code.isalpha():
@@ -2699,7 +2706,7 @@ class DashboardAPI:
         event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
         banned_current = bool(event.get("is_banned_current"))
         first_ban_unix = self._safe_int(event.get("first_ban_unix"), 0)
-        event_ts_unix = self._parse_timestamp_unix(event.get("timestamp"))
+        event_ts_unix = self._safe_int(self._parse_timestamp_unix(event.get("timestamp")), 0)
         event["is_firewall_blocked"] = banned_current
         event["is_post_ban"] = bool(banned_current and first_ban_unix > 0 and event_ts_unix >= first_ban_unix)
         event["is_ban_trigger_event"] = bool(banned_current and first_ban_unix > 0 and abs(event_ts_unix - first_ban_unix) <= 60)

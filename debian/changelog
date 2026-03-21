@@ -1,3 +1,12 @@
+wardenips (0.4.0~beta12-1) stable; urgency=medium
+
+  * Hotfix: Add missing DashboardAPI._safe_int helper used by minecraft events API
+  * Fix minecraft events ban-state timestamp math to be None-safe
+  * Fix /admin/minecraft refresh failure and restore recent events rendering
+  * Bump version to 0.4.0-beta-12
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 17:43:11 +03:00
+
 wardenips (0.4.0~beta11-1) stable; urgency=medium
 
   * Hotfix: Fix VelocityPlugin initialization order to avoid AttributeError on startup
