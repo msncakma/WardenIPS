@@ -145,6 +145,11 @@ plugins:
         last_login: "lastlogin"
         reg_ip: "regip"
         is_verified: "isVerified"
+    analytics:
+      api_rate_limit_per_minute: 240
+      entity_intel_cache_ttl_seconds: 20
+      parser_health_cache_ttl_seconds: 12
+      mask_emails: true
     
   nginx:
     enabled: false

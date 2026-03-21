@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -143,6 +143,23 @@ CREATE INDEX IF NOT EXISTS idx_mc_burst_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_mc_burst_source_ip
     ON minecraft_burst_alerts(source_ip);
+
+-- Minecraft watchlist entries
+CREATE TABLE IF NOT EXISTS minecraft_watchlist (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name     TEXT    NOT NULL,
+    reason          TEXT,
+    actor_username  TEXT,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mc_watchlist_player_active
+    ON minecraft_watchlist(player_name, is_active);
+
+CREATE INDEX IF NOT EXISTS idx_mc_watchlist_created
+    ON minecraft_watchlist(created_at);
 
 -- Schema version table (for migrations)
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -267,6 +284,8 @@ class DatabaseManager:
                             await self._migrate_v2_to_v3_source_ip()
                         if current < 5:
                             await self._migrate_v4_to_v5_minecraft_alerts()
+                        if current < 6:
+                            await self._migrate_v5_to_v6_minecraft_watchlist()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
@@ -335,6 +354,28 @@ class DatabaseManager:
 
             CREATE INDEX IF NOT EXISTS idx_events_source_ip_ts
                 ON connection_events(source_ip, timestamp);
+            """
+        )
+
+    async def _migrate_v5_to_v6_minecraft_watchlist(self) -> None:
+        """Adds minecraft watchlist table and indexes."""
+        await self._db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS minecraft_watchlist (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_name     TEXT    NOT NULL,
+                reason          TEXT,
+                actor_username  TEXT,
+                is_active       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mc_watchlist_player_active
+                ON minecraft_watchlist(player_name, is_active);
+
+            CREATE INDEX IF NOT EXISTS idx_mc_watchlist_created
+                ON minecraft_watchlist(created_at);
             """
         )
 
@@ -877,6 +918,126 @@ class DatabaseManager:
             ) as cursor:
                 await self._db.commit()
                 return cursor.lastrowid
+
+    async def add_minecraft_watchlist(
+        self,
+        player_name: str,
+        reason: str = "",
+        actor_username: str = "",
+    ) -> int:
+        normalized = str(player_name or "").strip()
+        if not normalized:
+            raise WardenDatabaseError("Player name is required for watchlist.")
+        async with self._lock:
+            try:
+                # Reactivate existing inactive entry when available.
+                async with self._db.execute(
+                    """
+                    SELECT id
+                    FROM minecraft_watchlist
+                    WHERE LOWER(player_name) = LOWER(?)
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (normalized,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+                if row:
+                    watch_id = int(row[0])
+                    await self._db.execute(
+                        """
+                        UPDATE minecraft_watchlist
+                        SET is_active = 1,
+                            reason = ?,
+                            actor_username = ?,
+                            updated_at = datetime('now')
+                        WHERE id = ?
+                        """,
+                        (reason, actor_username, watch_id),
+                    )
+                    await self._db.commit()
+                    return watch_id
+
+                async with self._db.execute(
+                    """
+                    INSERT INTO minecraft_watchlist
+                        (player_name, reason, actor_username, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))
+                    """,
+                    (normalized, reason, actor_username),
+                ) as cursor:
+                    await self._db.commit()
+                    return int(cursor.lastrowid)
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to add minecraft watchlist entry: {exc}"
+                ) from exc
+
+    async def remove_minecraft_watchlist(self, player_name: str) -> int:
+        normalized = str(player_name or "").strip()
+        if not normalized:
+            return 0
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    """
+                    UPDATE minecraft_watchlist
+                    SET is_active = 0,
+                        updated_at = datetime('now')
+                    WHERE LOWER(player_name) = LOWER(?)
+                      AND is_active = 1
+                    """,
+                    (normalized,),
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount if cursor.rowcount is not None else 0
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to remove minecraft watchlist entry: {exc}"
+                ) from exc
+
+    async def list_minecraft_watchlist(self, limit: int = 200) -> List[Dict[str, Any]]:
+        max_limit = min(max(int(limit), 1), 1000)
+        try:
+            async with self._db.execute(
+                """
+                SELECT id, player_name, reason, actor_username, is_active, created_at, updated_at
+                FROM minecraft_watchlist
+                WHERE is_active = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max_limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+        except Exception as exc:
+            logger.error("Minecraft watchlist query failed: %s", exc)
+            return []
+
+    async def get_minecraft_watchlist_names(self) -> set[str]:
+        try:
+            async with self._db.execute(
+                """
+                SELECT player_name
+                FROM minecraft_watchlist
+                WHERE is_active = 1
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+                names: set[str] = set()
+                for row in rows:
+                    if not row:
+                        continue
+                    value = str(row[0] or "").strip().lower()
+                    if value:
+                        names.add(value)
+                return names
+        except Exception as exc:
+            logger.error("Minecraft watchlist names query failed: %s", exc)
+            return set()
 
     # ── Resource Management ──
 

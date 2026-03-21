@@ -1,3 +1,14 @@
+wardenips (0.4.0~beta8-1) stable; urgency=medium
+
+  * Add minecraft operator actions: ban-player, whitelist-player, watchlist add/remove/list
+  * Add minecraft watchlist storage with schema migration v6
+  * Add parser health endpoint and admin panel section for minecraft/velocity
+  * Add minecraft API safeguards (rate limiting, cache TTL, optional email masking)
+  * Improve minecraft admin UX with duplicate-email panel and auto-refresh controls
+  * Bump version to 0.4.0-beta-8
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 15:20:00 +0000
+
 wardenips (0.4.0~beta7-1) stable; urgency=medium
 
   * Fix: Enable Velocity plugin by default in config template

@@ -6,7 +6,7 @@ It is designed for teams that want stronger protection than static log-based ban
 
 Maintainer: msncakma
 
-[![Version](https://img.shields.io/badge/version-0.4.0-beta--7-green.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-0.4.0-beta--8-green.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -27,7 +27,7 @@ If you run internet-facing services and want practical prevention with transpare
 
 ## Transparent Status
 
-Current version: v0.4.0-beta-7
+Current version: v0.4.0-beta-8
 
 This project is in beta, and that matters.
 
@@ -70,6 +70,16 @@ WardenIPS continuously ingests service logs, converts them into structured secur
 - Live event stream, active DB bans, active firewall entries
 - Query tools for IP, ASN, and username records
 - Audit logging for sensitive admin actions
+
+### Minecraft Admin Intelligence
+
+- Dedicated admin panel at `/admin/minecraft` for Minecraft and Velocity activity
+- Entity investigation for username, IP, and ASN with timeline pivoting
+- Duplicate email signal panel for player DB enrichment findings
+- Watchlist workflow for suspicious player tracking
+- Player-level operator actions: ban all known player IPs or whitelist them in one step
+- Parser health view for Minecraft and Velocity log ingestion (enabled state, readability, recent event flow)
+- Built-in analytics safeguards: API rate limiting, short TTL response cache, optional email masking
 
 ## What It Does Not Do
 

@@ -1,6 +1,6 @@
 # WardenIPS — Installation & Configuration Guide
 
-**Version: 0.4.0-beta-7**
+**Version: 0.4.0-beta-8**
 
 Complete guide for deploying WardenIPS on a Linux server.
 
@@ -171,11 +171,34 @@ plugins:
   minecraft:
     enabled: false
     log_path: "/opt/minecraft/logs/latest.log"
+    velocity:
+      enabled: true
+      log_path: "/opt/velocity/logs/latest.log"
+    analytics:
+      api_rate_limit_per_minute: 240
+      entity_intel_cache_ttl_seconds: 20
+      parser_health_cache_ttl_seconds: 12
+      mask_emails: true
 
   nginx:
     enabled: false
     log_path: "/var/log/nginx/access.log"
 ```
+
+Minecraft admin operations now expose the following protected routes:
+
+- `GET /admin/minecraft`
+- `GET /api/minecraft/summary`
+- `GET /api/minecraft/events`
+- `GET /api/minecraft/bursts`
+- `GET /api/minecraft/duplicates/email`
+- `GET /api/minecraft/entity-intel`
+- `GET /api/admin/minecraft/parser-health`
+- `GET /api/admin/minecraft/watchlist`
+- `POST /api/admin/minecraft/watchlist/add`
+- `POST /api/admin/minecraft/watchlist/remove`
+- `POST /api/admin/minecraft/ban-player`
+- `POST /api/admin/minecraft/whitelist-player`
 
 ### 5.6 Geofencing (Optional)
 

@@ -112,6 +112,8 @@ class DashboardAPI:
     self._login_attempts: dict[str, list[float]] = {}
     self._activity_touches: dict[str, list[float]] = {}
     self._recent_client_ips: dict[str, float] = {}
+    self._minecraft_api_attempts: dict[str, list[float]] = {}
+    self._minecraft_api_cache: dict[str, dict[str, object]] = {}
     self._activity_touch_interval_seconds: int = 15
     self._bootstrap_setup_required: bool = False
     self._bootstrap_token_hash: str = ""
@@ -244,6 +246,60 @@ class DashboardAPI:
     entries.append(now)
     bucket[key] = entries
     return False
+
+  def _get_minecraft_analytics_int(self, key: str, default: int, minimum: int = 0, maximum: int = 10_000) -> int:
+    try:
+      value = int(self._config.get(f"plugins.minecraft.analytics.{key}", default))
+    except Exception:
+      value = int(default)
+    return min(max(value, minimum), maximum)
+
+  def _is_minecraft_email_masking_enabled(self) -> bool:
+    return bool(self._config.get("plugins.minecraft.analytics.mask_emails", True))
+
+  def _mask_email(self, email: str) -> str:
+    value = str(email or "").strip()
+    if not value or "@" not in value:
+      return value
+    local, domain = value.split("@", 1)
+    if not local:
+      return f"***@{domain}"
+    if len(local) <= 2:
+      masked_local = local[0] + "*" * max(len(local) - 1, 1)
+    else:
+      masked_local = local[0] + ("*" * (len(local) - 2)) + local[-1]
+    return f"{masked_local}@{domain}"
+
+  def _minecraft_cache_get(self, key: str, ttl_seconds: int) -> Optional[dict]:
+    if ttl_seconds <= 0:
+      return None
+    entry = self._minecraft_api_cache.get(key)
+    if not entry:
+      return None
+    created = float(entry.get("created", 0.0) or 0.0)
+    if (time.monotonic() - created) > ttl_seconds:
+      self._minecraft_api_cache.pop(key, None)
+      return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+      return None
+    return copy.deepcopy(payload)
+
+  def _minecraft_cache_set(self, key: str, payload: dict) -> None:
+    self._minecraft_api_cache[key] = {
+      "created": time.monotonic(),
+      "payload": copy.deepcopy(payload),
+    }
+
+  def _consume_minecraft_rate_limit(self, request: web.Request, scope: str) -> bool:
+    limit = self._get_minecraft_analytics_int("api_rate_limit_per_minute", 240, minimum=10, maximum=5000)
+    client_ip = self._client_ip(request)
+    return self._consume_rate_limit(
+      self._minecraft_api_attempts,
+      f"{scope}:{client_ip}",
+      limit,
+      60,
+    )
 
   def _is_session_authenticated(self, request: web.Request) -> bool:
     self._cleanup_expired_sessions()
@@ -556,6 +612,12 @@ class DashboardAPI:
     self._app.router.add_get("/api/minecraft/bursts", self._handle_minecraft_bursts)
     self._app.router.add_get("/api/minecraft/duplicates/email", self._handle_minecraft_duplicate_emails)
     self._app.router.add_get("/api/minecraft/entity-intel", self._handle_minecraft_entity_intel)
+    self._app.router.add_get("/api/admin/minecraft/parser-health", self._handle_admin_minecraft_parser_health)
+    self._app.router.add_get("/api/admin/minecraft/watchlist", self._handle_admin_minecraft_watchlist)
+    self._app.router.add_post("/api/admin/minecraft/watchlist/add", self._handle_admin_minecraft_watchlist_add)
+    self._app.router.add_post("/api/admin/minecraft/watchlist/remove", self._handle_admin_minecraft_watchlist_remove)
+    self._app.router.add_post("/api/admin/minecraft/ban-player", self._handle_admin_minecraft_ban_player)
+    self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
@@ -2557,7 +2619,9 @@ class DashboardAPI:
     username = str(request.query.get("username", "")).strip()
     source_ip = str(request.query.get("ip", "")).strip()
     event_type = str(request.query.get("event_type", "")).strip().lower()
+    hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
       query = """
         SELECT id, timestamp, source_ip, player_name, connection_type,
                asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details
@@ -2565,8 +2629,11 @@ class DashboardAPI:
         WHERE connection_type = 'minecraft'
       """
       params: list[object] = []
+      if hours_back > 0:
+        query += f" AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
+        params.append(f"-{hours_back}")
       if username:
-        query += " AND player_name = ?"
+        query += " AND LOWER(COALESCE(player_name, '')) = LOWER(?)"
         params.append(username)
       if source_ip:
         query += " AND source_ip = ?"
@@ -2583,6 +2650,8 @@ class DashboardAPI:
           columns = [d[0] for d in cursor.description]
           events = [dict(zip(columns, row)) for row in rows]
 
+      watch_names = await self._db.get_minecraft_watchlist_names()
+
       for event in events:
         details_obj = {}
         details_raw = event.get("details")
@@ -2593,6 +2662,7 @@ class DashboardAPI:
             details_obj = {}
         event["event_type"] = str(details_obj.get("event_type") or "")
         event["country_code"] = self._resolve_country_code(details_obj, event.get("source_ip"))
+        event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
 
       return web.json_response({"events": events, "count": len(events), "limit": limit, "offset": offset})
     except Exception as exc:
@@ -2603,16 +2673,25 @@ class DashboardAPI:
       return self._json_auth_error()
     self._touch_session(request)
     limit = min(max(int(request.query.get("limit", "50")), 1), 500)
+    hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      where_clause = ""
+      params: list[object] = []
+      if hours_back > 0:
+        where_clause = f"WHERE {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
+        params.append(f"-{hours_back}")
+      params.append(limit)
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT id, timestamp, source_ip, event_count, window_seconds, unique_ip_count, plugin_name
           FROM minecraft_burst_alerts
+          {where_clause}
           ORDER BY id DESC
           LIMIT ?
           """,
-          (limit,),
+          tuple(params),
         ) as cursor:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
@@ -2625,19 +2704,30 @@ class DashboardAPI:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    if self._consume_minecraft_rate_limit(request, "minecraft.duplicates"):
+      return web.json_response({"error": "rate_limited", "message": "Too many duplicate-email requests."}, status=429)
     limit = min(max(int(request.query.get("limit", "50")), 1), 500)
+    hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      where_clause = ""
+      params: list[object] = []
+      if hours_back > 0:
+        where_clause = f" AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
+        params.append(f"-{hours_back}")
+      params.append(limit)
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT source_ip, player_name, timestamp, details
           FROM connection_events
           WHERE connection_type = 'minecraft'
             AND COALESCE(details, '') LIKE '%"duplicate_email_count":%'
+            {where_clause}
           ORDER BY id DESC
           LIMIT ?
           """,
-          (limit,),
+          tuple(params),
         ) as cursor:
           rows = await cursor.fetchall()
 
@@ -2653,6 +2743,8 @@ class DashboardAPI:
         email_value = str(details_obj.get("email") or "")
         if duplicate_count <= 1:
           continue
+        if self._is_minecraft_email_masking_enabled():
+          email_value = self._mask_email(email_value)
         findings.append(
           {
             "timestamp": timestamp,
@@ -2666,15 +2758,293 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
+  async def _handle_admin_minecraft_parser_health(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    if self._consume_minecraft_rate_limit(request, "minecraft.parser_health"):
+      return web.json_response({"error": "rate_limited", "message": "Too many parser-health requests."}, status=429)
+    try:
+      cache_ttl = self._get_minecraft_analytics_int("parser_health_cache_ttl_seconds", 12, minimum=0, maximum=300)
+      cached = self._minecraft_cache_get("minecraft.parser_health", cache_ttl)
+      if cached is not None:
+        return web.json_response(cached)
+
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      async with self._db._lock:
+        async with self._db._db.execute(
+          f"""
+          SELECT
+            MAX(CASE WHEN COALESCE(details, '') LIKE '%\"event_type\": \"velocity_connected\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"velocity_disconnect\"%' THEN timestamp END) AS velocity_last,
+            SUM(CASE WHEN ({timestamp_expr} >= strftime('%s', 'now', '-1 hours')) AND (COALESCE(details, '') LIKE '%\"event_type\": \"velocity_connected\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"velocity_disconnect\"%') THEN 1 ELSE 0 END) AS velocity_count_1h,
+            MAX(CASE WHEN COALESCE(details, '') LIKE '%\"event_type\": \"login\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"ip_disconnect\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"failed_packet\"%' THEN timestamp END) AS minecraft_last,
+            SUM(CASE WHEN ({timestamp_expr} >= strftime('%s', 'now', '-1 hours')) AND (COALESCE(details, '') LIKE '%\"event_type\": \"login\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"ip_disconnect\"%' OR COALESCE(details, '') LIKE '%\"event_type\": \"failed_packet\"%') THEN 1 ELSE 0 END) AS minecraft_count_1h
+          FROM connection_events
+          WHERE connection_type = 'minecraft'
+          """
+        ) as cursor:
+          row = await cursor.fetchone()
+
+      velocity_log = str(self._config.get("plugins.minecraft.velocity.log_path", "/opt/velocity/logs/latest.log"))
+      minecraft_log = str(self._config.get("plugins.minecraft.log_path", "/opt/minecraft/logs/latest.log"))
+
+      velocity_exists = os.path.exists(velocity_log)
+      minecraft_exists = os.path.exists(minecraft_log)
+      velocity_readable = os.access(velocity_log, os.R_OK) if velocity_exists else False
+      minecraft_readable = os.access(minecraft_log, os.R_OK) if minecraft_exists else False
+
+      payload = {
+        "velocity": {
+          "enabled": bool(self._config.get("plugins.minecraft.velocity.enabled", False)),
+          "log_path": velocity_log,
+          "path_exists": velocity_exists,
+          "readable": velocity_readable,
+          "last_event": row[0] if row else None,
+          "events_last_hour": int((row[1] or 0) if row else 0),
+        },
+        "minecraft": {
+          "enabled": bool(self._config.get("plugins.minecraft.enabled", False)),
+          "log_path": minecraft_log,
+          "path_exists": minecraft_exists,
+          "readable": minecraft_readable,
+          "last_event": row[2] if row else None,
+          "events_last_hour": int((row[3] or 0) if row else 0),
+        },
+      }
+      self._minecraft_cache_set("minecraft.parser_health", payload)
+      return web.json_response(payload)
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _get_minecraft_player_ips(self, player_name: str, limit: int = 200) -> list[str]:
+    normalized = str(player_name or "").strip()
+    if not normalized:
+      return []
+    max_limit = min(max(int(limit), 1), 1000)
+    async with self._db._lock:
+      async with self._db._db.execute(
+        """
+        SELECT DISTINCT source_ip
+        FROM connection_events
+        WHERE connection_type = 'minecraft'
+          AND LOWER(COALESCE(player_name, '')) = LOWER(?)
+          AND COALESCE(source_ip, '') <> ''
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (normalized, max_limit),
+      ) as cursor:
+        rows = await cursor.fetchall()
+        ips = [str(row[0]).strip() for row in rows if row and str(row[0] or "").strip()]
+        # Deduplicate while preserving order.
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for ip_value in ips:
+          if ip_value in seen:
+            continue
+          deduped.append(ip_value)
+          seen.add(ip_value)
+        return deduped
+
+  async def _handle_admin_minecraft_watchlist(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    limit = min(max(int(request.query.get("limit", "200")), 1), 1000)
+    entries = await self._db.list_minecraft_watchlist(limit=limit)
+    return web.json_response({"entries": entries, "count": len(entries)})
+
+  async def _handle_admin_minecraft_watchlist_add(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    player_name = str(payload.get("player_name", "")).strip()
+    if not player_name:
+      return web.json_response(
+        {"error": "invalid_player", "message": "player_name is required."},
+        status=400,
+      )
+    reason = str(payload.get("reason", "")).strip() or "[ADMIN] Minecraft watchlist"
+    watch_id = await self._db.add_minecraft_watchlist(player_name, reason=reason, actor_username=actor or "")
+    await self._log_audit(
+      request,
+      "admin.minecraft.watchlist_add",
+      actor_username=actor,
+      target=player_name,
+      details={"player_name": player_name, "reason": reason, "watch_id": watch_id},
+    )
+    return web.json_response({"ok": True, "player_name": player_name, "watch_id": watch_id, "message": f"{player_name} added to minecraft watchlist."})
+
+  async def _handle_admin_minecraft_watchlist_remove(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    player_name = str(payload.get("player_name", "")).strip()
+    if not player_name:
+      return web.json_response(
+        {"error": "invalid_player", "message": "player_name is required."},
+        status=400,
+      )
+    updated = await self._db.remove_minecraft_watchlist(player_name)
+    await self._log_audit(
+      request,
+      "admin.minecraft.watchlist_remove",
+      actor_username=actor,
+      target=player_name,
+      details={"player_name": player_name, "updated": updated},
+    )
+    return web.json_response({"ok": True, "player_name": player_name, "updated": updated, "message": f"Watchlist entries removed: {updated}"})
+
+  async def _handle_admin_minecraft_ban_player(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    player_name = str(payload.get("player_name", "")).strip()
+    if not player_name:
+      return web.json_response(
+        {"error": "invalid_player", "message": "player_name is required."},
+        status=400,
+      )
+
+    reason = str(payload.get("reason", "")).strip()
+    if not reason:
+      return web.json_response(
+        {"error": "invalid_reason", "message": "reason is required for ban-player action."},
+        status=400,
+      )
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = 0
+
+    ips = await self._get_minecraft_player_ips(player_name)
+    if not ips:
+      return web.json_response(
+        {"error": "no_player_ips", "message": f"No known IPs found for player {player_name}."},
+        status=404,
+      )
+
+    results: list[dict[str, object]] = []
+    for ip_value in ips:
+      banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=f"[ADMIN][MINECRAFT_PLAYER] {reason} | player={player_name}")
+      if banned:
+        await self._db.log_ban(ip_value, f"[ADMIN][MINECRAFT_PLAYER] {reason} | player={player_name}", 100, duration)
+      results.append({"ip": ip_value, "ban_applied": bool(banned)})
+
+    applied = sum(1 for item in results if item.get("ban_applied"))
+    await self._log_audit(
+      request,
+      "admin.minecraft.ban_player",
+      actor_username=actor,
+      target=player_name,
+      details={"player_name": player_name, "duration": duration, "reason": reason, "ips": ips, "applied": applied},
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "player_name": player_name,
+        "total_ips": len(ips),
+        "applied": applied,
+        "duration": duration,
+        "results": results,
+        "message": f"Ban action finished for {player_name}: {applied}/{len(ips)} applied.",
+      }
+    )
+
+  async def _handle_admin_minecraft_whitelist_player(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    player_name = str(payload.get("player_name", "")).strip()
+    if not player_name:
+      return web.json_response(
+        {"error": "invalid_player", "message": "player_name is required."},
+        status=400,
+      )
+
+    ips = await self._get_minecraft_player_ips(player_name)
+    if not ips:
+      return web.json_response(
+        {"error": "no_player_ips", "message": f"No known IPs found for player {player_name}."},
+        status=404,
+      )
+
+    current_ips = [str(item).strip() for item in list(self._config.get("whitelist.ips", []) or []) if str(item or "").strip()]
+    existing = set(current_ips)
+    added_ips: list[str] = []
+    for ip_value in ips:
+      if ip_value in existing:
+        continue
+      current_ips.append(ip_value)
+      existing.add(ip_value)
+      added_ips.append(ip_value)
+
+    if added_ips:
+      await self._config.patch_values({"whitelist.ips": current_ips})
+      if self._whitelist:
+        await self._whitelist.reload(self._config)
+
+    await self._log_audit(
+      request,
+      "admin.minecraft.whitelist_player",
+      actor_username=actor,
+      target=player_name,
+      details={"player_name": player_name, "resolved_ips": ips, "added_ips": added_ips},
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "player_name": player_name,
+        "resolved_ips": ips,
+        "added_ips": added_ips,
+        "message": f"Whitelist update for {player_name}: {len(added_ips)} new IP(s) added.",
+      }
+    )
+
   async def _handle_minecraft_entity_intel(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
     self._touch_session(request)
+    if self._consume_minecraft_rate_limit(request, "minecraft.entity_intel"):
+      return web.json_response({"error": "rate_limited", "message": "Too many entity-intel requests."}, status=429)
 
     entity_type = str(request.query.get("type", "")).strip().lower()
     value = str(request.query.get("value", "")).strip()
     if entity_type not in {"user", "ip", "asn"} or not value:
       return web.json_response({"error": "invalid_query"}, status=400)
+
+    cache_ttl = self._get_minecraft_analytics_int("entity_intel_cache_ttl_seconds", 20, minimum=0, maximum=300)
+    cache_key = f"minecraft.entity_intel:{entity_type}:{value.lower()}"
+    cached = self._minecraft_cache_get(cache_key, cache_ttl)
+    if cached is not None:
+      return web.json_response(cached)
 
     local_events = []
     query = ""
@@ -2684,7 +3054,7 @@ class DashboardAPI:
       query = """
         SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
         FROM connection_events
-        WHERE connection_type = 'minecraft' AND player_name = ?
+        WHERE connection_type = 'minecraft' AND LOWER(COALESCE(player_name, '')) = LOWER(?)
         ORDER BY id DESC
         LIMIT 200
       """
@@ -2736,25 +3106,37 @@ class DashboardAPI:
         except Exception:
           pass
 
+    watch_names = await self._db.get_minecraft_watchlist_names()
     unique_ips = sorted({str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()})
     unique_users = sorted({str(e.get("player_name") or "").strip() for e in local_events if str(e.get("player_name") or "").strip()})
     risk_peak = max([int(e.get("risk_score") or 0) for e in local_events], default=0)
 
-    return web.json_response(
-      self._to_jsonable(
-        {
-          "type": entity_type,
-          "value": value,
-          "count": len(local_events),
-          "risk_peak": risk_peak,
-          "unique_ips": unique_ips,
-          "unique_users": unique_users,
-          "events": local_events,
-          "mysql": mysql_payload,
-          "mysql_backfilled": mysql_backfilled,
-        }
-      )
+    for event in local_events:
+      event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
+
+    if self._is_minecraft_email_masking_enabled():
+      if isinstance(mysql_payload, dict) and mysql_payload.get("email"):
+        mysql_payload["email"] = self._mask_email(mysql_payload.get("email"))
+
+    watchlisted_users = [name for name in unique_users if name.strip().lower() in watch_names]
+
+    response_payload = self._to_jsonable(
+      {
+        "type": entity_type,
+        "value": value,
+        "count": len(local_events),
+        "risk_peak": risk_peak,
+        "unique_ips": unique_ips,
+        "unique_users": unique_users,
+        "watchlisted_users": watchlisted_users,
+        "events": local_events,
+        "mysql": mysql_payload,
+        "mysql_backfilled": mysql_backfilled,
+      }
     )
+    if isinstance(response_payload, dict):
+      self._minecraft_cache_set(cache_key, response_payload)
+    return web.json_response(response_payload)
 
   async def _fetch_mysql_player_by_username(self, username: str) -> Optional[dict]:
     conf = self._config.get("plugins.minecraft.player_db", {})
@@ -2887,8 +3269,12 @@ body{margin:0;font-family:"Aptos","Segoe UI",sans-serif;color:var(--txt);backgro
 .k{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 .v{font-size:1.5rem;font-weight:700;margin-top:6px}
 .panel{margin-top:14px;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
-.controls{display:grid;grid-template-columns:1.1fr 1fr 1fr auto;gap:10px;margin-bottom:12px}
+.controls{display:grid;grid-template-columns:1.1fr 1fr 1fr 170px auto;gap:10px;margin-bottom:12px}
 .intel-controls{display:grid;grid-template-columns:200px 1fr auto;gap:10px;margin-top:10px}
+.top-controls{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:center}
+.status{display:none;margin-top:10px;padding:10px 12px;border-radius:10px;border:1px solid #33506d;background:#102238;color:#cae6ff;font-size:.84rem}
+.status.err{display:block;border-color:#6f2f3f;background:#331823;color:#ffd5dc}
+.status.ok{display:block;border-color:#2d5a46;background:#123126;color:#b9f6d8}
 input,select,button{border-radius:10px;border:1px solid #2f4861;background:#0c1a2a;color:#ecf3fb;padding:10px}
 button{background:linear-gradient(135deg,#2ec3d9,#2f80ed);border:0;font-weight:700;cursor:pointer}
 button.ghost{background:#111a2a;border:1px solid #344968}
@@ -2896,6 +3282,7 @@ table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:10px;border-bottom:1px solid #23394f;font-size:.9rem}
 th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 .chip{display:inline-flex;padding:2px 8px;border-radius:999px;border:1px solid #35506e;color:#cde3ff;background:#12263d;font-size:.72rem}
+.chip.warn{border-color:#6f5b2c;background:#2e2512;color:#ffd98a}
 .link-btn{border:0;background:transparent;color:#8ed3ff;text-decoration:underline;cursor:pointer;padding:0}
 .modal{position:fixed;inset:0;background:#04070db8;display:none;align-items:center;justify-content:center;padding:16px}
 .modal.open{display:flex}
@@ -2914,12 +3301,26 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
         <h1>Minecraft Intelligence</h1>
         <div class="sub">Deep investigation panel for player/IP/ASN behavior and burst analytics.</div>
         <div class="badge" id="modeBadge" style="margin-top:10px">Loading mode...</div>
+        <div class="top-controls">
+          <select id="summaryHours" title="Summary window">
+            <option value="1">Summary: Last 1h</option>
+            <option value="6">Summary: Last 6h</option>
+            <option value="24" selected>Summary: Last 24h</option>
+            <option value="72">Summary: Last 72h</option>
+            <option value="168">Summary: Last 7d</option>
+          </select>
+          <label class="sub" style="display:flex;align-items:center;gap:8px;border:1px solid #2f4861;border-radius:10px;padding:8px 10px;background:#0f1b2b">
+            <input type="checkbox" id="autoRefresh" checked style="width:16px;height:16px"> Auto refresh (10s)
+          </label>
+          <span class="sub" id="lastRefresh">Last refresh: -</span>
+        </div>
       </div>
       <div class="linkbar">
         <a href="/admin">Main Admin</a>
         <a href="/dashboard">Public Dashboard</a>
       </div>
     </div>
+    <div id="pageStatus" class="status"></div>
 
     <div class="grid" id="summaryCards">
       <div class="card"><div class="k">Events (24h)</div><div class="v" id="sumEvents">0</div></div>
@@ -2941,7 +3342,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
     <div class="panel">
       <h2 style="margin:0 0 10px 0;font-size:1rem">Advanced Event Query</h2>
       <div class="controls">
-        <input id="fUser" placeholder="Username (exact)">
+        <input id="fUser" placeholder="Username (case-insensitive exact)">
         <input id="fIp" placeholder="IP (exact)">
         <select id="fType">
           <option value="">All event types</option>
@@ -2951,6 +3352,14 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <option value="ip_disconnect">ip_disconnect</option>
           <option value="failed_packet">failed_packet</option>
           <option value="mysql_backfill">mysql_backfill</option>
+        </select>
+        <select id="fHours">
+          <option value="1">Last 1h</option>
+          <option value="6">Last 6h</option>
+          <option value="24" selected>Last 24h</option>
+          <option value="72">Last 72h</option>
+          <option value="168">Last 7d</option>
+          <option value="0">All time</option>
         </select>
         <button id="btnFilter">Apply</button>
       </div>
@@ -2967,6 +3376,30 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
         <tbody id="burstRows"></tbody>
       </table>
     </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Duplicate Email Signals</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Player</th><th>Email</th><th>Duplicates</th><th>IP</th></tr></thead>
+        <tbody id="duplicateRows"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Minecraft Watchlist</h2>
+      <table>
+        <thead><tr><th>Player</th><th>Reason</th><th>Added By</th><th>Updated</th><th>Action</th></tr></thead>
+        <tbody id="watchRows"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Parser Health</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Enabled</th><th>Log Read</th><th>Last Event</th><th>Events (1h)</th></tr></thead>
+        <tbody id="healthRows"></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="modal" id="intelModal">
@@ -2976,7 +3409,13 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <h3 id="intelTitle" style="margin:0">Entity Intel</h3>
           <div class="sub" id="intelMeta">Loading...</div>
         </div>
-        <button class="ghost" id="intelCloseBtn">Close</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+          <button class="ghost" id="intelWatchAddBtn">Watch +</button>
+          <button class="ghost" id="intelWatchRemoveBtn">Watch -</button>
+          <button class="ghost" id="intelWhitelistBtn">Whitelist Player</button>
+          <button class="ghost" id="intelBanPlayerBtn">Ban Player</button>
+          <button class="ghost" id="intelCloseBtn">Close</button>
+        </div>
       </div>
       <div class="mini" id="intelStats"></div>
       <div class="panel" style="margin-top:12px">
@@ -2990,12 +3429,38 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
   </div>
 
 <script>
-async function api(path){
-  const res = await fetch(path, {credentials:'same-origin'});
-  if(!res.ok){ throw new Error('HTTP '+res.status); }
-  return await res.json();
+async function api(path, options){
+  const base = {credentials:'same-origin'};
+  const req = Object.assign({}, base, options || {});
+  const res = await fetch(path, req);
+  let payload = {};
+  try { payload = await res.json(); } catch(_) { payload = {}; }
+  if(!res.ok){
+    const detail = payload && (payload.error || payload.message);
+    throw new Error(detail ? String(detail) : ('HTTP '+res.status));
+  }
+  return payload;
 }
 function esc(v){ return String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
+function setStatus(text, isError){
+  const el = document.getElementById('pageStatus');
+  el.className = 'status ' + (isError ? 'err' : 'ok');
+  el.textContent = text;
+}
+function clearStatus(){
+  const el = document.getElementById('pageStatus');
+  el.className = 'status';
+  el.textContent = '';
+}
+function markRefreshTime(){
+  document.getElementById('lastRefresh').textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+}
+function selectedIntel(){
+  return {
+    type: document.getElementById('intelType').value,
+    value: document.getElementById('intelValue').value.trim(),
+  };
+}
 
 function openIntelModal(){ document.getElementById('intelModal').classList.add('open'); }
 function closeIntelModal(){ document.getElementById('intelModal').classList.remove('open'); }
@@ -3006,7 +3471,8 @@ function eventType(details){
 }
 
 async function loadSummary(){
-  const s = await api('/api/minecraft/summary?hours=24');
+  const hours = encodeURIComponent(document.getElementById('summaryHours').value || '24');
+  const s = await api('/api/minecraft/summary?hours=' + hours);
   document.getElementById('sumEvents').textContent = String(s.event_count || 0);
   document.getElementById('sumIps').textContent = String(s.unique_ips || 0);
   document.getElementById('sumPlayers').textContent = String(s.unique_players || 0);
@@ -3021,14 +3487,16 @@ async function loadEvents(){
   const user = encodeURIComponent(document.getElementById('fUser').value.trim());
   const ip = encodeURIComponent(document.getElementById('fIp').value.trim());
   const type = encodeURIComponent(document.getElementById('fType').value);
-  const q = '/api/minecraft/events?limit=150&username='+user+'&ip='+ip+'&event_type='+type;
+  const hours = encodeURIComponent(document.getElementById('fHours').value || '24');
+  const q = '/api/minecraft/events?limit=150&hours_back='+hours+'&username='+user+'&ip='+ip+'&event_type='+type;
   const data = await api(q);
   const rows = (data.events || []).map(e => {
     const asnLabel = e.asn_number ? ('AS'+String(e.asn_number)) : '-';
+    const watch = e.is_watchlisted_player ? ' <span class="chip warn">WATCH</span>' : '';
     return '<tr>'+
       '<td>'+esc(e.timestamp)+'</td>'+
       '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(e.source_ip)+'">'+esc(e.source_ip)+'</button></td>'+
-      '<td>'+(e.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'):'-')+'</td>'+
+      '<td>'+(e.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'+watch):'-')+'</td>'+
       '<td><span class="chip">'+esc(e.event_type || eventType(e.details) || '-')+'</span></td>'+
       '<td>'+esc(e.risk_score || 0)+'</td>'+
       '<td>'+(e.asn_number?('<button class="link-btn" data-intel-type="asn" data-intel-value="AS'+esc(String(e.asn_number))+'">'+esc(asnLabel)+'</button>'):'-')+'</td>'+
@@ -3039,7 +3507,8 @@ async function loadEvents(){
 }
 
 async function loadBursts(){
-  const data = await api('/api/minecraft/bursts?limit=80');
+  const hours = encodeURIComponent(document.getElementById('fHours').value || '24');
+  const data = await api('/api/minecraft/bursts?limit=80&hours_back='+hours);
   const rows = (data.alerts || []).map(a =>
     '<tr>'+
       '<td>'+esc(a.timestamp)+'</td>'+
@@ -3052,61 +3521,225 @@ async function loadBursts(){
   document.getElementById('burstRows').innerHTML = rows || '<tr><td colspan="5">No burst alerts</td></tr>';
 }
 
+async function loadDuplicateEmails(){
+  const hours = encodeURIComponent(document.getElementById('fHours').value || '24');
+  const data = await api('/api/minecraft/duplicates/email?limit=80&hours_back=' + hours);
+  const rows = (data.findings || []).map(f =>
+    '<tr>'+
+      '<td>'+esc(f.timestamp)+'</td>'+
+      '<td>'+(f.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(f.player_name)+'">'+esc(f.player_name)+'</button>'):'-')+'</td>'+
+      '<td>'+esc(f.email || '-')+'</td>'+
+      '<td>'+esc(f.duplicate_email_count || 0)+'</td>'+
+      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(f.source_ip)+'">'+esc(f.source_ip)+'</button></td>'+
+    '</tr>'
+  ).join('');
+  document.getElementById('duplicateRows').innerHTML = rows || '<tr><td colspan="5">No duplicate-email signals</td></tr>';
+}
+
+async function loadWatchlist(){
+  const data = await api('/api/admin/minecraft/watchlist?limit=200');
+  const rows = (data.entries || []).map(w =>
+    '<tr>'+
+      '<td><button class="link-btn" data-intel-type="user" data-intel-value="'+esc(w.player_name)+'">'+esc(w.player_name)+'</button></td>'+
+      '<td>'+esc(w.reason || '-')+'</td>'+
+      '<td>'+esc(w.actor_username || '-')+'</td>'+
+      '<td>'+esc(w.updated_at || w.created_at || '-')+'</td>'+
+      '<td><button class="ghost" data-watch-remove="'+esc(w.player_name)+'">Remove</button></td>'+
+    '</tr>'
+  ).join('');
+  document.getElementById('watchRows').innerHTML = rows || '<tr><td colspan="5">Watchlist is empty</td></tr>';
+}
+
+function yesNoBadge(ok){
+  return ok ? '<span class="chip">yes</span>' : '<span class="chip warn">no</span>';
+}
+
+async function loadParserHealth(){
+  const data = await api('/api/admin/minecraft/parser-health');
+  const rows = [
+    {label:'Velocity', item:data.velocity || {}},
+    {label:'Minecraft', item:data.minecraft || {}},
+  ].map(entry => {
+    const i = entry.item || {};
+    const readOk = !!i.path_exists && !!i.readable;
+    return '<tr>'+
+      '<td>'+esc(entry.label)+'</td>'+
+      '<td>'+yesNoBadge(!!i.enabled)+'</td>'+
+      '<td>'+yesNoBadge(readOk)+'</td>'+
+      '<td>'+esc(i.last_event || '-')+'</td>'+
+      '<td>'+esc(i.events_last_hour || 0)+'</td>'+
+    '</tr>';
+  }).join('');
+  document.getElementById('healthRows').innerHTML = rows || '<tr><td colspan="5">No health data</td></tr>';
+}
+
+async function addWatchlist(playerName){
+  const value = String(playerName || '').trim();
+  if(!value){ setStatus('Watchlist add failed: player name is empty.', true); return; }
+  await api('/api/admin/minecraft/watchlist/add', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({player_name: value, reason: 'Manual watchlist from Minecraft admin'})
+  });
+  setStatus('Watchlist updated: '+value+' added.', false);
+  await refreshAll();
+}
+
+async function removeWatchlist(playerName){
+  const value = String(playerName || '').trim();
+  if(!value){ setStatus('Watchlist remove failed: player name is empty.', true); return; }
+  await api('/api/admin/minecraft/watchlist/remove', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({player_name: value})
+  });
+  setStatus('Watchlist updated: '+value+' removed.', false);
+  await refreshAll();
+}
+
+async function banPlayer(playerName){
+  const value = String(playerName || '').trim();
+  if(!value){ setStatus('Ban failed: player name is empty.', true); return; }
+  const reason = window.prompt('Ban reason for '+value+':', 'Suspicious activity from minecraft dashboard');
+  if(!reason){ return; }
+  await api('/api/admin/minecraft/ban-player', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({player_name: value, reason: reason, duration: 0})
+  });
+  setStatus('Ban action sent for player: '+value, false);
+  await refreshAll();
+}
+
+async function whitelistPlayer(playerName){
+  const value = String(playerName || '').trim();
+  if(!value){ setStatus('Whitelist failed: player name is empty.', true); return; }
+  await api('/api/admin/minecraft/whitelist-player', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({player_name: value})
+  });
+  setStatus('Whitelist updated for player: '+value, false);
+  await refreshAll();
+}
+
 async function searchIntel(type, value){
   if(!value){ return; }
-  openIntelModal();
-  document.getElementById('intelTitle').textContent = 'Entity Intel: '+value;
-  document.getElementById('intelMeta').textContent = 'Loading...';
-  document.getElementById('intelStats').innerHTML = '';
-  document.getElementById('intelRows').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
+  try {
+    openIntelModal();
+    document.getElementById('intelTitle').textContent = 'Entity Intel: '+value;
+    document.getElementById('intelMeta').textContent = 'Loading...';
+    document.getElementById('intelStats').innerHTML = '';
+    document.getElementById('intelRows').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
 
-  const payload = await api('/api/minecraft/entity-intel?type='+encodeURIComponent(type)+'&value='+encodeURIComponent(value));
-  const mysqlInfo = payload.mysql || {};
-  const metaBits = ['Type: '+payload.type, 'Events: '+(payload.count||0), 'Peak Risk: '+(payload.risk_peak||0)];
-  if(payload.mysql_backfilled){ metaBits.push('MySQL backfill: yes'); }
-  if(mysqlInfo && mysqlInfo.reason){ metaBits.push('MySQL: '+mysqlInfo.reason); }
-  document.getElementById('intelMeta').textContent = metaBits.join(' · ');
+    const payload = await api('/api/minecraft/entity-intel?type='+encodeURIComponent(type)+'&value='+encodeURIComponent(value));
+    const mysqlInfo = payload.mysql || {};
+    const metaBits = ['Type: '+payload.type, 'Events: '+(payload.count||0), 'Peak Risk: '+(payload.risk_peak||0)];
+    if(payload.mysql_backfilled){ metaBits.push('MySQL backfill: yes'); }
+    if(mysqlInfo && mysqlInfo.reason){ metaBits.push('MySQL: '+mysqlInfo.reason); }
+    if((payload.watchlisted_users || []).length){ metaBits.push('Watchlisted: '+payload.watchlisted_users.join(', ')); }
+    document.getElementById('intelMeta').textContent = metaBits.join(' · ');
 
-  const uniqueIps = (payload.unique_ips || []).slice(0,5).join(', ') || '-';
-  const uniqueUsers = (payload.unique_users || []).slice(0,5).join(', ') || '-';
-  document.getElementById('intelStats').innerHTML = ''
-    +'<div class="item"><div class="k">Entity</div><div class="v" style="font-size:1rem">'+esc(payload.value||'')+'</div></div>'
-    +'<div class="item"><div class="k">Event Count</div><div class="v" style="font-size:1rem">'+esc(payload.count||0)+'</div></div>'
-    +'<div class="item"><div class="k">Unique IPs</div><div class="v" style="font-size:.88rem">'+esc(uniqueIps)+'</div></div>'
-    +'<div class="item"><div class="k">Unique Users</div><div class="v" style="font-size:.88rem">'+esc(uniqueUsers)+'</div></div>';
+    const uniqueIps = (payload.unique_ips || []).slice(0,5).join(', ') || '-';
+    const uniqueUsers = (payload.unique_users || []).slice(0,5).join(', ') || '-';
+    document.getElementById('intelStats').innerHTML = ''
+      +'<div class="item"><div class="k">Entity</div><div class="v" style="font-size:1rem">'+esc(payload.value||'')+'</div></div>'
+      +'<div class="item"><div class="k">Event Count</div><div class="v" style="font-size:1rem">'+esc(payload.count||0)+'</div></div>'
+      +'<div class="item"><div class="k">Unique IPs</div><div class="v" style="font-size:.88rem">'+esc(uniqueIps)+'</div></div>'
+      +'<div class="item"><div class="k">Unique Users</div><div class="v" style="font-size:.88rem">'+esc(uniqueUsers)+'</div></div>';
 
-  const rows = (payload.events || []).map(e => {
-    const t = eventType(e.details) || '-';
-    return '<tr>'
-      +'<td>'+esc(e.timestamp)+'</td>'
-      +'<td>'+esc(e.source_ip||'-')+'</td>'
-      +'<td>'+esc(e.player_name||'-')+'</td>'
-      +'<td>'+esc(t)+'</td>'
-      +'<td>'+esc(e.risk_score||0)+'</td>'
-      +'<td>'+esc(e.asn_org || (e.asn_number ? ('AS'+String(e.asn_number)) : '-'))+'</td>'
-      +'</tr>';
-  }).join('');
-  document.getElementById('intelRows').innerHTML = rows || '<tr><td colspan="6">No timeline data</td></tr>';
+    const rows = (payload.events || []).map(e => {
+      const t = eventType(e.details) || '-';
+      return '<tr>'
+        +'<td>'+esc(e.timestamp)+'</td>'
+        +'<td>'+esc(e.source_ip||'-')+'</td>'
+        +'<td>'+esc(e.player_name||'-')+'</td>'
+        +'<td>'+esc(t)+'</td>'
+        +'<td>'+esc(e.risk_score||0)+'</td>'
+        +'<td>'+esc(e.asn_org || (e.asn_number ? ('AS'+String(e.asn_number)) : '-'))+'</td>'
+        +'</tr>';
+    }).join('');
+    document.getElementById('intelRows').innerHTML = rows || '<tr><td colspan="6">No timeline data</td></tr>';
+  } catch (err) {
+    setStatus('Entity intel request failed: ' + String(err && err.message ? err.message : err), true);
+  }
+}
+
+let refreshTimer = null;
+async function refreshAll(){
+  try {
+    await Promise.all([loadSummary(), loadEvents(), loadBursts(), loadDuplicateEmails(), loadWatchlist(), loadParserHealth()]);
+    markRefreshTime();
+    clearStatus();
+  } catch (err) {
+    console.error(err);
+    setStatus('Minecraft analytics refresh failed: ' + String(err && err.message ? err.message : err), true);
+    document.getElementById('modeBadge').textContent = 'Failed to load Minecraft analytics';
+  }
+}
+
+function setupAutoRefresh(){
+  if(refreshTimer){
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if(!document.getElementById('autoRefresh').checked){
+    return;
+  }
+  refreshTimer = setInterval(refreshAll, 10000);
 }
 
 document.getElementById('btnFilter').addEventListener('click', loadEvents);
+document.getElementById('summaryHours').addEventListener('change', refreshAll);
+document.getElementById('fHours').addEventListener('change', refreshAll);
+document.getElementById('autoRefresh').addEventListener('change', setupAutoRefresh);
 document.getElementById('intelSearchBtn').addEventListener('click', function(){
   searchIntel(document.getElementById('intelType').value, document.getElementById('intelValue').value.trim());
+});
+document.getElementById('intelWatchAddBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'user'){ setStatus('Watchlist action requires user type.', true); return; }
+  try { await addWatchlist(current.value); } catch(err){ setStatus('Watchlist add failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelWatchRemoveBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'user'){ setStatus('Watchlist action requires user type.', true); return; }
+  try { await removeWatchlist(current.value); } catch(err){ setStatus('Watchlist remove failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelBanPlayerBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'user'){ setStatus('Ban action requires user type.', true); return; }
+  try { await banPlayer(current.value); } catch(err){ setStatus('Ban action failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelWhitelistBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'user'){ setStatus('Whitelist action requires user type.', true); return; }
+  try { await whitelistPlayer(current.value); } catch(err){ setStatus('Whitelist action failed: ' + String(err && err.message ? err.message : err), true); }
 });
 document.getElementById('intelCloseBtn').addEventListener('click', closeIntelModal);
 document.getElementById('intelModal').addEventListener('click', function(ev){ if(ev.target===this){ closeIntelModal(); } });
 document.body.addEventListener('click', function(ev){
+  const removeBtn = ev.target.closest('[data-watch-remove]');
+  if(removeBtn){
+    const player = removeBtn.getAttribute('data-watch-remove');
+    if(player){
+      removeWatchlist(player).catch(err => setStatus('Watchlist remove failed: ' + String(err && err.message ? err.message : err), true));
+    }
+    return;
+  }
   const btn = ev.target.closest('[data-intel-type]');
   if(!btn){ return; }
   const type = btn.getAttribute('data-intel-type');
   const value = btn.getAttribute('data-intel-value');
-  if(type && value){ searchIntel(type, value); }
+  if(type && value){
+    document.getElementById('intelType').value = type;
+    document.getElementById('intelValue').value = value;
+    searchIntel(type, value);
+  }
 });
 
-Promise.all([loadSummary(), loadEvents(), loadBursts()]).catch(err => {
-  console.error(err);
-  document.getElementById('modeBadge').textContent = 'Failed to load Minecraft analytics';
-});
+refreshAll();
+setupAutoRefresh();
 </script>
 </body>
 </html>
