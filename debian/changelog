@@ -1,3 +1,11 @@
+wardenips (0.4.0~beta11-1) stable; urgency=medium
+
+  * Hotfix: Fix VelocityPlugin initialization order to avoid AttributeError on startup
+  * Ensure multi-Velocity plugin labels are available before BasePlugin logger initialization
+  * Bump version to 0.4.0-beta-11
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 17:38:38 +03:00
+
 wardenips (0.4.0~beta10-1) stable; urgency=medium
 
   * Add multi-Velocity parser support via plugins.minecraft.velocity.extra_log_paths

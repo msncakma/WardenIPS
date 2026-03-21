@@ -33,11 +33,11 @@ _RE_TIME = re.compile(r"\[(\d{2}:\d{2}:\d{2})\]")
 
 class VelocityPlugin(BasePlugin):
     def __init__(self, config, log_path_override: str = "", instance_label: str = "") -> None:
+        self._log_path_override = str(log_path_override or "").strip()
+        self._instance_label = str(instance_label or "").strip()
         super().__init__(config)
         velocity_conf = config.get_section("plugins").get("minecraft", {}).get("velocity", {})
         self._enabled = bool(velocity_conf.get("enabled", False))
-        self._log_path_override = str(log_path_override or "").strip()
-        self._instance_label = str(instance_label or "").strip()
 
     @property
     def name(self) -> str:
