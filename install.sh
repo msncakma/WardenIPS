@@ -778,9 +778,10 @@ PY
 install_service() {
     log "Installing systemd service..."
     cp "$INSTALL_DIR/wardenips.service" "$SERVICE_FILE"
-    python3 - "$SERVICE_FILE" "$INSTALL_DIR" "$SERVICE_USER" "$SERVICE_GROUP" "$HAS_ADM_GROUP" <<'PY'
+    "$INSTALL_DIR/venv/bin/python" - "$SERVICE_FILE" "$INSTALL_DIR" "$SERVICE_USER" "$SERVICE_GROUP" "$HAS_ADM_GROUP" "$INSTALL_DIR/config.yaml" <<'PY'
 from pathlib import Path
 import sys
+import yaml
 
 
 service_path = Path(sys.argv[1])
@@ -788,6 +789,40 @@ install_dir = sys.argv[2]
 service_user = sys.argv[3]
 service_group = sys.argv[4]
 has_adm_group = sys.argv[5] == "1"
+config_path = Path(sys.argv[6])
+
+protect_home = "yes"
+extra_readonly_paths: list[str] = []
+
+try:
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if isinstance(data, dict):
+        service_cfg = data.get("service", {})
+        if isinstance(service_cfg, dict):
+            systemd_cfg = service_cfg.get("systemd", {})
+            if isinstance(systemd_cfg, dict):
+                candidate = str(systemd_cfg.get("protect_home", "yes")).strip().lower()
+                if candidate in {"yes", "true", "1"}:
+                    protect_home = "yes"
+                elif candidate in {"read-only", "readonly", "read_only"}:
+                    protect_home = "read-only"
+                elif candidate in {"no", "false", "0"}:
+                    protect_home = "no"
+
+                raw_paths = systemd_cfg.get("extra_readonly_paths", [])
+                if isinstance(raw_paths, list):
+                    for item in raw_paths:
+                        p = str(item or "").strip()
+                        if p.startswith("/"):
+                            extra_readonly_paths.append(p)
+except Exception:
+    pass
+
+extra_readonly_paths = sorted(set(extra_readonly_paths))
+extra_readonly_line = ""
+if extra_readonly_paths:
+    extra_readonly_line = "ReadOnlyPaths=" + " ".join(extra_readonly_paths)
+
 text = service_path.read_text(encoding="utf-8")
 text = text.replace("__SERVICE_USER__", service_user)
 text = text.replace("__SERVICE_GROUP__", service_group)
@@ -796,6 +831,8 @@ text = text.replace(
     "__SUPPLEMENTARY_GROUPS__",
     "SupplementaryGroups=adm" if has_adm_group else "",
 )
+text = text.replace("__PROTECT_HOME__", protect_home)
+text = text.replace("__EXTRA_READ_ONLY_PATHS__", extra_readonly_line)
 service_path.write_text(text, encoding="utf-8")
 PY
     systemctl daemon-reload

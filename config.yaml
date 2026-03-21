@@ -90,6 +90,11 @@ dashboard:
     token_hash: ""
     token_expires_at: ""
 
+service:
+  systemd:
+    protect_home: "yes"         # yes (default hardening), read-only (allow reading /home), or no
+    extra_readonly_paths: []      # Optional absolute paths readable by the service, e.g. /home/mc/velocity/logs
+
 blocklist:
   enabled: true
   # Your local timezone (e.g. "Europe/Istanbul", "America/New_York")

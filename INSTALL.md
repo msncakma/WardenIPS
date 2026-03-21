@@ -1,6 +1,6 @@
 # WardenIPS — Installation & Configuration Guide
 
-**Version: 0.4.0-beta-3**
+**Version: 0.4.0-beta-4**
 
 Complete guide for deploying WardenIPS on a Linux server.
 
@@ -270,6 +270,18 @@ sudo systemctl status wardenips
 sudo journalctl -u wardenips -f
 ```
 
+If your Velocity/Minecraft logs are under `/home/...`, configure systemd hardening overrides in `config.yaml`:
+
+```yaml
+service:
+  systemd:
+    protect_home: "read-only"   # yes | read-only | no
+    extra_readonly_paths:
+      - "/home/mc/velocity/logs"
+```
+
+Apply changes by re-running installer (update mode) and restarting service.
+
 ### Docker
 
 ```bash
@@ -331,3 +343,4 @@ sudo sh uninstall.sh --purge  # Remove everything
 | Log file not found | Verify `log_path` values in the plugins section |
 | Dashboard shows HTTPS error | Dashboard is plain HTTP by default. Use `http://`, not `https://` |
 | Blocklist not loading | Check network connectivity and that `blocklist.enabled` is `true` |
+| Log path under `/home` unreadable | Set `service.systemd.protect_home: "read-only"` and add `service.systemd.extra_readonly_paths` |
