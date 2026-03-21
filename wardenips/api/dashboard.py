@@ -4024,7 +4024,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <tbody id="intelRows"></tbody>
         </table>
       </div>
-      <div class="panel" style="margin-top:12px">
+      <div class="panel" id="intelAccountPanel" style="margin-top:12px">
         <h4 style="margin:0 0 8px 0">Account Intel</h4>
         <table>
           <tbody id="intelAccountRows"></tbody>
@@ -4370,6 +4370,19 @@ function syncIntelActionButtons(type){
   document.getElementById('intelBanAsnBtn').style.display = isAsn ? '' : 'none';
 }
 
+function syncIntelAccountPanel(type){
+  const normalized = String(type || '').toLowerCase();
+  const isUser = normalized === 'user';
+  const panel = document.getElementById('intelAccountPanel');
+  if(panel){
+    panel.style.display = isUser ? '' : 'none';
+  }
+  if(!isUser){
+    const body = document.getElementById('intelAccountRows');
+    if(body){ body.innerHTML = ''; }
+  }
+}
+
 function renderRelatedPivotList(type, values){
   const list = Array.isArray(values) ? values : [];
   if(!list.length){ return '<span class="sub">-</span>'; }
@@ -4396,6 +4409,7 @@ async function searchIntel(type, value){
   if(!value){ return; }
   try {
     openIntelModal();
+    syncIntelAccountPanel(type);
     document.getElementById('intelTitle').textContent = 'Entity Intel: '+value;
     document.getElementById('intelMeta').textContent = 'Loading...';
     document.getElementById('intelStats').innerHTML = '';
@@ -4403,6 +4417,7 @@ async function searchIntel(type, value){
 
     const payload = await api('/api/minecraft/entity-intel?type='+encodeURIComponent(type)+'&value='+encodeURIComponent(value));
     syncIntelActionButtons(payload.type || type);
+    syncIntelAccountPanel(payload.type || type);
     const mysqlInfo = payload.mysql || {};
     const metaBits = ['Type: '+payload.type, 'Events: '+(payload.count||0), 'Peak Risk: '+(payload.risk_peak||0)];
     if(payload.mysql_backfilled){ metaBits.push('MySQL backfill: yes'); }
@@ -4432,23 +4447,26 @@ async function searchIntel(type, value){
     }).join('');
     document.getElementById('intelRows').innerHTML = rows || '<tr><td colspan="6">No timeline data</td></tr>';
 
+    const normalizedType = String(payload.type || type || '').toLowerCase();
     const accountRows = [];
     const addAccountRow = function(label, val){
       const value = (val === undefined || val === null || String(val).trim() === '') ? '-' : String(val);
       accountRows.push('<tr><th style="width:220px">'+esc(label)+'</th><td class="copyable">'+esc(value)+'</td></tr>');
     };
     const mysqlMatches = Array.isArray(payload.mysql_matches) ? payload.mysql_matches : [];
-    addAccountRow('Email', mysqlInfo.email || '-');
-    addAccountRow('UUID', mysqlInfo.uuid || '-');
-    addAccountRow('First Registration', mysqlInfo.creation_date || '-');
-    addAccountRow('Last Login', mysqlInfo.last_login || '-');
-    addAccountRow('Last Known IP', mysqlInfo.ip || '-');
-    addAccountRow('Registration IP', mysqlInfo.reg_ip || '-');
-    addAccountRow('Creation IP', mysqlInfo.creation_ip || '-');
-    addAccountRow('Verified', (mysqlInfo.is_verified === undefined || mysqlInfo.is_verified === null) ? '-' : String(mysqlInfo.is_verified));
-    addAccountRow('Duplicate Email Count', mysqlInfo.duplicate_email_count || '-');
-    addAccountRow('DB Accounts on Email', mysqlMatches.length || '-');
-    document.getElementById('intelAccountRows').innerHTML = accountRows.join('');
+    if(normalizedType === 'user'){
+      addAccountRow('Email', mysqlInfo.email || '-');
+      addAccountRow('UUID', mysqlInfo.uuid || '-');
+      addAccountRow('First Registration', mysqlInfo.creation_date || '-');
+      addAccountRow('Last Login', mysqlInfo.last_login || '-');
+      addAccountRow('Last Known IP', mysqlInfo.ip || '-');
+      addAccountRow('Registration IP', mysqlInfo.reg_ip || '-');
+      addAccountRow('Creation IP', mysqlInfo.creation_ip || '-');
+      addAccountRow('Verified', (mysqlInfo.is_verified === undefined || mysqlInfo.is_verified === null) ? '-' : String(mysqlInfo.is_verified));
+      addAccountRow('Duplicate Email Count', mysqlInfo.duplicate_email_count || '-');
+      addAccountRow('DB Accounts on Email', mysqlMatches.length || '-');
+      document.getElementById('intelAccountRows').innerHTML = accountRows.join('');
+    }
 
     const related = payload.related || {};
     const relatedRows = [];

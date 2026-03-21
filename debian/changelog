@@ -1,3 +1,12 @@
+wardenips (0.4.0~beta16-1) stable; urgency=medium
+
+  * Hide Account Intel panel for IP, ASN and Email entity-intel scopes
+  * Keep Account Intel visible only for User entity-intel scope
+  * Clear stale account rows when switching to non-user intel views
+  * Bump version to 0.4.0-beta-16
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 18:44:00 +03:00
+
 wardenips (0.4.0~beta15-1) stable; urgency=medium
 
   * Expand Minecraft entity-intel with ASN relation aggregation for IP/email pivots
