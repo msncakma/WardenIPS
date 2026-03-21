@@ -3954,6 +3954,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
       <div class="linkbar">
         <a href="/dashboard">Open Public Dashboard</a>
         <a href="/admin">Admin Route</a>
+        <a href="/admin/minecraft">Minecraft Intelligence</a>
         <a href="https://github.com/msncakma/WardenIPS" target="_blank" rel="noopener">Repository</a>
         <a href="https://github.com/msncakma/WardenIPS/stargazers" target="_blank" rel="noopener">Star on GitHub</a>
         <a href="https://github.com/msncakma/WardenIPS/issues" target="_blank" rel="noopener">Issues</a>
@@ -3968,6 +3969,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
         <option value="5000">Refresh 5s</option>
       </select>
       <button id="openConfigBtn" class="btn ghost">Config</button>
+      <a href="/admin/minecraft" class="btn ghost" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center">Minecraft</a>
       <button id="themeToggle" class="btn theme">Light Mode</button>
       <button id="logoutBtn" class="btn">Log Out</button>
       <button id="refreshNow" class="btn primary">Refresh Now</button>
