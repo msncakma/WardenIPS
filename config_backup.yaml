@@ -132,6 +132,7 @@ plugins:
         ip: "ip"
         creation_ip: "creationIP"
         creation_date: "creationDate"
+        reg_date: "regdate"
         last_login: "lastlogin"
         reg_ip: "regip"
         is_verified: "isVerified"

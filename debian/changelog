@@ -1,3 +1,16 @@
+wardenips (0.4.0~beta18-1) stable; urgency=medium
+
+  * Add Minecraft admin historical log import endpoint for multi-file .log.gz uploads
+  * Add Minecraft panel upload UI for importing archived minecraft/velocity logs
+  * Preserve historical dates by inferring file day from YYYY-MM-DD in uploaded filename
+  * Optimize import performance with parser reuse and chunked batch database writes
+  * Ensure uploaded temporary files are removed after processing
+  * Add optional player_db reg_date column mapping for regdate-compatible schemas
+  * Fix mysql_register_sync backfill timestamps to use registration-era values
+  * Bump version to 0.4.0-beta-18
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 19:21:00 +03:00
+
 wardenips (0.4.0~beta17-1) stable; urgency=medium
 
   * Add Minecraft intel actions: direct ban-ip and ban-email endpoints/actions

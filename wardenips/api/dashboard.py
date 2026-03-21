@@ -33,12 +33,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import gzip
+import hashlib
 import hmac
 import ipaddress
 import json
 import os
 import secrets
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Optional
@@ -66,6 +69,8 @@ from wardenips.core.auth import (
 from wardenips.core.logger import get_logger
 from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.updater import UpdateChecker
+from wardenips.plugins.minecraft_plugin import MinecraftPlugin
+from wardenips.plugins.velocity_plugin import VelocityPlugin
 
 logger = get_logger(__name__)
 
@@ -623,6 +628,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/minecraft/bursts", self._handle_minecraft_bursts)
     self._app.router.add_get("/api/minecraft/duplicates/email", self._handle_minecraft_duplicate_emails)
     self._app.router.add_get("/api/minecraft/entity-intel", self._handle_minecraft_entity_intel)
+    self._app.router.add_post("/api/admin/minecraft/import-logs", self._handle_admin_minecraft_import_logs)
     self._app.router.add_get("/api/admin/minecraft/parser-health", self._handle_admin_minecraft_parser_health)
     self._app.router.add_get("/api/admin/minecraft/watchlist", self._handle_admin_minecraft_watchlist)
     self._app.router.add_post("/api/admin/minecraft/watchlist/add", self._handle_admin_minecraft_watchlist_add)
@@ -3136,6 +3142,236 @@ class DashboardAPI:
         rows = await cursor.fetchall()
         return [str(row[0]).strip() for row in rows if row and str(row[0] or "").strip()]
 
+  @staticmethod
+  def _extract_date_from_uploaded_log_filename(filename: str) -> Optional[date]:
+    text = str(filename or "").strip()
+    if not text:
+      return None
+    base = os.path.basename(text)
+    for idx in range(max(len(base) - 9, 0)):
+      candidate = base[idx : idx + 10]
+      if len(candidate) != 10 or candidate[4] != "-" or candidate[7] != "-":
+        continue
+      try:
+        return datetime.strptime(candidate, "%Y-%m-%d").date()
+      except Exception:
+        continue
+    return None
+
+  @staticmethod
+  def _normalize_imported_log_timestamp(event_ts: datetime, file_day: Optional[date]) -> datetime:
+    if not isinstance(event_ts, datetime):
+      return datetime.utcnow()
+    if file_day is None:
+      return event_ts
+    try:
+      return event_ts.replace(year=file_day.year, month=file_day.month, day=file_day.day)
+    except Exception:
+      return event_ts
+
+  async def _insert_import_rows_chunk(self, row_values: list[tuple[object, ...]]) -> int:
+    if not row_values:
+      return 0
+    async with self._db._lock:
+      await self._db._db.executemany(
+        """
+        INSERT INTO connection_events
+          (timestamp, source_ip, player_name, connection_type, asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        row_values,
+      )
+      await self._db._db.commit()
+    return len(row_values)
+
+  async def _import_minecraft_log_gz_file(self, file_path: str, filename: str, minecraft_parser: MinecraftPlugin, velocity_parser: VelocityPlugin) -> dict:
+    file_day = self._extract_date_from_uploaded_log_filename(filename)
+    parsed = 0
+    imported = 0
+    skipped = 0
+    lines = 0
+    row_values: list[tuple[object, ...]] = []
+    write_chunk_size = 1500
+    in_file_fingerprints: set[str] = set()
+
+    try:
+      with gzip.open(file_path, mode="rt", encoding="utf-8", errors="replace") as gz_file:
+        for line_no, line in enumerate(gz_file, start=1):
+          text = str(line or "").rstrip("\r\n")
+          if not text:
+            continue
+          lines += 1
+
+          event = await minecraft_parser.parse_line(text)
+          if event is None:
+            event = await velocity_parser.parse_line(text)
+          if event is None:
+            skipped += 1
+            continue
+
+          source_ip = str(event.source_ip or "").strip()
+          if not source_ip:
+            skipped += 1
+            continue
+
+          parsed += 1
+          normalized_ts = self._normalize_imported_log_timestamp(event.timestamp, file_day)
+          details = dict(event.details or {})
+          details["import_source"] = "uploaded_log_gz"
+          details["import_filename"] = filename
+          details["import_line"] = line_no
+          details["raw_log_line"] = text[:1024]
+
+          fingerprint = hashlib.sha1(
+            f"{filename}:{line_no}:{text}".encode("utf-8", "ignore")
+          ).hexdigest()
+          details["import_fingerprint"] = fingerprint
+          if fingerprint in in_file_fingerprints:
+            skipped += 1
+            continue
+          in_file_fingerprints.add(fingerprint)
+
+          row_values.append(
+            (
+              normalized_ts.isoformat(),
+              source_ip,
+              event.player_name,
+              "minecraft",
+              event.asn_number,
+              event.asn_org,
+              1 if event.is_suspicious_asn else 0,
+              int(event.risk_score or 0),
+              event.threat_level.name,
+              json.dumps(details, ensure_ascii=False),
+            )
+          )
+
+          if len(row_values) >= write_chunk_size:
+            imported += await self._insert_import_rows_chunk(row_values)
+            row_values = []
+
+      if row_values:
+        imported += await self._insert_import_rows_chunk(row_values)
+
+      return {
+        "filename": filename,
+        "file_day": file_day.isoformat() if file_day else None,
+        "lines": lines,
+        "parsed": parsed,
+        "imported": imported,
+        "skipped": skipped,
+      }
+    except Exception as exc:
+      return {
+        "filename": filename,
+        "file_day": file_day.isoformat() if file_day else None,
+        "lines": lines,
+        "parsed": parsed,
+        "imported": imported,
+        "skipped": skipped,
+        "error": str(exc),
+      }
+
+  async def _handle_admin_minecraft_import_logs(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+
+    try:
+      reader = await request.multipart()
+    except Exception:
+      return web.json_response({"error": "invalid_multipart", "message": "Upload must be multipart/form-data."}, status=400)
+
+    files: list[dict] = []
+    max_files = 20
+    max_file_size = 300 * 1024 * 1024
+    processed_files = 0
+    minecraft_parser = MinecraftPlugin(self._config)
+    velocity_parser = VelocityPlugin(self._config)
+
+    while True:
+      part = await reader.next()
+      if part is None:
+        break
+      filename = str(getattr(part, "filename", "") or "").strip()
+      if not filename:
+        continue
+
+      processed_files += 1
+      if processed_files > max_files:
+        files.append({"filename": filename, "error": f"max_files_exceeded:{max_files}"})
+        continue
+
+      if not filename.lower().endswith(".log.gz"):
+        files.append({"filename": filename, "error": "invalid_extension:only_.log.gz_allowed"})
+        while await part.read_chunk():
+          pass
+        continue
+
+      temp_path = ""
+      total_bytes = 0
+      try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".log.gz") as tmp_file:
+          temp_path = tmp_file.name
+          while True:
+            chunk = await part.read_chunk()
+            if not chunk:
+              break
+            total_bytes += len(chunk)
+            if total_bytes > max_file_size:
+              raise ValueError(f"file_too_large:max_{max_file_size}_bytes")
+            tmp_file.write(chunk)
+
+        result = await self._import_minecraft_log_gz_file(temp_path, filename, minecraft_parser, velocity_parser)
+        result["bytes"] = total_bytes
+        files.append(result)
+      except Exception as exc:
+        files.append({"filename": filename, "bytes": total_bytes, "error": str(exc)})
+      finally:
+        if temp_path:
+          try:
+            os.remove(temp_path)
+          except Exception:
+            pass
+
+    if not files:
+      return web.json_response({"error": "no_files", "message": "No .log.gz files were uploaded."}, status=400)
+
+    total_imported = sum(int(item.get("imported") or 0) for item in files)
+    total_parsed = sum(int(item.get("parsed") or 0) for item in files)
+    total_lines = sum(int(item.get("lines") or 0) for item in files)
+    total_skipped = sum(int(item.get("skipped") or 0) for item in files)
+    file_errors = [item for item in files if item.get("error")]
+
+    await self._log_audit(
+      request,
+      "admin.minecraft.import_logs",
+      actor_username=actor,
+      details={
+        "file_count": len(files),
+        "imported_events": total_imported,
+        "parsed_events": total_parsed,
+        "lines": total_lines,
+        "skipped": total_skipped,
+        "errors": len(file_errors),
+      },
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "file_count": len(files),
+        "lines": total_lines,
+        "parsed_events": total_parsed,
+        "imported_events": total_imported,
+        "skipped": total_skipped,
+        "errors": len(file_errors),
+        "files": files,
+        "message": f"Imported {total_imported} event(s) from {len(files)} file(s).",
+      }
+    )
+
   async def _handle_admin_minecraft_watchlist(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
@@ -3822,6 +4058,7 @@ class DashboardAPI:
     uuid_col = str(columns.get("uuid", "uuid"))
     creation_ip_col = str(columns.get("creation_ip", "creationIP"))
     creation_date_col = str(columns.get("creation_date", "creationDate"))
+    reg_date_col = str(columns.get("reg_date", "")).strip()
     last_login_col = str(columns.get("last_login", "lastlogin"))
     reg_ip_col = str(columns.get("reg_ip", "regip"))
     is_verified_col = str(columns.get("is_verified", "isVerified"))
@@ -3841,10 +4078,12 @@ class DashboardAPI:
       )
       try:
         with conn.cursor() as cur:
+          reg_date_fragment = f", `{reg_date_col}` AS reg_date " if reg_date_col else ""
           sql = (
             f"SELECT `{username_col}` AS username, `{ip_col}` AS ip, `{email_col}` AS email, "
             f"`{uuid_col}` AS uuid, `{creation_ip_col}` AS creation_ip, `{creation_date_col}` AS creation_date, "
-            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified "
+            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified"
+            f"{reg_date_fragment}"
             f"FROM `{table}` WHERE `{username_col}` = %s LIMIT 1"
           )
           cur.execute(sql, (username,))
@@ -3892,6 +4131,7 @@ class DashboardAPI:
     uuid_col = str(columns.get("uuid", "uuid"))
     creation_ip_col = str(columns.get("creation_ip", "creationIP"))
     creation_date_col = str(columns.get("creation_date", "creationDate"))
+    reg_date_col = str(columns.get("reg_date", "")).strip()
     last_login_col = str(columns.get("last_login", "lastlogin"))
     reg_ip_col = str(columns.get("reg_ip", "regip"))
     is_verified_col = str(columns.get("is_verified", "isVerified"))
@@ -3915,10 +4155,12 @@ class DashboardAPI:
       )
       try:
         with conn.cursor() as cur:
+          reg_date_fragment = f", `{reg_date_col}` AS reg_date " if reg_date_col else ""
           sql = (
             f"SELECT `{username_col}` AS username, `{ip_col}` AS ip, `{email_col}` AS email, "
             f"`{uuid_col}` AS uuid, `{creation_ip_col}` AS creation_ip, `{creation_date_col}` AS creation_date, "
-            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified "
+            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified"
+            f"{reg_date_fragment}"
             f"FROM `{table}` WHERE LOWER(COALESCE(`{email_col}`, '')) LIKE %s LIMIT 300"
           )
           cur.execute(sql, (normalized_email,))
@@ -3957,6 +4199,70 @@ class DashboardAPI:
         continue
     return synced
 
+  @staticmethod
+  def _parse_mysql_datetime_value(raw: object) -> Optional[datetime]:
+    if raw is None:
+      return None
+    if isinstance(raw, datetime):
+      if raw.tzinfo is None:
+        return raw.replace(tzinfo=timezone.utc)
+      return raw.astimezone(timezone.utc)
+    if isinstance(raw, (int, float)):
+      value = float(raw)
+      if value <= 0:
+        return None
+      if value >= 1_000_000_000_000:
+        value = value / 1000.0
+      try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+      except Exception:
+        return None
+    text = str(raw).strip()
+    if not text:
+      return None
+    if text.isdigit():
+      try:
+        value = float(text)
+        if value <= 0:
+          return None
+        if value >= 1_000_000_000_000:
+          value = value / 1000.0
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+      except Exception:
+        return None
+    normalized = text.replace(" ", "T")
+    if normalized.endswith("Z"):
+      normalized = normalized[:-1] + "+00:00"
+    try:
+      parsed = datetime.fromisoformat(normalized)
+      if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+      return parsed.astimezone(timezone.utc)
+    except Exception:
+      pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+      try:
+        parsed = datetime.strptime(text, fmt)
+        return parsed.replace(tzinfo=timezone.utc)
+      except Exception:
+        continue
+    return None
+
+  def _resolve_mysql_registration_timestamp(self, payload: dict) -> str:
+    candidates = [
+      payload.get("reg_date"),
+      payload.get("regdate"),
+      payload.get("creation_date"),
+      payload.get("creationDate"),
+      payload.get("last_login"),
+      payload.get("lastlogin"),
+    ]
+    for raw in candidates:
+      parsed = self._parse_mysql_datetime_value(raw)
+      if parsed is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+    return datetime.utcnow().isoformat()
+
   async def _backfill_mysql_player_snapshot(
     self,
     payload: dict,
@@ -3967,12 +4273,30 @@ class DashboardAPI:
       source_ip = str(payload.get("ip") or payload.get("creation_ip") or payload.get("reg_ip") or "0.0.0.0").strip()
       username = str(payload.get("username") or "unknown").strip() or "unknown"
       creation_date = str(payload.get("creation_date") or "").strip()
+      reg_date = str(payload.get("reg_date") or payload.get("regdate") or "").strip()
+      event_timestamp = self._resolve_mysql_registration_timestamp(payload)
 
       if dedupe_by_creation:
         detail_event_probe = f'"event_type": "{event_type}"'
+        detail_reg_probe = f'"reg_date": "{reg_date}"' if reg_date else ""
         detail_creation_probe = f'"creation_date": "{creation_date}"' if creation_date else ""
         async with self._db._lock:
-          if detail_creation_probe:
+          if detail_reg_probe:
+            async with self._db._db.execute(
+              """
+              SELECT id
+              FROM connection_events
+              WHERE connection_type = 'minecraft'
+                AND LOWER(COALESCE(player_name, '')) = LOWER(?)
+                AND COALESCE(details, '') LIKE ?
+                AND COALESCE(details, '') LIKE ?
+              ORDER BY id DESC
+              LIMIT 1
+              """,
+              (username, f"%{detail_event_probe}%", f"%{detail_reg_probe}%"),
+            ) as cursor:
+              exists_row = await cursor.fetchone()
+          elif detail_creation_probe:
             async with self._db._db.execute(
               """
               SELECT id
@@ -4011,6 +4335,7 @@ class DashboardAPI:
         "uuid": payload.get("uuid"),
         "creation_ip": payload.get("creation_ip"),
         "creation_date": payload.get("creation_date"),
+        "reg_date": payload.get("reg_date") or payload.get("regdate"),
         "last_login": payload.get("last_login"),
         "reg_ip": payload.get("reg_ip"),
         "is_verified": payload.get("is_verified"),
@@ -4029,7 +4354,7 @@ class DashboardAPI:
           VALUES (?, ?, ?, 'minecraft', NULL, NULL, 0, 0, 'NONE', ?)
           """,
           (
-            datetime.utcnow().isoformat(),
+            event_timestamp,
             source_ip,
             username,
             json.dumps(details, ensure_ascii=False),
@@ -4313,6 +4638,18 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
       </div>
       <div class="sub">Telegram remains global. Discord test uses minecraft-specific webhook when configured.</div>
     </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Historical Log Import (.log.gz)</h2>
+      <div class="top-controls" style="align-items:flex-end">
+        <div style="display:grid;gap:6px;flex:1;min-width:260px">
+          <label for="mcLogUploadInput" class="sub" style="font-size:.8rem">Upload one or more archived log files</label>
+          <input id="mcLogUploadInput" type="file" accept=".log.gz" multiple>
+        </div>
+        <button class="ghost" id="mcLogUploadBtn">Import Logs</button>
+      </div>
+      <div class="sub">Imports old events from uploaded minecraft/velocity .log.gz files. Date is inferred from filename (YYYY-MM-DD) when present.</div>
+    </div>
   </div>
 
   <div class="modal" id="intelModal">
@@ -4583,6 +4920,32 @@ async function sendTestNotification(channel){
     body: JSON.stringify({channel: channel})
   });
   setStatus(String(payload.message || 'Notification test sent.'), false);
+}
+
+async function importHistoricalMinecraftLogs(){
+  const input = document.getElementById('mcLogUploadInput');
+  const files = (input && input.files) ? Array.from(input.files) : [];
+  if(!files.length){
+    setStatus('Log import failed: select at least one .log.gz file.', true);
+    return;
+  }
+
+  const form = new FormData();
+  files.forEach(function(file){
+    form.append('logs', file, file.name);
+  });
+
+  const payload = await api('/api/admin/minecraft/import-logs', {
+    method:'POST',
+    body: form
+  });
+
+  const imported = Number(payload.imported_events || 0);
+  const fileCount = Number(payload.file_count || files.length);
+  const errors = Number(payload.errors || 0);
+  setStatus('Log import completed: '+String(imported)+' event(s), '+String(fileCount)+' file(s), '+String(errors)+' error(s).', errors > 0);
+  if(input){ input.value = ''; }
+  await refreshAll();
 }
 
 async function addWatchlist(playerName){
@@ -4873,6 +5236,9 @@ document.getElementById('testTelegramBtn').addEventListener('click', function(){
 });
 document.getElementById('testMcDiscordBtn').addEventListener('click', function(){
   sendTestNotification('minecraft-discord').catch(err => setStatus('Minecraft Discord test failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('mcLogUploadBtn').addEventListener('click', function(){
+  importHistoricalMinecraftLogs().catch(err => setStatus('Log import failed: ' + String(err && err.message ? err.message : err), true));
 });
 document.getElementById('toggleBannedBtn').addEventListener('click', function(){
   window.minecraftShowBanned = !window.minecraftShowBanned;
