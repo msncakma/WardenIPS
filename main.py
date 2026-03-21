@@ -83,6 +83,11 @@ class WardenIPS:
         self._stats_total_bans: int = 0
         self._start_time: float = 0.0
         self._smart_scoring: SmartScoringEngine = SmartScoringEngine()
+        self._log_ban_success_detail: bool = False
+        self._log_duplicate_ban_detail: bool = False
+        self._ban_summary_interval_seconds: int = 60
+        self._ban_success_summary: dict[str, int] = defaultdict(int)
+        self._ban_summary_last_flush: float = 0.0
 
     async def start(self) -> None:
         """Starts WardenIPS and loads all components."""
@@ -95,6 +100,20 @@ class WardenIPS:
         log_file = self._config.get("general.log_file")
         setup_logging(level=log_level, log_file=log_file)
         self._logger = get_logger("warden")
+        self._log_ban_success_detail = bool(
+            self._config.get("logging.verbose.ban_success_detail", False)
+        )
+        self._log_duplicate_ban_detail = bool(
+            self._config.get("logging.verbose.duplicate_ban_detail", False)
+        )
+        try:
+            self._ban_summary_interval_seconds = max(
+                int(self._config.get("logging.verbose.ban_summary_interval_seconds", 60)),
+                10,
+            )
+        except Exception:
+            self._ban_summary_interval_seconds = 60
+        self._ban_summary_last_flush = time.monotonic()
 
         self._logger.info("=" * 60)
         self._logger.info("  Starting WardenIPS v%s...", __version__)
@@ -214,6 +233,21 @@ class WardenIPS:
             velocity_plugin = VelocityPlugin(self._config)
             self._plugin_manager.register(velocity_plugin)
 
+            extra_paths = self._config.get("plugins.minecraft.velocity.extra_log_paths", []) or []
+            if isinstance(extra_paths, (list, tuple)):
+                seen_paths = {str(velocity_plugin.log_file_path).strip()}
+                for index, raw_path in enumerate(extra_paths, start=1):
+                    path = str(raw_path or "").strip()
+                    if not path or path in seen_paths:
+                        continue
+                    seen_paths.add(path)
+                    velocity_extra_plugin = VelocityPlugin(
+                        self._config,
+                        log_path_override=path,
+                        instance_label=f"extra-{index}",
+                    )
+                    self._plugin_manager.register(velocity_extra_plugin)
+
         # Nginx Plugin
         if self._config.get("plugins.nginx.enabled", False):
             nginx_plugin = NginxPlugin(self._config)
@@ -326,11 +360,11 @@ class WardenIPS:
                     await self._db.log_ban(
                         source_ip, reason, 100, ban_duration
                     )
-                    self._logger.warning(
-                        "BURST DETECTED: IP=%s Events=%d/%ds — AUTO-BANNED "
-                        "Plugin=%s",
-                        event.source_ip, len(ts_list),
-                        burst_window, plugin.name,
+                    self._record_ban_success(
+                        plugin_name=plugin.name,
+                        source_ip=event.source_ip,
+                        risk_score=100,
+                        event_type="burst_flood",
                     )
                     await self._notifier.notify_burst(
                         ip=event.source_ip,
@@ -513,18 +547,19 @@ class WardenIPS:
                         duration=ban_duration,
                         plugin=plugin.name,
                     )
-                    self._logger.warning(
-                        "THREAT DETECTED: IP=%s Risk=%d Action=%s "
-                        "Plugin=%s Type=%s",
-                        event.source_ip, risk_score, action,
-                        plugin.name, event.details.get("event_type", "?"),
+                    self._record_ban_success(
+                        plugin_name=plugin.name,
+                        source_ip=event.source_ip,
+                        risk_score=risk_score,
+                        event_type=event.details.get("event_type", "?") or "?",
                     )
                 else:
-                    self._logger.debug(
-                        "Duplicate event suppressed (already banned): IP=%s Plugin=%s Type=%s",
-                        event.source_ip, plugin.name,
-                        event.details.get("event_type", "?"),
-                    )
+                    if self._log_duplicate_ban_detail:
+                        self._logger.debug(
+                            "Duplicate event suppressed (already banned): IP=%s Plugin=%s Type=%s",
+                            event.source_ip, plugin.name,
+                            event.details.get("event_type", "?"),
+                        )
             elif action == "WATCH":
                 self._logger.info(
                     "SUSPICIOUS: IP=%s Risk=%d Plugin=%s",
@@ -532,6 +567,49 @@ class WardenIPS:
                 )
 
         return handler
+
+    def _record_ban_success(
+        self,
+        plugin_name: str,
+        source_ip: str,
+        risk_score: int,
+        event_type: str,
+    ) -> None:
+        plugin_key = str(plugin_name or "unknown").strip().lower() or "unknown"
+        self._ban_success_summary["total"] += 1
+        self._ban_success_summary[f"plugin:{plugin_key}"] += 1
+        if self._log_ban_success_detail:
+            self._logger.warning(
+                "THREAT DETECTED: IP=%s Risk=%d Action=BAN Plugin=%s Type=%s",
+                source_ip,
+                int(risk_score or 0),
+                plugin_name,
+                event_type,
+            )
+        self._flush_ban_success_summary_if_due()
+
+    def _flush_ban_success_summary_if_due(self, force: bool = False) -> None:
+        if not self._ban_success_summary:
+            return
+        now = time.monotonic()
+        if (not force) and ((now - self._ban_summary_last_flush) < self._ban_summary_interval_seconds):
+            return
+
+        total = int(self._ban_success_summary.get("total", 0))
+        plugin_parts = []
+        for key, value in sorted(self._ban_success_summary.items()):
+            if not key.startswith("plugin:"):
+                continue
+            plugin_parts.append(f"{key.split(':', 1)[1]}={int(value)}")
+        plugin_text = ", ".join(plugin_parts) if plugin_parts else "n/a"
+        self._logger.info(
+            "BAN SUMMARY: total=%d interval=%ss plugins=[%s]",
+            total,
+            self._ban_summary_interval_seconds,
+            plugin_text,
+        )
+        self._ban_success_summary.clear()
+        self._ban_summary_last_flush = now
 
     def _is_minecraft_observe_only(self, plugin_name: str) -> bool:
         plugin_key = str(plugin_name or "").strip().lower()
@@ -764,6 +842,7 @@ class WardenIPS:
 
         self._logger.info("Shutting down WardenIPS...")
         self._running = False
+        self._flush_ban_success_summary_if_due(force=True)
 
         # Stop tailers
         for tailer in self._tailers:

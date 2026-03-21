@@ -5,6 +5,14 @@ general:
   log_file: "/var/log/wardenips/warden.log"
   analysis_interval: 5        # Analyze the last N minutes of connection events
 
+logging:
+  verbose:
+    ban_success_detail: false          # false: successful bans are summarized instead of per-IP spam
+    duplicate_ban_detail: false        # false: suppress duplicate-ban debug lines
+    whitelist_skip_detail: true        # true: log whitelist skip decisions individually
+    ban_failure_detail: true           # true: log failed ban attempts individually
+    ban_summary_interval_seconds: 60   # successful-ban summary interval
+
 whitelist:
   # IPv4/IPv6 addresses that will NEVER be blocked. Add your IP here!
   ips:
@@ -109,7 +117,7 @@ plugins:
     enabled: true
     log_path: "/var/log/auth.log"
     max_failed_attempts: 5    # Attempts within analysis_interval before triggering a high score
-    
+
   minecraft:
     enabled: false  # Backend Minecraft server log parser (Paper/Spigot/etc.). Can stay false if using only Velocity logs.
     log_path: "/opt/minecraft/logs/latest.log"
@@ -125,6 +133,7 @@ plugins:
     velocity:
       enabled: true  # Velocity parser is independent; set true even if plugins.minecraft.enabled is false
       log_path: "/opt/velocity/logs/latest.log"
+      extra_log_paths: []  # Optional: additional Velocity log file paths for multi-proxy setups
       parse_connected: true
       parse_disconnect: true
     player_db:
@@ -150,7 +159,13 @@ plugins:
       entity_intel_cache_ttl_seconds: 20
       parser_health_cache_ttl_seconds: 12
       mask_emails: true
-    
+      local_cache_enabled: true
+      local_cache_manual_refresh_only: true
+    notifications:
+      discord:
+        enabled: false
+        webhook_url: ""  # Optional dedicated webhook for minecraft/velocity events
+
   nginx:
     enabled: false
     log_path: "/var/log/nginx/access.log"

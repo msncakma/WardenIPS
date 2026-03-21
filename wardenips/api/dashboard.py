@@ -257,6 +257,9 @@ class DashboardAPI:
   def _is_minecraft_email_masking_enabled(self) -> bool:
     return bool(self._config.get("plugins.minecraft.analytics.mask_emails", True))
 
+  def _is_minecraft_local_cache_enabled(self) -> bool:
+    return bool(self._config.get("plugins.minecraft.analytics.local_cache_enabled", True))
+
   def _mask_email(self, email: str) -> str:
     value = str(email or "").strip()
     if not value or "@" not in value:
@@ -617,6 +620,7 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/minecraft/watchlist/add", self._handle_admin_minecraft_watchlist_add)
     self._app.router.add_post("/api/admin/minecraft/watchlist/remove", self._handle_admin_minecraft_watchlist_remove)
     self._app.router.add_post("/api/admin/minecraft/ban-player", self._handle_admin_minecraft_ban_player)
+    self._app.router.add_post("/api/admin/minecraft/ban-asn", self._handle_admin_minecraft_ban_asn)
     self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
@@ -2619,12 +2623,30 @@ class DashboardAPI:
     username = str(request.query.get("username", "")).strip()
     source_ip = str(request.query.get("ip", "")).strip()
     event_type = str(request.query.get("event_type", "")).strip().lower()
+    country = str(request.query.get("country", "")).strip().upper()
+    asn_query = str(request.query.get("asn", "")).strip()
     hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
       timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
       query = """
         SELECT id, timestamp, source_ip, player_name, connection_type,
-               asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details
+               asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details,
+               EXISTS(
+                 SELECT 1
+                 FROM ban_history bh
+                 WHERE bh.source_ip = connection_events.source_ip
+                   AND bh.is_active = 1
+                   AND (
+                     bh.expires_at IS NULL
+                     OR bh.expires_at = ''
+                     OR COALESCE(strftime('%s', bh.expires_at), 0) > strftime('%s', 'now')
+                   )
+               ) AS is_banned_current,
+               (
+                 SELECT MIN(COALESCE(strftime('%s', bh_first.banned_at), 0))
+                 FROM ban_history bh_first
+                 WHERE bh_first.source_ip = connection_events.source_ip
+               ) AS first_ban_unix
         FROM connection_events
         WHERE connection_type = 'minecraft'
       """
@@ -2641,6 +2663,18 @@ class DashboardAPI:
       if event_type:
         query += " AND LOWER(COALESCE(details, '')) LIKE ?"
         params.append(f'%\"event_type\": \"{event_type}%')
+      if country and len(country) == 2 and country.isalpha():
+        query += " AND (UPPER(COALESCE(details, '')) LIKE ? OR UPPER(COALESCE(details, '')) LIKE ?)"
+        params.append(f'%\"COUNTRY_CODE\":\"{country}\"%')
+        params.append(f'%\"COUNTRY_CODE\": \"{country}\"%')
+      if asn_query:
+        asn_normalized = asn_query.upper().replace("AS", "").strip()
+        if asn_normalized.isdigit():
+          query += " AND asn_number = ?"
+          params.append(int(asn_normalized))
+        else:
+          query += " AND LOWER(COALESCE(asn_org, '')) LIKE ?"
+          params.append(f"%{asn_query.lower()}%")
       query += " ORDER BY id DESC LIMIT ? OFFSET ?"
       params.extend([limit, offset])
 
@@ -2663,6 +2697,12 @@ class DashboardAPI:
         event["event_type"] = str(details_obj.get("event_type") or "")
         event["country_code"] = self._resolve_country_code(details_obj, event.get("source_ip"))
         event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
+        banned_current = bool(event.get("is_banned_current"))
+        first_ban_unix = self._safe_int(event.get("first_ban_unix"), 0)
+        event_ts_unix = self._parse_timestamp_unix(event.get("timestamp"))
+        event["is_firewall_blocked"] = banned_current
+        event["is_post_ban"] = bool(banned_current and first_ban_unix > 0 and event_ts_unix >= first_ban_unix)
+        event["is_ban_trigger_event"] = bool(banned_current and first_ban_unix > 0 and abs(event_ts_unix - first_ban_unix) <= 60)
 
       return web.json_response({"events": events, "count": len(events), "limit": limit, "offset": offset})
     except Exception as exc:
@@ -2732,6 +2772,7 @@ class DashboardAPI:
           rows = await cursor.fetchall()
 
       findings = []
+      seen_keys: set[tuple[str, str, str]] = set()
       for source_ip, player_name, timestamp, details_raw in rows:
         details_obj = {}
         if isinstance(details_raw, str) and details_raw:
@@ -2745,6 +2786,10 @@ class DashboardAPI:
           continue
         if self._is_minecraft_email_masking_enabled():
           email_value = self._mask_email(email_value)
+        key = (str(player_name or "").lower(), str(email_value).lower(), str(source_ip or ""))
+        if key in seen_keys:
+          continue
+        seen_keys.add(key)
         findings.append(
           {
             "timestamp": timestamp,
@@ -2754,6 +2799,41 @@ class DashboardAPI:
             "duplicate_email_count": duplicate_count,
           }
         )
+
+      if self._is_minecraft_local_cache_enabled():
+        async with self._db._lock:
+          async with self._db._db.execute(
+            """
+            SELECT player_name, email, ip, duplicate_email_count, updated_at
+            FROM minecraft_player_cache
+            WHERE COALESCE(duplicate_email_count, 0) > 1
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+          ) as cache_cursor:
+            cache_rows = await cache_cursor.fetchall()
+        for player_name, email_value, source_ip, duplicate_count, updated_at in cache_rows:
+          if not str(email_value or "").strip():
+            continue
+          display_email = str(email_value)
+          if self._is_minecraft_email_masking_enabled():
+            display_email = self._mask_email(display_email)
+          key = (str(player_name or "").lower(), str(display_email).lower(), str(source_ip or ""))
+          if key in seen_keys:
+            continue
+          seen_keys.add(key)
+          findings.append(
+            {
+              "timestamp": updated_at,
+              "source_ip": source_ip,
+              "player_name": player_name,
+              "email": display_email,
+              "duplicate_email_count": int(duplicate_count or 0),
+            }
+          )
+
+      findings = findings[:limit]
       return web.json_response({"findings": findings, "count": len(findings)})
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
@@ -2845,6 +2925,27 @@ class DashboardAPI:
           deduped.append(ip_value)
           seen.add(ip_value)
         return deduped
+
+  async def _get_minecraft_asn_ips(self, asn_number: int, hours_back: int, limit: int = 2000) -> list[str]:
+    max_limit = min(max(int(limit), 1), 5000)
+    normalized_hours = max(int(hours_back), 1)
+    timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+    async with self._db._lock:
+      async with self._db._db.execute(
+        f"""
+        SELECT DISTINCT source_ip
+        FROM connection_events
+        WHERE connection_type = 'minecraft'
+          AND asn_number = ?
+          AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')
+          AND COALESCE(source_ip, '') <> ''
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(asn_number), f"-{normalized_hours}", max_limit),
+      ) as cursor:
+        rows = await cursor.fetchall()
+        return [str(row[0]).strip() for row in rows if row and str(row[0] or "").strip()]
 
   async def _handle_admin_minecraft_watchlist(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
@@ -2971,6 +3072,112 @@ class DashboardAPI:
       }
     )
 
+  async def _handle_admin_minecraft_ban_asn(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    asn_input = str(payload.get("asn", "")).strip().upper().replace("AS", "")
+    if not asn_input.isdigit():
+      return web.json_response(
+        {"error": "invalid_asn", "message": "asn is required (e.g. AS14061)."},
+        status=400,
+      )
+
+    reason = str(payload.get("reason", "")).strip()
+    if not reason:
+      return web.json_response(
+        {"error": "invalid_reason", "message": "reason is required for ban-asn action."},
+        status=400,
+      )
+
+    window_mode = str(payload.get("window_mode", "24h")).strip().lower()
+    hours_map = {"24h": 24, "7d": 168, "30d": 720}
+    hours_back = hours_map.get(window_mode, 24)
+    dry_run = bool(payload.get("dry_run", False))
+
+    asn_number = int(asn_input)
+    ips = await self._get_minecraft_asn_ips(asn_number, hours_back=hours_back, limit=5000)
+    if not ips:
+      return web.json_response(
+        {"error": "no_asn_ips", "message": f"No known IPs found for ASN AS{asn_number} in window {window_mode}."},
+        status=404,
+      )
+
+    if dry_run:
+      return web.json_response(
+        {
+          "ok": True,
+          "dry_run": True,
+          "asn": f"AS{asn_number}",
+          "window_mode": window_mode,
+          "candidate_count": len(ips),
+          "ips": ips,
+          "message": f"Dry-run completed for AS{asn_number}: {len(ips)} candidate IP(s).",
+        }
+      )
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = 0
+
+    applied = 0
+    failed = 0
+    results: list[dict[str, object]] = []
+    for ip_value in ips:
+      ban_reason = f"[ADMIN][MINECRAFT_ASN] {reason} | asn=AS{asn_number} window={window_mode}"
+      banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=ban_reason)
+      if banned:
+        applied += 1
+        await self._db.log_ban(ip_value, ban_reason, 100, duration)
+        if self._notifier:
+          await self._notifier.notify_ban(
+            ip=ip_value,
+            reason=ban_reason,
+            risk=100,
+            duration=duration,
+            plugin="minecraft",
+          )
+      else:
+        failed += 1
+      results.append({"ip": ip_value, "ban_applied": bool(banned)})
+
+    await self._log_audit(
+      request,
+      "admin.minecraft.ban_asn",
+      actor_username=actor,
+      target=f"AS{asn_number}",
+      details={
+        "asn": f"AS{asn_number}",
+        "window_mode": window_mode,
+        "duration": duration,
+        "reason": reason,
+        "candidate_count": len(ips),
+        "applied": applied,
+        "failed": failed,
+      },
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "asn": f"AS{asn_number}",
+        "window_mode": window_mode,
+        "candidate_count": len(ips),
+        "applied": applied,
+        "failed": failed,
+        "results": results,
+        "message": f"Ban ASN completed for AS{asn_number}: {applied}/{len(ips)} applied.",
+      }
+    )
+
   async def _handle_admin_minecraft_whitelist_player(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
       return self._json_auth_error()
@@ -3037,7 +3244,7 @@ class DashboardAPI:
 
     entity_type = str(request.query.get("type", "")).strip().lower()
     value = str(request.query.get("value", "")).strip()
-    if entity_type not in {"user", "ip", "asn"} or not value:
+    if entity_type not in {"user", "ip", "asn", "email"} or not value:
       return web.json_response({"error": "invalid_query"}, status=400)
 
     cache_ttl = self._get_minecraft_analytics_int("entity_intel_cache_ttl_seconds", 20, minimum=0, maximum=300)
@@ -3068,6 +3275,17 @@ class DashboardAPI:
         LIMIT 200
       """
       params = (value,)
+    elif entity_type == "email":
+      lowered = value.lower().replace("*", "%")
+      query = """
+        SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft'
+          AND LOWER(COALESCE(details, '')) LIKE ?
+        ORDER BY id DESC
+        LIMIT 200
+      """
+      params = (f'%"email": "{lowered}"%',)
     else:
       asn_value = value.upper().replace("AS", "").strip()
       if not asn_value.isdigit():
@@ -3093,18 +3311,43 @@ class DashboardAPI:
     mysql_payload = None
     mysql_backfilled = False
     if entity_type == "user":
-      mysql_payload = await self._fetch_mysql_player_by_username(value)
-      if (not local_events) and mysql_payload and mysql_payload.get("found"):
-        await self._backfill_mysql_player_snapshot(mysql_payload)
-        mysql_backfilled = True
-        try:
-          async with self._db._lock:
-            async with self._db._db.execute(query, params) as cursor:
-              rows = await cursor.fetchall()
-              cols = [d[0] for d in cursor.description]
-              local_events = [dict(zip(cols, row)) for row in rows]
-        except Exception:
-          pass
+      if self._is_minecraft_local_cache_enabled():
+        cached_profile = await self._db.get_minecraft_player_cache(value)
+        if cached_profile:
+          mysql_payload = {
+            "enabled": True,
+            "found": True,
+            "source": "local_cache",
+            "username": cached_profile.get("player_name"),
+            "email": cached_profile.get("email"),
+            "uuid": cached_profile.get("uuid"),
+            "ip": cached_profile.get("ip"),
+            "creation_ip": cached_profile.get("creation_ip"),
+            "creation_date": cached_profile.get("creation_date"),
+            "last_login": cached_profile.get("last_login"),
+            "reg_ip": cached_profile.get("reg_ip"),
+            "is_verified": cached_profile.get("is_verified"),
+            "duplicate_email_count": int(cached_profile.get("duplicate_email_count") or 0),
+          }
+
+      if not (isinstance(mysql_payload, dict) and mysql_payload.get("found")):
+        mysql_payload = await self._fetch_mysql_player_by_username(value)
+        if mysql_payload and mysql_payload.get("found"):
+          if self._is_minecraft_local_cache_enabled():
+            try:
+              await self._db.upsert_minecraft_player_cache(value, mysql_payload, source="mysql")
+            except Exception:
+              pass
+          await self._backfill_mysql_player_snapshot(mysql_payload)
+          mysql_backfilled = True
+          try:
+            async with self._db._lock:
+              async with self._db._db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                cols = [d[0] for d in cursor.description]
+                local_events = [dict(zip(cols, row)) for row in rows]
+          except Exception:
+            pass
 
     watch_names = await self._db.get_minecraft_watchlist_names()
     unique_ips = sorted({str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()})
@@ -3224,6 +3467,11 @@ class DashboardAPI:
         "is_verified": payload.get("is_verified"),
         "duplicate_email_count": int(payload.get("duplicate_email_count") or 0),
       }
+      if self._is_minecraft_local_cache_enabled():
+        try:
+          await self._db.upsert_minecraft_player_cache(username, payload, source="mysql")
+        except Exception:
+          pass
       async with self._db._lock:
         await self._db._db.execute(
           """
@@ -3337,7 +3585,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
     <div class="panel">
       <h2 style="margin:0 0 10px 0;font-size:1rem">Entity Investigation</h2>
       <div class="intel-controls">
-        <select id="intelType"><option value="user">Username</option><option value="ip">IP</option><option value="asn">ASN</option></select>
+        <select id="intelType"><option value="user">Username</option><option value="ip">IP</option><option value="asn">ASN</option><option value="email">Email</option></select>
         <input id="intelValue" placeholder="Example: atma_12345, 45.141.178.192, AS14061">
         <button id="intelSearchBtn">Investigate</button>
       </div>
@@ -3346,6 +3594,9 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 
     <div class="panel">
       <h2 style="margin:0 0 10px 0;font-size:1rem">Advanced Event Query</h2>
+      <div class="top-controls" style="margin:0 0 10px 0">
+        <button id="toggleBannedBtn" class="ghost">Hide banned events</button>
+      </div>
       <div class="controls">
         <input id="fUser" placeholder="Username (case-insensitive exact)">
         <input id="fIp" placeholder="IP (exact)">
@@ -3358,6 +3609,8 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <option value="failed_packet">failed_packet</option>
           <option value="mysql_backfill">mysql_backfill</option>
         </select>
+        <select id="fCountry"><option value="">All countries</option></select>
+        <select id="fAsn"><option value="">All ASN</option></select>
         <select id="fHours">
           <option value="1">Last 1h</option>
           <option value="6">Last 6h</option>
@@ -3405,6 +3658,15 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
         <tbody id="healthRows"></tbody>
       </table>
     </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Minecraft Notifications</h2>
+      <div class="top-controls">
+        <button class="ghost" id="testTelegramBtn">Test Telegram (Global)</button>
+        <button class="ghost" id="testMcDiscordBtn">Test Discord (Minecraft)</button>
+      </div>
+      <div class="sub">Telegram remains global. Discord test uses minecraft-specific webhook when configured.</div>
+    </div>
   </div>
 
   <div class="modal" id="intelModal">
@@ -3419,6 +3681,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <button class="ghost" id="intelWatchRemoveBtn">Watch -</button>
           <button class="ghost" id="intelWhitelistBtn">Whitelist Player</button>
           <button class="ghost" id="intelBanPlayerBtn">Ban Player</button>
+          <button class="ghost" id="intelBanAsnBtn" style="display:none">Ban ASN</button>
           <button class="ghost" id="intelCloseBtn">Close</button>
         </div>
       </div>
@@ -3509,13 +3772,32 @@ async function loadSummary(){
 }
 
 async function loadEvents(){
+  const showBanned = !!window.minecraftShowBanned;
   const user = encodeURIComponent(document.getElementById('fUser').value.trim());
   const ip = encodeURIComponent(document.getElementById('fIp').value.trim());
   const type = encodeURIComponent(document.getElementById('fType').value);
+  const country = encodeURIComponent(document.getElementById('fCountry').value || '');
+  const asn = encodeURIComponent(document.getElementById('fAsn').value || '');
   const hours = encodeURIComponent(document.getElementById('fHours').value || '24');
-  const q = '/api/minecraft/events?limit=150&hours_back='+hours+'&username='+user+'&ip='+ip+'&event_type='+type;
+  const q = '/api/minecraft/events?limit=150&hours_back='+hours+'&username='+user+'&ip='+ip+'&event_type='+type+'&country='+country+'&asn='+asn;
   const data = await api(q);
-  const rows = (data.events || []).map(e => {
+  const allEvents = (data.events || []);
+  const events = showBanned ? allEvents : allEvents.filter(e => !(e.is_post_ban || e.is_firewall_blocked || e.is_ban_trigger_event));
+
+  const countryValues = [];
+  const asnValues = [];
+  allEvents.forEach(e => {
+    const cc = String(e.country_code || '').toUpperCase();
+    if(cc && /^[A-Z]{2}$/.test(cc)){ countryValues.push(cc); }
+    const num = e.asn_number ? ('AS' + String(e.asn_number)) : '';
+    const org = String(e.asn_org || '').trim();
+    const filterValue = num || org;
+    if(filterValue){ asnValues.push(filterValue); }
+  });
+  syncSelectOptions(document.getElementById('fCountry'), countryValues, 'All countries');
+  syncSelectOptions(document.getElementById('fAsn'), asnValues, 'All ASN');
+
+  const rows = events.map(e => {
     const asnNum = e.asn_number ? ('AS'+String(e.asn_number)) : '';
     const asnOrg = String(e.asn_org || '').trim();
     const asnLabel = (asnNum && asnOrg) ? (asnNum + ' · ' + asnOrg) : (asnNum || asnOrg || '-');
@@ -3560,8 +3842,8 @@ async function loadDuplicateEmails(){
     '<tr>'+
       '<td class="copyable">'+esc(f.timestamp)+'</td>'+
       '<td>'+(f.player_name?('<button class="link-btn copyable" data-intel-type="user" data-intel-value="'+esc(f.player_name)+'">'+esc(f.player_name)+'</button>'):'-')+'</td>'+
-      '<td class="copyable">'+esc(f.email || '-')+'</td>'+
-      '<td class="copyable">'+esc(f.duplicate_email_count || 0)+'</td>'+
+      '<td>'+(f.email?('<button class="link-btn copyable" data-intel-type="email" data-intel-value="'+esc(f.email)+'">'+esc(f.email)+'</button>'):'-')+'</td>'+
+      '<td>'+(f.email?('<button class="link-btn copyable" data-intel-type="email" data-intel-value="'+esc(f.email)+'">'+esc(f.duplicate_email_count || 0)+'</button>'):('<span class="copyable">'+esc(f.duplicate_email_count || 0)+'</span>'))+'</td>'+
       '<td><button class="link-btn copyable" data-intel-type="ip" data-intel-value="'+esc(f.source_ip)+'">'+esc(f.source_ip)+'</button></td>'+
     '</tr>'
   ).join('');
@@ -3605,6 +3887,15 @@ async function loadParserHealth(){
   document.getElementById('healthRows').innerHTML = rows || '<tr><td colspan="5">No health data</td></tr>';
 }
 
+async function sendTestNotification(channel){
+  const payload = await api('/api/admin/test-notification', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({channel: channel})
+  });
+  setStatus(String(payload.message || 'Notification test sent.'), false);
+}
+
 async function addWatchlist(playerName){
   const value = String(playerName || '').trim();
   if(!value){ setStatus('Watchlist add failed: player name is empty.', true); return; }
@@ -3643,6 +3934,53 @@ async function banPlayer(playerName){
   await refreshAll();
 }
 
+async function banAsn(asnValue){
+  const value = String(asnValue || '').trim();
+  if(!value){ setStatus('Ban ASN failed: ASN is empty.', true); return; }
+  const normalized = value.toUpperCase().startsWith('AS') ? value.toUpperCase() : ('AS'+value);
+  const windowMode = window.prompt('ASN window (24h, 7d, 30d):', '24h');
+  if(!windowMode){ return; }
+  const mode = String(windowMode).trim().toLowerCase();
+  if(['24h','7d','30d'].indexOf(mode) === -1){ setStatus('Ban ASN failed: invalid window mode.', true); return; }
+  const reason = window.prompt('Ban reason for '+normalized+':', 'Suspicious ASN activity from minecraft dashboard');
+  if(!reason){ return; }
+  const dryRun = window.confirm('Run dry-run first? OK = dry-run, Cancel = apply bans now.');
+  const payload = await api('/api/admin/minecraft/ban-asn', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({asn: normalized, window_mode: mode, reason: reason, duration: 0, dry_run: dryRun})
+  });
+  if(payload.dry_run){
+    setStatus('Dry-run '+normalized+': '+String(payload.candidate_count || 0)+' candidate IP(s). Re-run with dry-run disabled to apply.', false);
+  } else {
+    setStatus('Ban ASN completed for '+normalized+': '+String(payload.applied || 0)+'/'+String(payload.candidate_count || 0)+' applied.', false);
+    await refreshAll();
+  }
+}
+
+function syncSelectOptions(selectEl, values, allLabel){
+  if(!selectEl){ return; }
+  const previous = selectEl.value || '';
+  const unique = Array.from(new Set((values || []).filter(Boolean))).sort();
+  const options = ['<option value="">'+esc(allLabel || 'All')+'</option>'];
+  unique.forEach(v => options.push('<option value="'+esc(v)+'">'+esc(v)+'</option>'));
+  selectEl.innerHTML = options.join('');
+  if(unique.indexOf(previous) !== -1 || previous === ''){
+    selectEl.value = previous;
+  }
+}
+
+function syncIntelActionButtons(type){
+  const normalized = String(type || '').toLowerCase();
+  const isUser = normalized === 'user';
+  const isAsn = normalized === 'asn';
+  document.getElementById('intelWatchAddBtn').style.display = isUser ? '' : 'none';
+  document.getElementById('intelWatchRemoveBtn').style.display = isUser ? '' : 'none';
+  document.getElementById('intelWhitelistBtn').style.display = isUser ? '' : 'none';
+  document.getElementById('intelBanPlayerBtn').style.display = isUser ? '' : 'none';
+  document.getElementById('intelBanAsnBtn').style.display = isAsn ? '' : 'none';
+}
+
 async function whitelistPlayer(playerName){
   const value = String(playerName || '').trim();
   if(!value){ setStatus('Whitelist failed: player name is empty.', true); return; }
@@ -3665,6 +4003,7 @@ async function searchIntel(type, value){
     document.getElementById('intelRows').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
 
     const payload = await api('/api/minecraft/entity-intel?type='+encodeURIComponent(type)+'&value='+encodeURIComponent(value));
+    syncIntelActionButtons(payload.type || type);
     const mysqlInfo = payload.mysql || {};
     const metaBits = ['Type: '+payload.type, 'Events: '+(payload.count||0), 'Peak Risk: '+(payload.risk_peak||0)];
     if(payload.mysql_backfilled){ metaBits.push('MySQL backfill: yes'); }
@@ -3739,9 +4078,25 @@ function setupAutoRefresh(){
 }
 
 document.getElementById('btnFilter').addEventListener('click', loadEvents);
+document.getElementById('fCountry').addEventListener('change', loadEvents);
+document.getElementById('fAsn').addEventListener('change', loadEvents);
 document.getElementById('summaryHours').addEventListener('change', refreshAll);
 document.getElementById('fHours').addEventListener('change', refreshAll);
 document.getElementById('autoRefresh').addEventListener('change', setupAutoRefresh);
+document.getElementById('testTelegramBtn').addEventListener('click', function(){
+  sendTestNotification('telegram').catch(err => setStatus('Telegram test failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('testMcDiscordBtn').addEventListener('click', function(){
+  sendTestNotification('minecraft-discord').catch(err => setStatus('Minecraft Discord test failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('toggleBannedBtn').addEventListener('click', function(){
+  window.minecraftShowBanned = !window.minecraftShowBanned;
+  this.textContent = window.minecraftShowBanned ? 'Hide banned events' : 'Show banned events';
+  loadEvents().catch(err => setStatus('Event reload failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('intelType').addEventListener('change', function(){
+  syncIntelActionButtons(this.value);
+});
 document.getElementById('intelSearchBtn').addEventListener('click', function(){
   searchIntel(document.getElementById('intelType').value, document.getElementById('intelValue').value.trim());
 });
@@ -3759,6 +4114,11 @@ document.getElementById('intelBanPlayerBtn').addEventListener('click', async fun
   const current = selectedIntel();
   if(current.type !== 'user'){ setStatus('Ban action requires user type.', true); return; }
   try { await banPlayer(current.value); } catch(err){ setStatus('Ban action failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelBanAsnBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'asn'){ setStatus('Ban ASN action requires ASN type.', true); return; }
+  try { await banAsn(current.value); } catch(err){ setStatus('Ban ASN action failed: ' + String(err && err.message ? err.message : err), true); }
 });
 document.getElementById('intelWhitelistBtn').addEventListener('click', async function(){
   const current = selectedIntel();
@@ -3802,6 +4162,9 @@ document.body.addEventListener('dblclick', function(ev){
 });
 
 refreshAll();
+window.minecraftShowBanned = false;
+document.getElementById('toggleBannedBtn').textContent = 'Show banned events';
+syncIntelActionButtons(document.getElementById('intelType').value);
 setupAutoRefresh();
 </script>
 </body>

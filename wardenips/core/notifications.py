@@ -45,6 +45,8 @@ class NotificationManager:
         self._telegram_chat_id: str = ""
         self._discord_enabled: bool = False
         self._discord_webhook_url: str = ""
+        self._minecraft_discord_enabled: bool = False
+        self._minecraft_discord_webhook_url: str = ""
         self._session: Optional[aiohttp.ClientSession] = None
         # Simple rate limiting: max 20 notifications per minute
         self._rate_limit: int = 20
@@ -94,6 +96,17 @@ class NotificationManager:
                     "Discord enabled but webhook_url missing."
                 )
 
+        # Minecraft-specific Discord webhook (Telegram remains global)
+        mc_notif = config.get("plugins.minecraft.notifications", {})
+        mc_discord = mc_notif.get("discord", {}) if isinstance(mc_notif, dict) else {}
+        if mc_discord.get("enabled", False):
+            self._minecraft_discord_webhook_url = str(mc_discord.get("webhook_url", "") or "").strip()
+            if self._minecraft_discord_webhook_url:
+                self._minecraft_discord_enabled = True
+                logger.info("Minecraft-specific Discord webhook enabled.")
+            else:
+                logger.warning("Minecraft Discord webhook enabled but webhook_url is missing.")
+
         self._rate_limit = notif_section.get("rate_limit_per_minute", 20)
         rules = notif_section.get("rules", {}) if isinstance(notif_section.get("rules", {}), dict) else {}
         self._notify_on_ban = bool(rules.get("on_ban", True))
@@ -111,7 +124,19 @@ class NotificationManager:
 
     @property
     def enabled(self) -> bool:
-        return self._telegram_enabled or self._discord_enabled
+        return self._telegram_enabled or self._discord_enabled or self._minecraft_discord_enabled
+
+    @staticmethod
+    def _is_minecraft_plugin(plugin: str) -> bool:
+        key = str(plugin or "").strip().lower()
+        if not key:
+            return False
+        return (
+            key in {"minecraft", "velocity"}
+            or key.startswith("minecraft")
+            or key.startswith("velocity")
+            or key.startswith("admin.minecraft")
+        )
 
     def _rate_limited(self) -> bool:
         """Returns True if we've exceeded rate limit."""
@@ -169,8 +194,11 @@ class NotificationManager:
         tasks = []
         if self._telegram_enabled:
             tasks.append(self._send_telegram(title, body))
-        if self._discord_enabled:
-            tasks.append(self._send_discord(title, body))
+        use_mc_discord = self._is_minecraft_plugin(plugin_name) and self._minecraft_discord_enabled
+        if use_mc_discord:
+            tasks.append(self._send_discord(title, body, webhook_url=self._minecraft_discord_webhook_url))
+        elif self._discord_enabled:
+            tasks.append(self._send_discord(title, body, webhook_url=self._discord_webhook_url))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
@@ -206,15 +234,18 @@ class NotificationManager:
         tasks = []
         if self._telegram_enabled:
             tasks.append(self._send_telegram(title, body))
-        if self._discord_enabled:
-            tasks.append(self._send_discord(title, body))
+        use_mc_discord = self._is_minecraft_plugin(plugin) and self._minecraft_discord_enabled
+        if use_mc_discord:
+            tasks.append(self._send_discord(title, body, webhook_url=self._minecraft_discord_webhook_url))
+        elif self._discord_enabled:
+            tasks.append(self._send_discord(title, body, webhook_url=self._discord_webhook_url))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_test_notification(self, channel: str = "all") -> dict[str, object]:
         """Send an operator-triggered test notification to one or more channels."""
         requested = str(channel or "all").strip().lower()
-        if requested not in {"all", "telegram", "discord"}:
+        if requested not in {"all", "telegram", "discord", "minecraft-discord"}:
             raise ValueError("Unsupported notification channel.")
 
         if not _AIOHTTP_AVAILABLE or not self._session:
@@ -233,6 +264,8 @@ class NotificationManager:
             targets.append(("telegram", self._send_telegram, self._telegram_enabled))
         if requested in {"all", "discord"}:
             targets.append(("discord", self._send_discord, self._discord_enabled))
+        if requested == "minecraft-discord":
+            targets.append(("minecraft-discord", self._send_discord, self._minecraft_discord_enabled))
 
         any_enabled = False
         for name, sender, enabled in targets:
@@ -240,7 +273,12 @@ class NotificationManager:
                 results[name] = "disabled"
                 continue
             any_enabled = True
-            sent = await sender(title, body)
+            if name == "discord":
+                sent = await sender(title, body, webhook_url=self._discord_webhook_url)
+            elif name == "minecraft-discord":
+                sent = await sender(title, body, webhook_url=self._minecraft_discord_webhook_url)
+            else:
+                sent = await sender(title, body)
             results[name] = "sent" if sent else "failed"
 
         if not any_enabled:
@@ -285,8 +323,11 @@ class NotificationManager:
 
     # ── Discord ──
 
-    async def _send_discord(self, title: str, body: str) -> bool:
+    async def _send_discord(self, title: str, body: str, webhook_url: str = "") -> bool:
         """Send a message via Discord Webhook."""
+        target_webhook = str(webhook_url or self._discord_webhook_url).strip()
+        if not target_webhook:
+            return False
         # Discord Webhook accepts embeds or content
         embed = {
             "title": title,
@@ -299,7 +340,7 @@ class NotificationManager:
         async with self._lock:
             try:
                 async with self._session.post(
-                    self._discord_webhook_url, json=payload
+                    target_webhook, json=payload
                 ) as resp:
                     self._send_times.append(time.monotonic())
                     if resp.status in (200, 204):

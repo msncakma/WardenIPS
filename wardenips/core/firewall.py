@@ -77,6 +77,9 @@ class FirewallManager:
         # for the same IP (important in simulation mode where ipset -exist has
         # no effect).
         self._banned_ips: set = set()
+        self._log_ban_success_detail: bool = True
+        self._log_whitelist_skip_detail: bool = True
+        self._log_ban_failure_detail: bool = True
 
     # ── Factory ──
 
@@ -107,6 +110,15 @@ class FirewallManager:
         self._set_name = ipset_section.get("set_name", "warden_blacklist")
         self._default_ban_duration = ipset_section.get(
             "default_ban_duration", 0
+        )
+        self._log_ban_success_detail = bool(
+            config.get("logging.verbose.ban_success_detail", True)
+        )
+        self._log_whitelist_skip_detail = bool(
+            config.get("logging.verbose.whitelist_skip_detail", True)
+        )
+        self._log_ban_failure_detail = bool(
+            config.get("logging.verbose.ban_failure_detail", True)
         )
 
         # Platform ve yetki kontrolu
@@ -332,11 +344,12 @@ class FirewallManager:
         # Whitelist protection
         if self._whitelist:
             if await self._whitelist.is_whitelisted(ip_str):
-                logger.warning(
-                    "BAN BLOCKED! IP is in whitelist: %s — "
-                    "Admin lock protection active.",
-                    ip_str,
-                )
+                if self._log_whitelist_skip_detail:
+                    logger.warning(
+                        "BAN BLOCKED! IP is in whitelist: %s — "
+                        "Admin lock protection active.",
+                        ip_str,
+                    )
                 return False
 
         # Skip if already banned unless a forced replay was requested.
@@ -388,15 +401,23 @@ class FirewallManager:
 
         if success:
             self._banned_ips.add(ip_str)  # idempotent for normal path
-            dur_str = f"{ban_duration}s" if ban_duration > 0 else "KALICI"
-            logger.info(
-                "IP BANNED: %s | Duration: %s | Reason: %s",
-                ip_str, dur_str, reason,
-            )
+            if self._log_ban_success_detail:
+                dur_str = f"{ban_duration}s" if ban_duration > 0 else "KALICI"
+                logger.info(
+                    "IP BANNED: %s | Duration: %s | Reason: %s",
+                    ip_str, dur_str, reason,
+                )
         else:
             # Rollback the optimistic add if ipset command failed
             if not force_reapply:
                 self._banned_ips.discard(ip_str)
+            if self._log_ban_failure_detail:
+                logger.warning(
+                    "BAN APPLY FAILED: IP=%s Duration=%s Reason=%s",
+                    ip_str,
+                    ban_duration,
+                    reason,
+                )
         return success
 
     async def enforce_db_bans(self, items: list[dict[str, object]]) -> dict[str, int]:
@@ -421,6 +442,15 @@ class FirewallManager:
                     stats["skipped"] += 1
                     continue
 
+                if self._whitelist and await self._whitelist.is_whitelisted(ip_value):
+                    stats["skipped"] += 1
+                    if self._log_whitelist_skip_detail:
+                        logger.warning(
+                            "Simulation replay skip: whitelisted IP %s",
+                            ip_value,
+                        )
+                    continue
+
                 duration_value = item.get("duration")
                 try:
                     duration = int(duration_value) if duration_value is not None else 0
@@ -438,8 +468,22 @@ class FirewallManager:
                     stats["applied"] += 1
                 else:
                     stats["failed"] += 1
+                    if self._log_ban_failure_detail:
+                        logger.warning(
+                            "Simulation replay failed for IP=%s Reason=%s",
+                            ip_value,
+                            reason,
+                        )
         finally:
             self._simulation_mode = previous_simulation
+
+        logger.info(
+            "Simulation replay summary: requested=%d applied=%d failed=%d skipped=%d",
+            stats["requested"],
+            stats["applied"],
+            stats["failed"],
+            stats["skipped"],
+        )
 
         return stats
 

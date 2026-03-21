@@ -1,3 +1,16 @@
+wardenips (0.4.0~beta10-1) stable; urgency=medium
+
+  * Add multi-Velocity parser support via plugins.minecraft.velocity.extra_log_paths
+  * Add ban logging policy controls (success summary, keep failure/whitelist details)
+  * Add local-first minecraft player intel cache (schema v7) with persistent upsert
+  * Add minecraft admin enhancements: banned toggle, country/asn filters, email pivots
+  * Add admin ban-asn action with 24h/7d/30d window and dry-run support
+  * Add minecraft-specific Discord webhook routing with panel test action
+  * Repair config.yaml plugin section integrity and keep backup template aligned
+  * Bump version to 0.4.0-beta-10
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 17:37:15 +03:00
+
 wardenips (0.4.0~beta9-1) stable; urgency=medium
 
   * Improve Minecraft admin event query: ASN label now includes organization name

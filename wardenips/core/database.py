@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -160,6 +160,33 @@ CREATE INDEX IF NOT EXISTS idx_mc_watchlist_player_active
 
 CREATE INDEX IF NOT EXISTS idx_mc_watchlist_created
     ON minecraft_watchlist(created_at);
+
+-- Persistent Minecraft player intel cache (local-first)
+CREATE TABLE IF NOT EXISTS minecraft_player_cache (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name           TEXT    NOT NULL UNIQUE,
+    email                 TEXT,
+    uuid                  TEXT,
+    ip                    TEXT,
+    creation_ip           TEXT,
+    creation_date         TEXT,
+    last_login            TEXT,
+    reg_ip                TEXT,
+    is_verified           INTEGER,
+    duplicate_email_count INTEGER NOT NULL DEFAULT 0,
+    source                TEXT    NOT NULL DEFAULT 'mysql',
+    updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mc_player_cache_email
+    ON minecraft_player_cache(email);
+
+CREATE INDEX IF NOT EXISTS idx_mc_player_cache_ip
+    ON minecraft_player_cache(ip);
+
+CREATE INDEX IF NOT EXISTS idx_mc_player_cache_updated
+    ON minecraft_player_cache(updated_at);
 
 -- Schema version table (for migrations)
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -286,6 +313,8 @@ class DatabaseManager:
                             await self._migrate_v4_to_v5_minecraft_alerts()
                         if current < 6:
                             await self._migrate_v5_to_v6_minecraft_watchlist()
+                        if current < 7:
+                            await self._migrate_v6_to_v7_minecraft_player_cache()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
@@ -376,6 +405,38 @@ class DatabaseManager:
 
             CREATE INDEX IF NOT EXISTS idx_mc_watchlist_created
                 ON minecraft_watchlist(created_at);
+            """
+        )
+
+    async def _migrate_v6_to_v7_minecraft_player_cache(self) -> None:
+        """Adds persistent Minecraft player intel cache table and indexes."""
+        await self._db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS minecraft_player_cache (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_name           TEXT    NOT NULL UNIQUE,
+                email                 TEXT,
+                uuid                  TEXT,
+                ip                    TEXT,
+                creation_ip           TEXT,
+                creation_date         TEXT,
+                last_login            TEXT,
+                reg_ip                TEXT,
+                is_verified           INTEGER,
+                duplicate_email_count INTEGER NOT NULL DEFAULT 0,
+                source                TEXT    NOT NULL DEFAULT 'mysql',
+                updated_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+                created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mc_player_cache_email
+                ON minecraft_player_cache(email);
+
+            CREATE INDEX IF NOT EXISTS idx_mc_player_cache_ip
+                ON minecraft_player_cache(ip);
+
+            CREATE INDEX IF NOT EXISTS idx_mc_player_cache_updated
+                ON minecraft_player_cache(updated_at);
             """
         )
 
@@ -1038,6 +1099,84 @@ class DatabaseManager:
         except Exception as exc:
             logger.error("Minecraft watchlist names query failed: %s", exc)
             return set()
+
+    async def get_minecraft_player_cache(self, player_name: str) -> Optional[Dict[str, Any]]:
+        normalized = str(player_name or "").strip()
+        if not normalized:
+            return None
+        try:
+            async with self._db.execute(
+                """
+                SELECT player_name, email, uuid, ip, creation_ip, creation_date,
+                       last_login, reg_ip, is_verified, duplicate_email_count,
+                       source, updated_at, created_at
+                FROM minecraft_player_cache
+                WHERE LOWER(player_name) = LOWER(?)
+                LIMIT 1
+                """,
+                (normalized,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+        except Exception as exc:
+            logger.error("Minecraft player cache query failed: %s", exc)
+            return None
+
+    async def upsert_minecraft_player_cache(
+        self,
+        player_name: str,
+        payload: Dict[str, Any],
+        source: str = "mysql",
+    ) -> int:
+        normalized = str(player_name or "").strip()
+        if not normalized:
+            raise WardenDatabaseError("player_name is required for minecraft cache upsert")
+
+        async with self._lock:
+            try:
+                async with self._db.execute(
+                    """
+                    INSERT INTO minecraft_player_cache
+                        (player_name, email, uuid, ip, creation_ip, creation_date,
+                         last_login, reg_ip, is_verified, duplicate_email_count,
+                         source, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(player_name) DO UPDATE SET
+                        email = excluded.email,
+                        uuid = excluded.uuid,
+                        ip = excluded.ip,
+                        creation_ip = excluded.creation_ip,
+                        creation_date = excluded.creation_date,
+                        last_login = excluded.last_login,
+                        reg_ip = excluded.reg_ip,
+                        is_verified = excluded.is_verified,
+                        duplicate_email_count = excluded.duplicate_email_count,
+                        source = excluded.source,
+                        updated_at = datetime('now')
+                    """,
+                    (
+                        normalized,
+                        payload.get("email"),
+                        payload.get("uuid"),
+                        payload.get("ip"),
+                        payload.get("creation_ip"),
+                        payload.get("creation_date"),
+                        payload.get("last_login"),
+                        payload.get("reg_ip"),
+                        payload.get("is_verified"),
+                        int(payload.get("duplicate_email_count") or 0),
+                        str(source or "mysql").strip().lower(),
+                    ),
+                ) as cursor:
+                    await self._db.commit()
+                    return int(cursor.lastrowid or 0)
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Failed to upsert minecraft player cache: {exc}"
+                ) from exc
 
     # ── Resource Management ──
 
