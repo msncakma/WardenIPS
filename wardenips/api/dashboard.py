@@ -619,6 +619,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
     self._app.router.add_get("/api/minecraft/summary", self._handle_minecraft_summary)
     self._app.router.add_get("/api/minecraft/events", self._handle_minecraft_events)
+    self._app.router.add_get("/api/minecraft/filter-options", self._handle_minecraft_filter_options)
     self._app.router.add_get("/api/minecraft/bursts", self._handle_minecraft_bursts)
     self._app.router.add_get("/api/minecraft/duplicates/email", self._handle_minecraft_duplicate_emails)
     self._app.router.add_get("/api/minecraft/entity-intel", self._handle_minecraft_entity_intel)
@@ -2635,7 +2636,36 @@ class DashboardAPI:
     hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
       timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
-      query = """
+      where_clauses = ["connection_type = 'minecraft'"]
+      params: list[object] = []
+      if hours_back > 0:
+        where_clauses.append(f"{timestamp_expr} >= strftime('%s', 'now', ? || ' hours')")
+        params.append(f"-{hours_back}")
+      if username:
+        where_clauses.append("LOWER(COALESCE(player_name, '')) = LOWER(?)")
+        params.append(username)
+      if source_ip:
+        where_clauses.append("source_ip = ?")
+        params.append(source_ip)
+      if event_type:
+        where_clauses.append("LOWER(COALESCE(details, '')) LIKE ?")
+        params.append(f'%\"event_type\": \"{event_type}%')
+      if country and len(country) == 2 and country.isalpha():
+        where_clauses.append("(UPPER(COALESCE(details, '')) LIKE ? OR UPPER(COALESCE(details, '')) LIKE ?)")
+        params.append(f'%\"COUNTRY_CODE\":\"{country}\"%')
+        params.append(f'%\"COUNTRY_CODE\": \"{country}\"%')
+      if asn_query:
+        asn_normalized = asn_query.upper().replace("AS", "").strip()
+        if asn_normalized.isdigit():
+          where_clauses.append("asn_number = ?")
+          params.append(int(asn_normalized))
+        else:
+          where_clauses.append("LOWER(COALESCE(asn_org, '')) LIKE ?")
+          params.append(f"%{asn_query.lower()}%")
+
+      where_sql = " AND ".join(where_clauses)
+
+      data_query = f"""
         SELECT id, timestamp, source_ip, player_name, connection_type,
                asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details,
                EXISTS(
@@ -2655,41 +2685,26 @@ class DashboardAPI:
                  WHERE bh_first.source_ip = connection_events.source_ip
                ) AS first_ban_unix
         FROM connection_events
-        WHERE connection_type = 'minecraft'
+        WHERE {where_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
       """
-      params: list[object] = []
-      if hours_back > 0:
-        query += f" AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
-        params.append(f"-{hours_back}")
-      if username:
-        query += " AND LOWER(COALESCE(player_name, '')) = LOWER(?)"
-        params.append(username)
-      if source_ip:
-        query += " AND source_ip = ?"
-        params.append(source_ip)
-      if event_type:
-        query += " AND LOWER(COALESCE(details, '')) LIKE ?"
-        params.append(f'%\"event_type\": \"{event_type}%')
-      if country and len(country) == 2 and country.isalpha():
-        query += " AND (UPPER(COALESCE(details, '')) LIKE ? OR UPPER(COALESCE(details, '')) LIKE ?)"
-        params.append(f'%\"COUNTRY_CODE\":\"{country}\"%')
-        params.append(f'%\"COUNTRY_CODE\": \"{country}\"%')
-      if asn_query:
-        asn_normalized = asn_query.upper().replace("AS", "").strip()
-        if asn_normalized.isdigit():
-          query += " AND asn_number = ?"
-          params.append(int(asn_normalized))
-        else:
-          query += " AND LOWER(COALESCE(asn_org, '')) LIKE ?"
-          params.append(f"%{asn_query.lower()}%")
-      query += " ORDER BY id DESC LIMIT ? OFFSET ?"
-      params.extend([limit, offset])
+      data_params = [*params, limit, offset]
+
+      count_query = f"""
+        SELECT COUNT(*)
+        FROM connection_events
+        WHERE {where_sql}
+      """
 
       async with self._db._lock:
-        async with self._db._db.execute(query, tuple(params)) as cursor:
+        async with self._db._db.execute(data_query, tuple(data_params)) as cursor:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
           events = [dict(zip(columns, row)) for row in rows]
+        async with self._db._db.execute(count_query, tuple(params)) as count_cursor:
+          count_row = await count_cursor.fetchone()
+          total = int((count_row[0] or 0) if count_row else 0)
 
       watch_names = await self._db.get_minecraft_watchlist_names()
 
@@ -2711,7 +2726,84 @@ class DashboardAPI:
         event["is_post_ban"] = bool(banned_current and first_ban_unix > 0 and event_ts_unix >= first_ban_unix)
         event["is_ban_trigger_event"] = bool(banned_current and first_ban_unix > 0 and abs(event_ts_unix - first_ban_unix) <= 60)
 
-      return web.json_response({"events": events, "count": len(events), "limit": limit, "offset": offset})
+      return web.json_response({
+        "events": events,
+        "count": len(events),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": bool(offset + len(events) < total),
+      })
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_minecraft_filter_options(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    username = str(request.query.get("username", "")).strip()
+    source_ip = str(request.query.get("ip", "")).strip()
+    event_type = str(request.query.get("event_type", "")).strip().lower()
+    hours_back = max(int(request.query.get("hours_back", "0")), 0)
+    max_scan = min(max(int(request.query.get("scan_limit", "5000")), 200), 20000)
+    try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      query = """
+        SELECT source_ip, asn_number, asn_org, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft'
+      """
+      params: list[object] = []
+      if hours_back > 0:
+        query += f" AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
+        params.append(f"-{hours_back}")
+      if username:
+        query += " AND LOWER(COALESCE(player_name, '')) = LOWER(?)"
+        params.append(username)
+      if source_ip:
+        query += " AND source_ip = ?"
+        params.append(source_ip)
+      if event_type:
+        query += " AND LOWER(COALESCE(details, '')) LIKE ?"
+        params.append(f'%\"event_type\": \"{event_type}%')
+      query += " ORDER BY id DESC LIMIT ?"
+      params.append(max_scan)
+
+      async with self._db._lock:
+        async with self._db._db.execute(query, tuple(params)) as cursor:
+          rows = await cursor.fetchall()
+
+      country_set: set[str] = set()
+      asn_map: dict[str, str] = {}
+      for source_ip_value, asn_number, asn_org, details_raw in rows:
+        details_obj = {}
+        if isinstance(details_raw, str) and details_raw:
+          try:
+            details_obj = json.loads(details_raw)
+          except Exception:
+            details_obj = {}
+
+        cc = self._resolve_country_code(details_obj, source_ip_value)
+        if cc:
+          country_set.add(cc)
+
+        asn_num = str(asn_number or "").strip()
+        asn_org_text = str(asn_org or "").strip()
+        if asn_num:
+          value = f"AS{asn_num}"
+          label = f"AS{asn_num} · {asn_org_text}" if asn_org_text else value
+          asn_map[value] = label
+        elif asn_org_text:
+          asn_map[asn_org_text] = asn_org_text
+
+      asn_items = [
+        {"value": value, "label": asn_map[value]}
+        for value in sorted(asn_map.keys())
+      ]
+      return web.json_response({
+        "countries": sorted(country_set),
+        "asns": asn_items,
+      })
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -3524,9 +3616,11 @@ body{margin:0;font-family:"Aptos","Segoe UI",sans-serif;color:var(--txt);backgro
 .k{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 .v{font-size:1.5rem;font-weight:700;margin-top:6px}
 .panel{margin-top:14px;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
-.controls{display:grid;grid-template-columns:1.1fr 1fr 1fr 170px auto;gap:10px;margin-bottom:12px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}
 .intel-controls{display:grid;grid-template-columns:200px 1fr auto;gap:10px;margin-top:10px}
 .top-controls{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;align-items:center}
+.pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;flex-wrap:wrap}
+.pagination .meta{color:var(--muted);font-size:.84rem}
 .status{display:none;margin-top:10px;padding:10px 12px;border-radius:10px;border:1px solid #33506d;background:#102238;color:#cae6ff;font-size:.84rem}
 .status.err{display:block;border-color:#6f2f3f;background:#331823;color:#ffd5dc}
 .status.ok{display:block;border-color:#2d5a46;background:#123126;color:#b9f6d8}
@@ -3626,12 +3720,24 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <option value="168">Last 7d</option>
           <option value="0">All time</option>
         </select>
+        <select id="eventPageSize" title="Rows per page">
+          <option value="25">25 rows</option>
+          <option value="50" selected>50 rows</option>
+          <option value="100">100 rows</option>
+        </select>
         <button id="btnFilter">Apply</button>
       </div>
       <table>
         <thead><tr><th>Time</th><th>IP</th><th>Player</th><th>Type</th><th>Risk</th><th>ASN</th><th>Country</th></tr></thead>
         <tbody id="eventRows"></tbody>
       </table>
+      <div class="pagination">
+        <div style="display:flex;gap:8px">
+          <button id="eventPrevBtn" class="ghost">Previous</button>
+          <button id="eventNextBtn" class="ghost">Next</button>
+        </div>
+        <div id="eventPageInfo" class="meta">Page 1 / 1 · 0 events</div>
+      </div>
     </div>
 
     <div class="panel">
@@ -3765,6 +3871,34 @@ function eventType(details){
   return (details&&details.event_type)||'';
 }
 
+function eventFilters(){
+  return {
+    user: document.getElementById('fUser').value.trim(),
+    ip: document.getElementById('fIp').value.trim(),
+    type: document.getElementById('fType').value,
+    country: document.getElementById('fCountry').value || '',
+    asn: document.getElementById('fAsn').value || '',
+    hours: document.getElementById('fHours').value || '24',
+  };
+}
+
+function currentEventPageSize(){
+  const parsed = parseInt(document.getElementById('eventPageSize').value || '50', 10);
+  if(!Number.isFinite(parsed) || parsed <= 0){ return 50; }
+  return parsed;
+}
+
+async function loadEventFilterOptions(){
+  const filters = eventFilters();
+  const q = '/api/minecraft/filter-options?hours_back='+encodeURIComponent(filters.hours)
+    +'&username='+encodeURIComponent(filters.user)
+    +'&ip='+encodeURIComponent(filters.ip)
+    +'&event_type='+encodeURIComponent(filters.type);
+  const data = await api(q);
+  syncSelectOptions(document.getElementById('fCountry'), data.countries || [], 'All countries');
+  syncAsnOptions(document.getElementById('fAsn'), data.asns || []);
+}
+
 async function loadSummary(){
   const hours = encodeURIComponent(document.getElementById('summaryHours').value || '24');
   const s = await api('/api/minecraft/summary?hours=' + hours);
@@ -3778,31 +3912,33 @@ async function loadSummary(){
     : 'Enforcement may be enabled for Minecraft';
 }
 
-async function loadEvents(){
+async function loadEvents(resetPage){
+  if(resetPage){
+    window.minecraftEventsPage = 1;
+  }
+  window.minecraftEventsPage = Math.max(parseInt(window.minecraftEventsPage || 1, 10) || 1, 1);
+  const pageSize = currentEventPageSize();
+  const offset = (window.minecraftEventsPage - 1) * pageSize;
   const showBanned = !!window.minecraftShowBanned;
-  const user = encodeURIComponent(document.getElementById('fUser').value.trim());
-  const ip = encodeURIComponent(document.getElementById('fIp').value.trim());
-  const type = encodeURIComponent(document.getElementById('fType').value);
-  const country = encodeURIComponent(document.getElementById('fCountry').value || '');
-  const asn = encodeURIComponent(document.getElementById('fAsn').value || '');
-  const hours = encodeURIComponent(document.getElementById('fHours').value || '24');
-  const q = '/api/minecraft/events?limit=150&hours_back='+hours+'&username='+user+'&ip='+ip+'&event_type='+type+'&country='+country+'&asn='+asn;
+  const filters = eventFilters();
+  const q = '/api/minecraft/events?limit='+encodeURIComponent(pageSize)
+    +'&offset='+encodeURIComponent(offset)
+    +'&hours_back='+encodeURIComponent(filters.hours)
+    +'&username='+encodeURIComponent(filters.user)
+    +'&ip='+encodeURIComponent(filters.ip)
+    +'&event_type='+encodeURIComponent(filters.type)
+    +'&country='+encodeURIComponent(filters.country)
+    +'&asn='+encodeURIComponent(filters.asn);
   const data = await api(q);
   const allEvents = (data.events || []);
   const events = showBanned ? allEvents : allEvents.filter(e => !(e.is_post_ban || e.is_firewall_blocked || e.is_ban_trigger_event));
 
-  const countryValues = [];
-  const asnValues = [];
-  allEvents.forEach(e => {
-    const cc = String(e.country_code || '').toUpperCase();
-    if(cc && /^[A-Z]{2}$/.test(cc)){ countryValues.push(cc); }
-    const num = e.asn_number ? ('AS' + String(e.asn_number)) : '';
-    const org = String(e.asn_org || '').trim();
-    const filterValue = num || org;
-    if(filterValue){ asnValues.push(filterValue); }
-  });
-  syncSelectOptions(document.getElementById('fCountry'), countryValues, 'All countries');
-  syncSelectOptions(document.getElementById('fAsn'), asnValues, 'All ASN');
+  const total = Math.max(parseInt(data.total || allEvents.length, 10) || 0, 0);
+  const maxPage = Math.max(Math.ceil(total / pageSize), 1);
+  if(window.minecraftEventsPage > maxPage){
+    window.minecraftEventsPage = maxPage;
+    return loadEvents(false);
+  }
 
   const rows = events.map(e => {
     const asnNum = e.asn_number ? ('AS'+String(e.asn_number)) : '';
@@ -3825,6 +3961,11 @@ async function loadEvents(){
     '</tr>';
   }).join('');
   document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="7">No events</td></tr>';
+
+  const pageInfo = 'Page '+String(window.minecraftEventsPage)+' / '+String(maxPage)+' · '+String(total)+' events';
+  document.getElementById('eventPageInfo').textContent = pageInfo;
+  document.getElementById('eventPrevBtn').disabled = window.minecraftEventsPage <= 1;
+  document.getElementById('eventNextBtn').disabled = window.minecraftEventsPage >= maxPage;
 }
 
 async function loadBursts(){
@@ -3977,6 +4118,23 @@ function syncSelectOptions(selectEl, values, allLabel){
   }
 }
 
+function syncAsnOptions(selectEl, items){
+  if(!selectEl){ return; }
+  const previous = selectEl.value || '';
+  const normalized = Array.isArray(items) ? items : [];
+  const options = ['<option value="">All ASN</option>'];
+  normalized.forEach(item => {
+    const value = typeof item === 'string' ? item : String((item && item.value) || '');
+    const label = typeof item === 'string' ? item : String((item && item.label) || value);
+    if(!value){ return; }
+    options.push('<option value="'+esc(value)+'">'+esc(label)+'</option>');
+  });
+  selectEl.innerHTML = options.join('');
+  if(normalized.some(item => (typeof item === 'string' ? item : String((item && item.value) || '')) === previous) || previous === ''){
+    selectEl.value = previous;
+  }
+}
+
 function syncIntelActionButtons(type){
   const normalized = String(type || '').toLowerCase();
   const isUser = normalized === 'user';
@@ -4063,7 +4221,8 @@ async function searchIntel(type, value){
 let refreshTimer = null;
 async function refreshAll(){
   try {
-    await Promise.all([loadSummary(), loadEvents(), loadBursts(), loadDuplicateEmails(), loadWatchlist(), loadParserHealth()]);
+    await loadEventFilterOptions();
+    await Promise.all([loadSummary(), loadEvents(false), loadBursts(), loadDuplicateEmails(), loadWatchlist(), loadParserHealth()]);
     markRefreshTime();
     clearStatus();
   } catch (err) {
@@ -4084,11 +4243,14 @@ function setupAutoRefresh(){
   refreshTimer = setInterval(refreshAll, 10000);
 }
 
-document.getElementById('btnFilter').addEventListener('click', loadEvents);
-document.getElementById('fCountry').addEventListener('change', loadEvents);
-document.getElementById('fAsn').addEventListener('change', loadEvents);
+document.getElementById('btnFilter').addEventListener('click', function(){
+  Promise.all([loadEventFilterOptions(), loadEvents(true)]).catch(err => setStatus('Filter apply failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('fCountry').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('Country filter failed: ' + String(err && err.message ? err.message : err), true)); });
+document.getElementById('fAsn').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('ASN filter failed: ' + String(err && err.message ? err.message : err), true)); });
 document.getElementById('summaryHours').addEventListener('change', refreshAll);
 document.getElementById('fHours').addEventListener('change', refreshAll);
+document.getElementById('eventPageSize').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('Page size update failed: ' + String(err && err.message ? err.message : err), true)); });
 document.getElementById('autoRefresh').addEventListener('change', setupAutoRefresh);
 document.getElementById('testTelegramBtn').addEventListener('click', function(){
   sendTestNotification('telegram').catch(err => setStatus('Telegram test failed: ' + String(err && err.message ? err.message : err), true));
@@ -4099,7 +4261,16 @@ document.getElementById('testMcDiscordBtn').addEventListener('click', function()
 document.getElementById('toggleBannedBtn').addEventListener('click', function(){
   window.minecraftShowBanned = !window.minecraftShowBanned;
   this.textContent = window.minecraftShowBanned ? 'Hide banned events' : 'Show banned events';
-  loadEvents().catch(err => setStatus('Event reload failed: ' + String(err && err.message ? err.message : err), true));
+  loadEvents(false).catch(err => setStatus('Event reload failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('eventPrevBtn').addEventListener('click', function(){
+  if((window.minecraftEventsPage || 1) <= 1){ return; }
+  window.minecraftEventsPage = Math.max((window.minecraftEventsPage || 1) - 1, 1);
+  loadEvents(false).catch(err => setStatus('Previous page load failed: ' + String(err && err.message ? err.message : err), true));
+});
+document.getElementById('eventNextBtn').addEventListener('click', function(){
+  window.minecraftEventsPage = Math.max((window.minecraftEventsPage || 1) + 1, 1);
+  loadEvents(false).catch(err => setStatus('Next page load failed: ' + String(err && err.message ? err.message : err), true));
 });
 document.getElementById('intelType').addEventListener('change', function(){
   syncIntelActionButtons(this.value);
@@ -4170,6 +4341,7 @@ document.body.addEventListener('dblclick', function(ev){
 
 refreshAll();
 window.minecraftShowBanned = false;
+window.minecraftEventsPage = 1;
 document.getElementById('toggleBannedBtn').textContent = 'Show banned events';
 syncIntelActionButtons(document.getElementById('intelType').value);
 setupAutoRefresh();

@@ -1,3 +1,14 @@
+wardenips (0.4.0~beta13-1) stable; urgency=medium
+
+  * Improve Minecraft admin layout for event query controls
+  * Add server-side pagination metadata to /api/minecraft/events (total/has_more)
+  * Add page-by-page navigation (prev/next) and page-size selector in Minecraft admin
+  * Add backend filter-options endpoint for selectable All Country / All ASN lists
+  * Keep country/asn selectors populated from backend options instead of current page only
+  * Bump version to 0.4.0-beta-13
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 18:01:14 +03:00
+
 wardenips (0.4.0~beta12-1) stable; urgency=medium
 
   * Hotfix: Add missing DashboardAPI._safe_int helper used by minecraft events API
