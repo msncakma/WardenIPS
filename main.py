@@ -204,13 +204,15 @@ class WardenIPS:
             ssh_plugin = SSHPlugin(self._config)
             self._plugin_manager.register(ssh_plugin)
 
-        # Minecraft Plugin
+        # Minecraft backend log plugin (Paper/Spigot/etc.)
         if self._config.get("plugins.minecraft.enabled", True):
             mc_plugin = MinecraftPlugin(self._config)
             self._plugin_manager.register(mc_plugin)
-            if self._config.get("plugins.minecraft.velocity.enabled", False):
-                velocity_plugin = VelocityPlugin(self._config)
-                self._plugin_manager.register(velocity_plugin)
+
+        # Velocity proxy log plugin can run independently from minecraft backend logs.
+        if self._config.get("plugins.minecraft.velocity.enabled", False):
+            velocity_plugin = VelocityPlugin(self._config)
+            self._plugin_manager.register(velocity_plugin)
 
         # Nginx Plugin
         if self._config.get("plugins.nginx.enabled", False):
