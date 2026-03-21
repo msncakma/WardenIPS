@@ -531,6 +531,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
+    self._app.router.add_post("/api/admin/bulk-ip-action", self._handle_admin_bulk_ip_action)
     self._app.router.add_post("/api/admin/unban-ip", self._handle_admin_unban_ip)
     self._app.router.add_get("/api/admin/whitelist", self._handle_admin_get_whitelist)
     self._app.router.add_post("/api/admin/whitelist/add", self._handle_admin_add_whitelist)
@@ -613,7 +614,7 @@ class DashboardAPI:
   async def _handle_events(self, request: web.Request) -> web.Response:
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
-    limit = min(int(request.query.get("limit", "50")), 200)
+    limit = min(max(int(request.query.get("limit", "50")), 1), 2000)
     try:
       async with self._db._lock:
         async with self._db._db.execute(
@@ -851,13 +852,14 @@ class DashboardAPI:
       return self._json_auth_error()
     hours = min(int(request.query.get("hours", "24")), 168)
     try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
       async with self._db._lock:
         async with self._db._db.execute(
-          """
+          f"""
           SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
                COUNT(*) as count
           FROM connection_events
-          WHERE COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')
+          WHERE {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')
           GROUP BY hour
           ORDER BY hour ASC
           """,
@@ -1684,6 +1686,176 @@ class DashboardAPI:
         "message": f"{ip_value}: " + ", ".join(result_parts) + ".",
         "ban_applied": ban_applied,
         "reported": reported,
+      }
+    )
+
+  async def _handle_admin_bulk_ip_action(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    action = str(payload.get("action", "ban") or "ban").strip().lower()
+    if action not in {"ban", "report", "report_and_ban"}:
+      return web.json_response(
+        {
+          "error": "invalid_action",
+          "message": "action must be one of: ban, report, report_and_ban.",
+        },
+        status=400,
+      )
+
+    lines_text = str(payload.get("lines", "") or "")
+    if not lines_text.strip():
+      return web.json_response(
+        {"error": "invalid_lines", "message": "Provide at least one IP in lines."},
+        status=400,
+      )
+
+    try:
+      duration = max(int(payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))), 0)
+    except Exception:
+      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
+
+    reason_base = str(payload.get("reason", "") or "").strip()
+    if not reason_base:
+      reason_base = "[ADMIN] Bulk action from dashboard"
+
+    risk_score_value = payload.get("risk_score", 100)
+    try:
+      risk_score = min(max(int(risk_score_value), 0), 100)
+    except Exception:
+      risk_score = 100
+
+    raw_categories = payload.get("categories", [14])
+    categories: list[int] = []
+    if isinstance(raw_categories, list):
+      for item in raw_categories:
+        try:
+          value = int(item)
+        except Exception:
+          continue
+        if 1 <= value <= 24 and value not in categories:
+          categories.append(value)
+    if not categories:
+      categories = [14]
+
+    entries: list[tuple[str, str]] = []
+    for raw_line in lines_text.splitlines():
+      line = str(raw_line or "").strip()
+      if not line or line.startswith("#"):
+        continue
+      if "|" in line:
+        ip_part, note_part = line.split("|", 1)
+        ip_value = ip_part.strip()
+        per_line_note = note_part.strip()
+      else:
+        ip_value = line
+        per_line_note = ""
+      if not ip_value:
+        continue
+      entries.append((ip_value, per_line_note))
+
+    if not entries:
+      return web.json_response(
+        {"error": "invalid_lines", "message": "No valid IP lines were found."},
+        status=400,
+      )
+
+    results: list[dict[str, object]] = []
+    for ip_value, per_line_note in entries:
+      item = {
+        "ip": ip_value,
+        "ban_applied": False,
+        "reported": False,
+        "ok": False,
+        "message": "",
+      }
+      try:
+        ipaddress.ip_address(ip_value)
+      except Exception:
+        item["message"] = "Invalid IP format."
+        results.append(item)
+        continue
+
+      final_reason = reason_base
+      if per_line_note:
+        final_reason = f"{reason_base} | {per_line_note}"
+
+      ban_applied = False
+      if action in {"ban", "report_and_ban"}:
+        ban_applied = await self._firewall.ban_ip(ip_value, duration=duration, reason=final_reason)
+        if ban_applied:
+          await self._db.log_ban(ip_value, final_reason, risk_score, duration)
+          await self._notifier.notify_ban(
+            ip=ip_value,
+            reason=final_reason,
+            risk=risk_score,
+            duration=duration,
+            plugin="admin",
+          )
+
+      reported = False
+      if action in {"report", "report_and_ban"} and self._abuse_reporter:
+        try:
+          reported = await self._abuse_reporter.report_ip(
+            ip=ip_value,
+            categories=categories,
+            comment=f"{final_reason} | Trigger: admin bulk {action}",
+          )
+        except Exception:
+          reported = False
+
+      item["ban_applied"] = ban_applied
+      item["reported"] = reported
+      if action == "ban":
+        item["ok"] = bool(ban_applied)
+        item["message"] = "ban applied" if ban_applied else "ban skipped"
+      elif action == "report":
+        item["ok"] = bool(reported)
+        item["message"] = "reported" if reported else "report skipped"
+      else:
+        item["ok"] = bool(ban_applied or reported)
+        parts = ["ban applied" if ban_applied else "ban skipped", "reported" if reported else "report skipped"]
+        item["message"] = ", ".join(parts)
+      results.append(item)
+
+    success_count = sum(1 for item in results if item.get("ok"))
+    fail_count = len(results) - success_count
+    reported_count = sum(1 for item in results if item.get("reported"))
+    ban_count = sum(1 for item in results if item.get("ban_applied"))
+
+    await self._log_audit(
+      request,
+      "admin.bulk_ip_action",
+      actor_username=actor,
+      details={
+        "action": action,
+        "total": len(results),
+        "success": success_count,
+        "failed": fail_count,
+        "reported": reported_count,
+        "ban_applied": ban_count,
+        "categories": categories,
+      },
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "action": action,
+        "total": len(results),
+        "success": success_count,
+        "failed": fail_count,
+        "reported": reported_count,
+        "ban_applied": ban_count,
+        "categories": categories,
+        "message": f"Bulk action completed: {success_count}/{len(results)} successful.",
+        "results": results,
       }
     )
 
@@ -3220,7 +3392,7 @@ async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
   var bn=await A('/api/bans');
-  var ev=await A('/api/events?limit=300');
+  var ev=await A('/api/events?limit=2000');
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var ti=await A('/api/blocklist');
@@ -3503,6 +3675,22 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
             <div class="toolbar-grid">
               <input id="manualBanReason" class="ctrl search" placeholder="Optional reason (default: [ADMIN] Manual ban from dashboard)">
             </div>
+            <div class="toolbar-grid stack-label"><div class="sub">Bulk IP Action (one per line)</div></div>
+            <div class="toolbar-grid query-grid">
+              <select id="bulkActionType" class="ctrl">
+                <option value="ban">Ban</option>
+                <option value="report_and_ban">Report + Ban</option>
+                <option value="report">Report Only</option>
+              </select>
+              <input id="bulkReason" class="ctrl search" placeholder="Reason/comment for all lines (optional)">
+              <input id="bulkCategories" class="ctrl" placeholder="Report categories: 14,15">
+            </div>
+            <div class="toolbar-grid three">
+              <textarea id="bulkIpLines" class="config-editor" style="min-height:110px;grid-column:1/-1" spellcheck="false" placeholder="203.0.113.5&#10;198.51.100.20 | ssh brute force&#10;2001:db8::7 | scanner"></textarea>
+              <input id="bulkDuration" class="ctrl" type="number" min="0" value="0" placeholder="Duration (sec)">
+              <button id="bulkActionBtn" class="btn cyan">Run Bulk Action</button>
+            </div>
+            <div class="sub">Line format: <span class="mono">IP</span> or <span class="mono">IP | note</span>. Notes are appended to report comment/reason.</div>
             <div class="toolbar-grid stack-label"><div class="sub">Manual Unban</div></div>
             <div class="toolbar-grid">
               <input id="manualIp" class="ctrl search" placeholder="Enter an IP address to unban from the firewall">
@@ -4004,11 +4192,40 @@ function flattenConfigEntries(node, prefix, output){
     flattenConfigEntries(node[key], nextPath, output);
   });
 }
+function isManagedConfigPath(path){
+  var managed={
+    'general.log_level':true,
+    'general.analysis_interval':true,
+    'successful_logins.enabled':true,
+    'successful_logins.reset_risk_score':true,
+    'dashboard.public_dashboard':true,
+    'dashboard.session_ttl':true,
+    'dashboard.login_rate_limit_per_minute':true,
+    'firewall.simulation_mode':true,
+    'firewall.ban_threshold':true,
+    'firewall.ipset.default_ban_duration':true,
+    'notifications.telegram.enabled':true,
+    'notifications.telegram.chat_id':true,
+    'notifications.discord.enabled':true,
+    'notifications.discord.webhook_url':true,
+    'notifications.rules.on_ban':true,
+    'notifications.rules.on_burst':true,
+    'notifications.rules.on_manual_ban':true,
+    'notifications.rules.min_risk_score':true,
+    'plugins.ssh.enabled':true,
+    'plugins.minecraft.enabled':true,
+    'plugins.minecraft.global_connection_burst_threshold':true,
+    'plugins.minecraft.global_connection_burst_window_seconds':true,
+    'plugins.portscan.ignored_ports':true
+  };
+  return !!managed[String(path||'')];
+}
 function renderAllConfigControls(){
   var host=$('#cfgAllSettings');
   if(!host){ return; }
   var entries=[];
   flattenConfigEntries(state.config||{}, '', entries);
+  entries=entries.filter(function(entry){ return !isManagedConfigPath(entry.path); });
   if(!entries.length){
     host.innerHTML='<div class="empty">No config keys found.</div>';
     return;
@@ -4052,22 +4269,37 @@ function collectAllConfigControlChanges(){
     var path=String(control.getAttribute('data-allcfg-path')||'').trim();
     var kind=String(control.getAttribute('data-allcfg-kind')||'string');
     if(!path){ return; }
+    if(isManagedConfigPath(path)){ return; }
     if(kind==='boolean'){
       changes[path]=!!control.checked;
       return;
     }
     var raw=String(control.value||'');
     if(kind==='number'){
+      if(raw.trim()===''){
+        var existingNumber=getConfigValue(path, 0);
+        changes[path]=Number.isFinite(existingNumber)?existingNumber:Number(existingNumber)||0;
+        return;
+      }
       var parsed=Number(raw);
       if(!Number.isFinite(parsed)){ throw new Error('Invalid number for '+path); }
       changes[path]=parsed;
       return;
     }
     if(kind==='json'){
+      if(raw.trim()===''){
+        var existingList=getConfigValue(path, []);
+        changes[path]=Array.isArray(existingList)?existingList:[];
+        return;
+      }
       try{
         changes[path]=raw.trim()?JSON.parse(raw):[];
       }catch(error){
-        throw new Error('Invalid JSON array for '+path);
+        var fallbackItems=raw.split(/\r?\n|,/).map(function(item){ return String(item||'').trim(); }).filter(Boolean).map(function(item){
+          return /^\d+$/.test(item) ? parseInt(item,10) : item;
+        });
+        if(!fallbackItems.length){ throw new Error('Invalid JSON array for '+path); }
+        changes[path]=fallbackItems;
       }
       return;
     }
@@ -4385,6 +4617,48 @@ async function runRecordQuery(){
   renderQueryResults(payload.records||[]);
   setStatus('ok','Query complete', 'Found '+N(payload.count||0)+' record(s) for '+(payload.field||field).toUpperCase()+'.');
 }
+function parseBulkCategories(raw){
+  var seen={};
+  return String(raw||'').split(/[\s,]+/).map(function(item){ return item.trim(); }).filter(Boolean).map(function(item){ return parseInt(item,10); }).filter(function(num){
+    if(!Number.isFinite(num) || num<1 || num>24 || seen[num]){ return false; }
+    seen[num]=true;
+    return true;
+  });
+}
+async function runBulkIpAction(){
+  var action=String($('#bulkActionType').value||'ban');
+  var lines=String($('#bulkIpLines').value||'').trim();
+  if(!lines){
+    setStatus('err','Missing bulk lines','Add one IP per line before running bulk action.');
+    return;
+  }
+  var reason=String($('#bulkReason').value||'').trim();
+  var duration=parseInt($('#bulkDuration').value,10);
+  if(!Number.isFinite(duration)||duration<0){ duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10); }
+  if(!Number.isFinite(duration)||duration<0){ duration=0; }
+  var categories=parseBulkCategories($('#bulkCategories').value);
+  if((action==='report' || action==='report_and_ban') && !categories.length){ categories=[14]; }
+  var payload=await api('/api/admin/bulk-ip-action', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      action:action,
+      lines:lines,
+      reason:reason,
+      duration:duration,
+      categories:categories
+    })
+  });
+  if(!payload){ return; }
+  var message='Action: '+String(payload.action||action)+' · Success '+N(payload.success||0)+'/'+N(payload.total||0)+' · Ban '+N(payload.ban_applied||0)+' · Report '+N(payload.reported||0);
+  if((payload.categories||[]).length){ message += ' · Categories: '+(payload.categories||[]).join(','); }
+  var failedRows=(payload.results||[]).filter(function(item){ return !item.ok; }).slice(0,4);
+  if(failedRows.length){
+    message += ' · Failed: '+failedRows.map(function(item){ return String(item.ip||'?')+' ('+String(item.message||'skipped')+')'; }).join('; ');
+  }
+  setStatus((payload.failed||0)>0?'err':'ok','Bulk action completed', message);
+  await refresh();
+}
 function renderTopPortscannedPorts(){
   var allPorts=Array.isArray(state.topPorts)?state.topPorts:[];
   var limit=state.topPortsExpanded?allPorts.length:8;
@@ -4541,7 +4815,7 @@ async function performAction(path, body, successTitle, successMessage){ var payl
 async function logout(message){ clearInterval(timer); clearTimeout(idleTimer); await fetch('/api/logout', {method:'POST'}).catch(function(){}); if(message){ sessionStorage.setItem('wardenips_logout_message', message); } window.location.href='/login?next=/admin'; }
 function bindActivity(){ ['mousemove','mousedown','keydown','scroll','touchstart','click'].forEach(function(name){ document.addEventListener(name, function(){ debounce('activity', handleUserActivity, 150); }, {passive:true}); }); resetIdleTimer(); }
 function bind(){
-  ['globalSearch','eventPluginFilter','eventThreatFilter','eventCountryFilter','eventBanStateFilter','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
+  ['globalSearch','eventPluginFilter','eventThreatFilter','eventCountryFilter','eventBanStateFilter','banSort','ipFamilyFilter','manualIp','manualWhitelist','manualBanIp','manualBanDuration','manualBanReason','cfgPortscanIgnoredPortsEntry','bulkReason','bulkCategories'].forEach(function(id){ $('#'+id).addEventListener('input', function(){ debounce(id, function(){ renderEvents(); renderBans(); renderFirewall(); }, 220); }); $('#'+id).addEventListener('change', function(){ debounce(id+'-change', function(){ renderEvents(); renderBans(); renderFirewall(); }, 120); }); });
   $('#themeToggle').addEventListener('click', function(){ applyTheme(state.theme==='dark' ? 'light' : 'dark'); });
   $('#dismissUpdateNoticeBtn').addEventListener('click', function(){ var info=state.updateInfo; var key=getDismissKey(info); if(key){ try{ localStorage.setItem(key,'1'); }catch(error){} } $('#updateNotice').hidden=true; });
   $('#openConfigBtn').addEventListener('click', function(){ handleUserActivity(); openConfigModal(); });
@@ -4562,6 +4836,7 @@ function bind(){
   $('#adminIncludeHoneypot').addEventListener('change', function(){ handleUserActivity(); refresh(); });
   $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
   $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
+  $('#bulkActionBtn').addEventListener('click', async function(){ handleUserActivity(); await runBulkIpAction(); });
   $('#saveAdminTotpBtn').addEventListener('click', async function(){
     handleUserActivity();
     var enabled=$('#adminTotpEnabled').checked;
