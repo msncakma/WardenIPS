@@ -1,3 +1,14 @@
+wardenips (0.4.0~beta17-1) stable; urgency=medium
+
+  * Add Minecraft intel actions: direct ban-ip and ban-email endpoints/actions
+  * Add email-targeted ban flow using local events, cache, and MySQL matches
+  * Sync MySQL registration matches into connection events as mysql_register_sync records
+  * Add pagination to public Recent Events with backend offset/total metadata
+  * Replace heavy /api/events?limit=2000 fetch with page-based loading
+  * Bump version to 0.4.0-beta-17
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 19:02:00 +03:00
+
 wardenips (0.4.0~beta16-1) stable; urgency=medium
 
   * Hide Account Intel panel for IP, ASN and Email entity-intel scopes

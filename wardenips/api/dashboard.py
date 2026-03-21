@@ -628,6 +628,8 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/minecraft/watchlist/add", self._handle_admin_minecraft_watchlist_add)
     self._app.router.add_post("/api/admin/minecraft/watchlist/remove", self._handle_admin_minecraft_watchlist_remove)
     self._app.router.add_post("/api/admin/minecraft/ban-player", self._handle_admin_minecraft_ban_player)
+    self._app.router.add_post("/api/admin/minecraft/ban-ip", self._handle_admin_minecraft_ban_ip)
+    self._app.router.add_post("/api/admin/minecraft/ban-email", self._handle_admin_minecraft_ban_email)
     self._app.router.add_post("/api/admin/minecraft/ban-asn", self._handle_admin_minecraft_ban_asn)
     self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
@@ -717,8 +719,17 @@ class DashboardAPI:
     if not self._check_public_dashboard_access(request):
       return self._json_auth_error()
     limit = min(max(int(request.query.get("limit", "50")), 1), 2000)
+    offset = max(int(request.query.get("offset", "0")), 0)
     try:
       async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT COUNT(*)
+          FROM connection_events
+          """
+        ) as total_cursor:
+          total_row = await total_cursor.fetchone()
+          total_count = int((total_row[0] if total_row else 0) or 0)
         async with self._db._db.execute(
           """
           SELECT id, timestamp, source_ip, player_name,
@@ -744,8 +755,9 @@ class DashboardAPI:
           FROM connection_events
           ORDER BY id DESC
           LIMIT ?
+          OFFSET ?
           """,
-          (limit,),
+          (limit, offset),
         ) as cursor:
           rows = await cursor.fetchall()
           columns = [d[0] for d in cursor.description]
@@ -840,7 +852,16 @@ class DashboardAPI:
           event["ban_state"] = "firewall_blocked"
         else:
           event["ban_state"] = "pre_ban"
-      return web.json_response({"events": events, "count": len(events)})
+      return web.json_response(
+        {
+          "events": events,
+          "count": len(events),
+          "total": total_count,
+          "limit": limit,
+          "offset": offset,
+          "has_more": (offset + len(events)) < total_count,
+        }
+      )
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
@@ -3025,6 +3046,75 @@ class DashboardAPI:
           seen.add(ip_value)
         return deduped
 
+  async def _get_minecraft_email_intel_targets(self, email: str, limit: int = 1000) -> dict:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+      return {"ips": [], "users": [], "mysql_matches": []}
+
+    max_limit = min(max(int(limit), 1), 3000)
+    email_pattern = normalized.replace("*", "%")
+    users: set[str] = set()
+    ips: set[str] = set()
+
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT player_name, source_ip, details
+          FROM connection_events
+          WHERE connection_type = 'minecraft'
+            AND (
+              LOWER(COALESCE(details, '')) LIKE ?
+              OR LOWER(COALESCE(details, '')) LIKE ?
+            )
+          ORDER BY id DESC
+          LIMIT ?
+          """,
+          (f'%"email": "{email_pattern}"%', f'%"email":"{email_pattern}"%', max_limit),
+        ) as cursor:
+          rows = await cursor.fetchall()
+      for player_name, source_ip, details_raw in rows:
+        player_text = str(player_name or "").strip()
+        if player_text:
+          users.add(player_text)
+        ip_text = str(source_ip or "").strip()
+        if ip_text:
+          ips.add(ip_text)
+        mail = self._extract_email_from_event_details(details_raw)
+        if mail and mail.strip().lower() != normalized:
+          continue
+    except Exception:
+      rows = []
+
+    cache_relations = await self._query_minecraft_cache_relations("email", normalized)
+    for user_text in cache_relations.get("users", []):
+      user_value = str(user_text or "").strip()
+      if user_value:
+        users.add(user_value)
+    for ip_text in cache_relations.get("ips", []):
+      ip_value = str(ip_text or "").strip()
+      if ip_value:
+        ips.add(ip_value)
+
+    mysql_email_matches = await self._fetch_mysql_players_by_email(normalized)
+    mysql_matches = list(mysql_email_matches.get("matches") or []) if isinstance(mysql_email_matches, dict) else []
+    for match in mysql_matches:
+      if not isinstance(match, dict):
+        continue
+      user_text = str(match.get("username") or "").strip()
+      if user_text:
+        users.add(user_text)
+      for candidate in (match.get("ip"), match.get("reg_ip"), match.get("creation_ip")):
+        ip_text = str(candidate or "").strip()
+        if ip_text:
+          ips.add(ip_text)
+
+    return {
+      "ips": sorted(ips),
+      "users": sorted(users),
+      "mysql_matches": mysql_matches,
+    }
+
   async def _get_minecraft_asn_ips(self, asn_number: int, hours_back: int, limit: int = 2000) -> list[str]:
     max_limit = min(max(int(limit), 1), 5000)
     normalized_hours = max(int(hours_back), 1)
@@ -3168,6 +3258,159 @@ class DashboardAPI:
         "duration": duration,
         "results": results,
         "message": f"Ban action finished for {player_name}: {applied}/{len(ips)} applied.",
+      }
+    )
+
+  async def _handle_admin_minecraft_ban_ip(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    ip_value = str(payload.get("ip", "")).strip()
+    if not ip_value:
+      return web.json_response({"error": "invalid_ip", "message": "ip is required."}, status=400)
+    try:
+      ipaddress.ip_address(ip_value)
+    except Exception:
+      return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
+
+    reason = str(payload.get("reason", "")).strip()
+    if not reason:
+      return web.json_response({"error": "invalid_reason", "message": "reason is required for ban-ip action."}, status=400)
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = 0
+
+    ban_reason = f"[ADMIN][MINECRAFT_IP] {reason} | ip={ip_value}"
+    banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=ban_reason)
+    if not banned:
+      return web.json_response(
+        {
+          "ok": False,
+          "message": f"Ban request for {ip_value} was skipped (already banned, whitelisted, or blocked by safety checks).",
+        },
+        status=409,
+      )
+
+    await self._db.log_ban(ip_value, ban_reason, 100, duration)
+    if self._notifier:
+      await self._notifier.notify_ban(
+        ip=ip_value,
+        reason=ban_reason,
+        risk=100,
+        duration=duration,
+        plugin="minecraft",
+      )
+    await self._log_audit(
+      request,
+      "admin.minecraft.ban_ip",
+      actor_username=actor,
+      target=ip_value,
+      details={"ip": ip_value, "duration": duration, "reason": reason},
+    )
+    return web.json_response(
+      {
+        "ok": True,
+        "ip": ip_value,
+        "duration": duration,
+        "message": f"Ban action finished for {ip_value}.",
+      }
+    )
+
+  async def _handle_admin_minecraft_ban_email(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    email_value = str(payload.get("email", "")).strip().lower()
+    if not email_value:
+      return web.json_response({"error": "invalid_email", "message": "email is required."}, status=400)
+
+    reason = str(payload.get("reason", "")).strip()
+    if not reason:
+      return web.json_response({"error": "invalid_reason", "message": "reason is required for ban-email action."}, status=400)
+
+    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
+    try:
+      duration = max(int(duration_value), 0)
+    except Exception:
+      duration = 0
+
+    targets = await self._get_minecraft_email_intel_targets(email_value, limit=3000)
+    ips = list(targets.get("ips") or [])
+    users = list(targets.get("users") or [])
+    mysql_matches = list(targets.get("mysql_matches") or [])
+
+    if mysql_matches:
+      await self._sync_mysql_registration_events(mysql_matches)
+
+    if not ips:
+      return web.json_response(
+        {"error": "no_email_ips", "message": f"No known IPs found for email {email_value}."},
+        status=404,
+      )
+
+    applied = 0
+    failed = 0
+    results: list[dict[str, object]] = []
+    for ip_value in ips:
+      ban_reason = f"[ADMIN][MINECRAFT_EMAIL] {reason} | email={email_value}"
+      banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=ban_reason)
+      if banned:
+        applied += 1
+        await self._db.log_ban(ip_value, ban_reason, 100, duration)
+        if self._notifier:
+          await self._notifier.notify_ban(
+            ip=ip_value,
+            reason=ban_reason,
+            risk=100,
+            duration=duration,
+            plugin="minecraft",
+          )
+      else:
+        failed += 1
+      results.append({"ip": ip_value, "ban_applied": bool(banned)})
+
+    await self._log_audit(
+      request,
+      "admin.minecraft.ban_email",
+      actor_username=actor,
+      target=email_value,
+      details={
+        "email": email_value,
+        "duration": duration,
+        "reason": reason,
+        "users": users,
+        "candidate_count": len(ips),
+        "applied": applied,
+        "failed": failed,
+      },
+    )
+
+    return web.json_response(
+      {
+        "ok": True,
+        "email": email_value,
+        "users": users,
+        "candidate_count": len(ips),
+        "applied": applied,
+        "failed": failed,
+        "duration": duration,
+        "results": results,
+        "message": f"Ban email completed for {email_value}: {applied}/{len(ips)} applied.",
       }
     )
 
@@ -3455,6 +3698,17 @@ class DashboardAPI:
       mysql_email_matches = await self._fetch_mysql_players_by_email(value)
       if isinstance(mysql_email_matches, dict) and mysql_email_matches.get("found"):
         mysql_matches = list(mysql_email_matches.get("matches") or [])
+        if mysql_matches:
+          synced = await self._sync_mysql_registration_events(mysql_matches)
+          if synced > 0:
+            try:
+              async with self._db._lock:
+                async with self._db._db.execute(query, params) as cursor:
+                  rows = await cursor.fetchall()
+                  cols = [d[0] for d in cursor.description]
+                  local_events = [dict(zip(cols, row)) for row in rows]
+            except Exception:
+              pass
 
     watch_names = await self._db.get_minecraft_watchlist_names()
     cache_relations = await self._query_minecraft_cache_relations(entity_type, value)
@@ -3686,12 +3940,72 @@ class DashboardAPI:
     except Exception as exc:
       return {"enabled": True, "found": False, "reason": f"mysql_error:{exc}", "matches": []}
 
-  async def _backfill_mysql_player_snapshot(self, payload: dict) -> None:
+  async def _sync_mysql_registration_events(self, matches: list[dict]) -> int:
+    synced = 0
+    for match in matches:
+      if not isinstance(match, dict):
+        continue
+      try:
+        inserted = await self._backfill_mysql_player_snapshot(
+          match,
+          event_type="mysql_register_sync",
+          dedupe_by_creation=True,
+        )
+        if inserted:
+          synced += 1
+      except Exception:
+        continue
+    return synced
+
+  async def _backfill_mysql_player_snapshot(
+    self,
+    payload: dict,
+    event_type: str = "mysql_backfill",
+    dedupe_by_creation: bool = False,
+  ) -> bool:
     try:
       source_ip = str(payload.get("ip") or payload.get("creation_ip") or payload.get("reg_ip") or "0.0.0.0").strip()
       username = str(payload.get("username") or "unknown").strip() or "unknown"
+      creation_date = str(payload.get("creation_date") or "").strip()
+
+      if dedupe_by_creation:
+        detail_event_probe = f'"event_type": "{event_type}"'
+        detail_creation_probe = f'"creation_date": "{creation_date}"' if creation_date else ""
+        async with self._db._lock:
+          if detail_creation_probe:
+            async with self._db._db.execute(
+              """
+              SELECT id
+              FROM connection_events
+              WHERE connection_type = 'minecraft'
+                AND LOWER(COALESCE(player_name, '')) = LOWER(?)
+                AND COALESCE(details, '') LIKE ?
+                AND COALESCE(details, '') LIKE ?
+              ORDER BY id DESC
+              LIMIT 1
+              """,
+              (username, f"%{detail_event_probe}%", f"%{detail_creation_probe}%"),
+            ) as cursor:
+              exists_row = await cursor.fetchone()
+          else:
+            async with self._db._db.execute(
+              """
+              SELECT id
+              FROM connection_events
+              WHERE connection_type = 'minecraft'
+                AND LOWER(COALESCE(player_name, '')) = LOWER(?)
+                AND COALESCE(details, '') LIKE ?
+              ORDER BY id DESC
+              LIMIT 1
+              """,
+              (username, f"%{detail_event_probe}%"),
+            ) as cursor:
+              exists_row = await cursor.fetchone()
+        if exists_row:
+          return False
+
       details = {
-        "event_type": "mysql_backfill",
+        "event_type": event_type,
         "parser_source": "mysql_player_db",
         "email": payload.get("email"),
         "uuid": payload.get("uuid"),
@@ -3722,8 +4036,9 @@ class DashboardAPI:
           ),
         )
         await self._db._db.commit()
+      return True
     except Exception:
-      return
+      return False
 
   @staticmethod
   def _extract_email_from_event_details(details_raw: object) -> str:
@@ -4012,6 +4327,8 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <button class="ghost" id="intelWatchRemoveBtn">Watch -</button>
           <button class="ghost" id="intelWhitelistBtn">Whitelist Player</button>
           <button class="ghost" id="intelBanPlayerBtn">Ban Player</button>
+          <button class="ghost" id="intelBanIpBtn" style="display:none">Ban IP</button>
+          <button class="ghost" id="intelBanEmailBtn" style="display:none">Ban Email</button>
           <button class="ghost" id="intelBanAsnBtn" style="display:none">Ban ASN</button>
           <button class="ghost" id="intelCloseBtn">Close</button>
         </div>
@@ -4362,12 +4679,44 @@ function syncAsnOptions(selectEl, items){
 function syncIntelActionButtons(type){
   const normalized = String(type || '').toLowerCase();
   const isUser = normalized === 'user';
+  const isIp = normalized === 'ip';
+  const isEmail = normalized === 'email';
   const isAsn = normalized === 'asn';
   document.getElementById('intelWatchAddBtn').style.display = isUser ? '' : 'none';
   document.getElementById('intelWatchRemoveBtn').style.display = isUser ? '' : 'none';
   document.getElementById('intelWhitelistBtn').style.display = isUser ? '' : 'none';
   document.getElementById('intelBanPlayerBtn').style.display = isUser ? '' : 'none';
+  document.getElementById('intelBanIpBtn').style.display = isIp ? '' : 'none';
+  document.getElementById('intelBanEmailBtn').style.display = isEmail ? '' : 'none';
   document.getElementById('intelBanAsnBtn').style.display = isAsn ? '' : 'none';
+}
+
+async function banIpIntel(ipValue){
+  const value = String(ipValue || '').trim();
+  if(!value){ setStatus('Ban IP failed: IP is empty.', true); return; }
+  const reason = window.prompt('Ban reason for '+value+':', 'Suspicious activity from minecraft dashboard');
+  if(!reason){ return; }
+  await api('/api/admin/minecraft/ban-ip', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ip: value, reason: reason, duration: 0})
+  });
+  setStatus('Ban action sent for IP: '+value, false);
+  await refreshAll();
+}
+
+async function banEmailIntel(emailValue){
+  const value = String(emailValue || '').trim();
+  if(!value){ setStatus('Ban email failed: email is empty.', true); return; }
+  const reason = window.prompt('Ban reason for email '+value+':', 'Compromised/shared account indicator from minecraft dashboard');
+  if(!reason){ return; }
+  const payload = await api('/api/admin/minecraft/ban-email', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({email: value, reason: reason, duration: 0})
+  });
+  setStatus('Ban email completed for '+value+': '+String(payload.applied || 0)+'/'+String(payload.candidate_count || 0)+' applied.', false);
+  await refreshAll();
 }
 
 function syncIntelAccountPanel(type){
@@ -4409,6 +4758,7 @@ async function searchIntel(type, value){
   if(!value){ return; }
   try {
     openIntelModal();
+    syncIntelActionButtons(type);
     syncIntelAccountPanel(type);
     document.getElementById('intelTitle').textContent = 'Entity Intel: '+value;
     document.getElementById('intelMeta').textContent = 'Loading...';
@@ -4558,6 +4908,16 @@ document.getElementById('intelBanPlayerBtn').addEventListener('click', async fun
   const current = selectedIntel();
   if(current.type !== 'user'){ setStatus('Ban action requires user type.', true); return; }
   try { await banPlayer(current.value); } catch(err){ setStatus('Ban action failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelBanIpBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'ip'){ setStatus('Ban IP action requires IP type.', true); return; }
+  try { await banIpIntel(current.value); } catch(err){ setStatus('Ban IP action failed: ' + String(err && err.message ? err.message : err), true); }
+});
+document.getElementById('intelBanEmailBtn').addEventListener('click', async function(){
+  const current = selectedIntel();
+  if(current.type !== 'email'){ setStatus('Ban email action requires email type.', true); return; }
+  try { await banEmailIntel(current.value); } catch(err){ setStatus('Ban email action failed: ' + String(err && err.message ? err.message : err), true); }
 });
 document.getElementById('intelBanAsnBtn').addEventListener('click', async function(){
   const current = selectedIntel();
@@ -5282,6 +5642,21 @@ footer a:hover{text-decoration:underline}
       <div class="pb" style="max-height:400px">
         <table class="t" id="evt"><thead><tr><th>Time</th><th>Source IP</th><th>Plugin</th><th>User</th><th>Origin</th><th>Risk</th><th>Threat</th><th>ASN</th><th>Advice</th></tr></thead><tbody id="evb"></tbody></table>
         <div class="em" id="eve" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><div>No events recorded yet</div></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:10px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <label for="evPageSize" style="font-size:.74rem;color:var(--dim)">Rows</label>
+            <select id="evPageSize" class="ctrl" style="padding:6px 10px;font-size:.78rem;min-width:84px">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+            </select>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button id="evPrevBtn" class="btn ghost small">Previous</button>
+            <button id="evNextBtn" class="btn ghost small">Next</button>
+            <span id="evPageInfo" style="font-size:.74rem;color:var(--dim)">Page 1 / 1</span>
+          </div>
+        </div>
       </div>
     </div>
     <div class="pl ai d3">
@@ -5402,6 +5777,9 @@ var GEO_SEEN=false;
 var evShowBanned=true;
 var includeHoneypotPorts=true;
 var lastEvData=[];
+var evPage=1;
+var evPageSize=100;
+var evTotal=0;
 var CENTROIDS={US:[37.1,-95.7],CA:[56.1,-106.3],MX:[23.6,-102.5],BR:[-14.2,-51.9],AR:[-38.4,-63.6],CL:[-35.7,-71.5],CO:[4.6,-74.1],PE:[-9.2,-75.0],GB:[55.3,-3.4],IE:[53.1,-8.2],FR:[46.2,2.2],DE:[51.2,10.4],NL:[52.1,5.3],BE:[50.5,4.5],ES:[40.4,-3.7],PT:[39.4,-8.2],IT:[41.9,12.5],CH:[46.8,8.2],AT:[47.5,14.6],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],DK:[56.2,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],RO:[45.9,24.9],UA:[48.3,31.2],TR:[38.9,35.2],RU:[61.5,105.3],SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,35.0],EG:[26.8,30.8],ZA:[-30.6,22.9],NG:[9.1,8.7],KE:[-0.0,37.9],ET:[9.1,40.5],MA:[31.8,-7.1],DZ:[28.0,1.7],IN:[20.6,78.9],PK:[30.4,69.3],BD:[23.7,90.3],CN:[35.9,104.1],JP:[36.2,138.2],KR:[35.9,127.8],TW:[23.7,121.0],HK:[22.3,114.2],SG:[1.3,103.8],ID:[-2.5,118.0],MY:[4.2,102.0],TH:[15.8,100.9],VN:[14.0,108.3],PH:[12.9,121.8],AU:[-25.3,133.8],NZ:[-40.9,174.8]};
 function applyTheme(theme){
   var next=theme==='light'?'light':'dark';
@@ -5530,6 +5908,43 @@ function renderEventsTable(events){
     return '<tr class="'+rowClass+'"><td style="white-space:nowrap;font-size:.75rem">'+T(e.timestamp_unix||e.timestamp)+'</td><td class="h" title="'+E(e.source_ip)+'">'+E((e.source_ip||'').substring(0,14))+'&hellip;'+bannedMark+'</td><td><span class="pt">'+E(pl)+'</span></td><td>'+E(e.player_name||'-')+'</td><td style="font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(origin)+'">'+E(origin)+'</td><td><span class="rb '+RC(e.risk_score)+'">'+e.risk_score+'</span></td><td><span class="tg '+tcl+'">'+E(tc)+'</span></td><td style="font-size:.75rem;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(e.asn_org)+'">'+E(e.asn_org||'-')+'</td><td><span class="advice-tip" title="'+E(advice)+'">i</span></td></tr>';
   }).join('');
 }
+
+function currentEventsPageSize(){
+  var el=$('#evPageSize');
+  var parsed=parseInt((el&&el.value)||String(evPageSize||100),10);
+  if(!Number.isFinite(parsed)||parsed<=0){ return 100; }
+  return parsed;
+}
+
+function renderEventsPager(){
+  evPageSize=currentEventsPageSize();
+  var total=Math.max(parseInt(evTotal||0,10)||0,0);
+  var maxPage=Math.max(Math.ceil(total/evPageSize),1);
+  if(evPage>maxPage){ evPage=maxPage; }
+  var info='Page '+String(evPage)+' / '+String(maxPage)+' · '+N(total)+' total events';
+  var infoEl=$('#evPageInfo');
+  if(infoEl){ infoEl.textContent=info; }
+  var prevBtn=$('#evPrevBtn');
+  var nextBtn=$('#evNextBtn');
+  if(prevBtn){ prevBtn.disabled=evPage<=1; }
+  if(nextBtn){ nextBtn.disabled=evPage>=maxPage; }
+}
+
+async function fetchEventsPage(){
+  evPageSize=currentEventsPageSize();
+  var offset=Math.max((evPage-1)*evPageSize,0);
+  var ev=await A('/api/events?limit='+evPageSize+'&offset='+offset);
+  if(ev&&typeof ev.total==='number'){ evTotal=ev.total; }
+  var maxPage=Math.max(Math.ceil((Math.max(parseInt(evTotal||0,10)||0,0))/evPageSize),1);
+  if(evPage>maxPage){
+    evPage=maxPage;
+    offset=Math.max((evPage-1)*evPageSize,0);
+    ev=await A('/api/events?limit='+evPageSize+'&offset='+offset);
+    if(ev&&typeof ev.total==='number'){ evTotal=ev.total; }
+  }
+  renderEventsPager();
+  return ev;
+}
 function renderTimelineFromEvents(events){
   var tc2=$('#tlc'),tl2=$('#tll');
   if(!tc2||!tl2){ return; }
@@ -5583,7 +5998,7 @@ async function refresh(){
   var h=await A('/api/health');
   var s=await A('/api/stats');
   var bn=await A('/api/bans');
-  var ev=await A('/api/events?limit=2000');
+  var ev=await fetchEventsPage();
   var th=await A('/api/threat-distribution');
   var pg=await A('/api/plugin-stats');
   var ti=await A('/api/blocklist');
@@ -5659,9 +6074,27 @@ $('#evBannedToggle').addEventListener('click',function(){
   renderEventsTable(lastEvData);
   renderTimelineFromEvents(lastEvData);
 });
+$('#evPrevBtn').addEventListener('click',function(){
+  if(evPage<=1){ return; }
+  evPage-=1;
+  refresh();
+});
+$('#evNextBtn').addEventListener('click',function(){
+  var pageSize=currentEventsPageSize();
+  var maxPage=Math.max(Math.ceil((Math.max(parseInt(evTotal||0,10)||0,0))/pageSize),1);
+  if(evPage>=maxPage){ return; }
+  evPage+=1;
+  refresh();
+});
+$('#evPageSize').addEventListener('change',function(){
+  evPage=1;
+  evPageSize=currentEventsPageSize();
+  refresh();
+});
 $('#coTimeRange').addEventListener('change',function(){ refreshCountry(); });
 $('#atTimeRange').addEventListener('change',function(){ refreshTopPorts(); });
 $('#atHoneypotToggle').addEventListener('change',function(){ refreshTopPorts(); });
+renderEventsPager();
 refresh();
 setInterval(refresh,R);
 })();
