@@ -3092,9 +3092,9 @@ class DashboardAPI:
 
     mysql_payload = None
     mysql_backfilled = False
-    if entity_type == "user" and not local_events:
+    if entity_type == "user":
       mysql_payload = await self._fetch_mysql_player_by_username(value)
-      if mysql_payload and mysql_payload.get("found"):
+      if (not local_events) and mysql_payload and mysql_payload.get("found"):
         await self._backfill_mysql_player_snapshot(mysql_payload)
         mysql_backfilled = True
         try:
@@ -3283,7 +3283,12 @@ th,td{text-align:left;padding:10px;border-bottom:1px solid #23394f;font-size:.9r
 th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 .chip{display:inline-flex;padding:2px 8px;border-radius:999px;border:1px solid #35506e;color:#cde3ff;background:#12263d;font-size:.72rem}
 .chip.warn{border-color:#6f5b2c;background:#2e2512;color:#ffd98a}
+.chip.type-connect{border-color:#2d6848;background:#143626;color:#b8f5ce}
+.chip.type-disconnect{border-color:#6a4a23;background:#372412;color:#ffd4a0}
+.chip.type-error{border-color:#6e2d3b;background:#381621;color:#ffc1cb}
+.chip.type-other{border-color:#35506e;background:#12263d;color:#cde3ff}
 .link-btn{border:0;background:transparent;color:#8ed3ff;text-decoration:underline;cursor:pointer;padding:0}
+.copyable{cursor:copy}
 .modal{position:fixed;inset:0;background:#04070db8;display:none;align-items:center;justify-content:center;padding:16px}
 .modal.open{display:flex}
 .modal-card{width:min(100%,1000px);max-height:88vh;overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
@@ -3425,6 +3430,12 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <tbody id="intelRows"></tbody>
         </table>
       </div>
+      <div class="panel" style="margin-top:12px">
+        <h4 style="margin:0 0 8px 0">Account Intel</h4>
+        <table>
+          <tbody id="intelAccountRows"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -3462,6 +3473,20 @@ function selectedIntel(){
   };
 }
 
+function flagFromCountry(cc){
+  const code = String(cc || '').trim().toUpperCase();
+  if(!/^[A-Z]{2}$/.test(code)){ return ''; }
+  return code.replace(/./g, ch => String.fromCodePoint(127397 + ch.charCodeAt(0)));
+}
+
+function eventTypeClass(t){
+  const v = String(t || '').toLowerCase();
+  if(v.indexOf('connect') !== -1 || v === 'login' || v === 'velocity_connected'){ return 'type-connect'; }
+  if(v.indexOf('disconnect') !== -1 || v === 'ip_disconnect' || v === 'velocity_disconnect'){ return 'type-disconnect'; }
+  if(v.indexOf('failed') !== -1 || v.indexOf('error') !== -1 || v === 'failed_packet'){ return 'type-error'; }
+  return 'type-other';
+}
+
 function openIntelModal(){ document.getElementById('intelModal').classList.add('open'); }
 function closeIntelModal(){ document.getElementById('intelModal').classList.remove('open'); }
 
@@ -3491,16 +3516,23 @@ async function loadEvents(){
   const q = '/api/minecraft/events?limit=150&hours_back='+hours+'&username='+user+'&ip='+ip+'&event_type='+type;
   const data = await api(q);
   const rows = (data.events || []).map(e => {
-    const asnLabel = e.asn_number ? ('AS'+String(e.asn_number)) : '-';
+    const asnNum = e.asn_number ? ('AS'+String(e.asn_number)) : '';
+    const asnOrg = String(e.asn_org || '').trim();
+    const asnLabel = (asnNum && asnOrg) ? (asnNum + ' · ' + asnOrg) : (asnNum || asnOrg || '-');
     const watch = e.is_watchlisted_player ? ' <span class="chip warn">WATCH</span>' : '';
+    const evType = e.event_type || eventType(e.details) || '-';
+    const evClass = eventTypeClass(evType);
+    const cc = String(e.country_code || '').toUpperCase();
+    const flag = flagFromCountry(cc);
+    const countryLabel = cc ? (flag ? (flag + ' ' + cc) : cc) : '-';
     return '<tr>'+
-      '<td>'+esc(e.timestamp)+'</td>'+
-      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(e.source_ip)+'">'+esc(e.source_ip)+'</button></td>'+
-      '<td>'+(e.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'+watch):'-')+'</td>'+
-      '<td><span class="chip">'+esc(e.event_type || eventType(e.details) || '-')+'</span></td>'+
-      '<td>'+esc(e.risk_score || 0)+'</td>'+
-      '<td>'+(e.asn_number?('<button class="link-btn" data-intel-type="asn" data-intel-value="AS'+esc(String(e.asn_number))+'">'+esc(asnLabel)+'</button>'):'-')+'</td>'+
-      '<td>'+esc(e.country_code || '-')+'</td>'+
+      '<td class="copyable">'+esc(e.timestamp)+'</td>'+
+      '<td><button class="link-btn copyable" data-intel-type="ip" data-intel-value="'+esc(e.source_ip)+'">'+esc(e.source_ip)+'</button></td>'+
+      '<td>'+(e.player_name?('<button class="link-btn copyable" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'+watch):'-')+'</td>'+
+      '<td><span class="chip '+evClass+' copyable">'+esc(evType)+'</span></td>'+
+      '<td class="copyable">'+esc(e.risk_score || 0)+'</td>'+
+      '<td>'+(e.asn_number?('<button class="link-btn copyable" data-intel-type="asn" data-intel-value="AS'+esc(String(e.asn_number))+'">'+esc(asnLabel)+'</button>'):('<span class="copyable">'+esc(asnLabel)+'</span>'))+'</td>'+
+      '<td class="copyable">'+esc(countryLabel)+'</td>'+
     '</tr>';
   }).join('');
   document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="7">No events</td></tr>';
@@ -3511,11 +3543,11 @@ async function loadBursts(){
   const data = await api('/api/minecraft/bursts?limit=80&hours_back='+hours);
   const rows = (data.alerts || []).map(a =>
     '<tr>'+
-      '<td>'+esc(a.timestamp)+'</td>'+
-      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(a.source_ip)+'">'+esc(a.source_ip)+'</button></td>'+
-      '<td>'+esc(a.event_count)+'</td>'+
-      '<td>'+esc(a.window_seconds)+'</td>'+
-      '<td>'+esc(a.plugin_name)+'</td>'+
+      '<td class="copyable">'+esc(a.timestamp)+'</td>'+
+      '<td><button class="link-btn copyable" data-intel-type="ip" data-intel-value="'+esc(a.source_ip)+'">'+esc(a.source_ip)+'</button></td>'+
+      '<td class="copyable">'+esc(a.event_count)+'</td>'+
+      '<td class="copyable">'+esc(a.window_seconds)+'</td>'+
+      '<td class="copyable">'+esc(a.plugin_name)+'</td>'+
     '</tr>'
   ).join('');
   document.getElementById('burstRows').innerHTML = rows || '<tr><td colspan="5">No burst alerts</td></tr>';
@@ -3526,11 +3558,11 @@ async function loadDuplicateEmails(){
   const data = await api('/api/minecraft/duplicates/email?limit=80&hours_back=' + hours);
   const rows = (data.findings || []).map(f =>
     '<tr>'+
-      '<td>'+esc(f.timestamp)+'</td>'+
-      '<td>'+(f.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(f.player_name)+'">'+esc(f.player_name)+'</button>'):'-')+'</td>'+
-      '<td>'+esc(f.email || '-')+'</td>'+
-      '<td>'+esc(f.duplicate_email_count || 0)+'</td>'+
-      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(f.source_ip)+'">'+esc(f.source_ip)+'</button></td>'+
+      '<td class="copyable">'+esc(f.timestamp)+'</td>'+
+      '<td>'+(f.player_name?('<button class="link-btn copyable" data-intel-type="user" data-intel-value="'+esc(f.player_name)+'">'+esc(f.player_name)+'</button>'):'-')+'</td>'+
+      '<td class="copyable">'+esc(f.email || '-')+'</td>'+
+      '<td class="copyable">'+esc(f.duplicate_email_count || 0)+'</td>'+
+      '<td><button class="link-btn copyable" data-intel-type="ip" data-intel-value="'+esc(f.source_ip)+'">'+esc(f.source_ip)+'</button></td>'+
     '</tr>'
   ).join('');
   document.getElementById('duplicateRows').innerHTML = rows || '<tr><td colspan="5">No duplicate-email signals</td></tr>';
@@ -3540,10 +3572,10 @@ async function loadWatchlist(){
   const data = await api('/api/admin/minecraft/watchlist?limit=200');
   const rows = (data.entries || []).map(w =>
     '<tr>'+
-      '<td><button class="link-btn" data-intel-type="user" data-intel-value="'+esc(w.player_name)+'">'+esc(w.player_name)+'</button></td>'+
-      '<td>'+esc(w.reason || '-')+'</td>'+
-      '<td>'+esc(w.actor_username || '-')+'</td>'+
-      '<td>'+esc(w.updated_at || w.created_at || '-')+'</td>'+
+      '<td><button class="link-btn copyable" data-intel-type="user" data-intel-value="'+esc(w.player_name)+'">'+esc(w.player_name)+'</button></td>'+
+      '<td class="copyable">'+esc(w.reason || '-')+'</td>'+
+      '<td class="copyable">'+esc(w.actor_username || '-')+'</td>'+
+      '<td class="copyable">'+esc(w.updated_at || w.created_at || '-')+'</td>'+
       '<td><button class="ghost" data-watch-remove="'+esc(w.player_name)+'">Remove</button></td>'+
     '</tr>'
   ).join('');
@@ -3650,16 +3682,33 @@ async function searchIntel(type, value){
 
     const rows = (payload.events || []).map(e => {
       const t = eventType(e.details) || '-';
+      const asnText = e.asn_org || (e.asn_number ? ('AS'+String(e.asn_number)) : '-');
       return '<tr>'
-        +'<td>'+esc(e.timestamp)+'</td>'
-        +'<td>'+esc(e.source_ip||'-')+'</td>'
-        +'<td>'+esc(e.player_name||'-')+'</td>'
-        +'<td>'+esc(t)+'</td>'
-        +'<td>'+esc(e.risk_score||0)+'</td>'
-        +'<td>'+esc(e.asn_org || (e.asn_number ? ('AS'+String(e.asn_number)) : '-'))+'</td>'
+        +'<td class="copyable">'+esc(e.timestamp)+'</td>'
+        +'<td class="copyable">'+esc(e.source_ip||'-')+'</td>'
+        +'<td class="copyable">'+esc(e.player_name||'-')+'</td>'
+        +'<td><span class="chip '+eventTypeClass(t)+' copyable">'+esc(t)+'</span></td>'
+        +'<td class="copyable">'+esc(e.risk_score||0)+'</td>'
+        +'<td class="copyable">'+esc(asnText)+'</td>'
         +'</tr>';
     }).join('');
     document.getElementById('intelRows').innerHTML = rows || '<tr><td colspan="6">No timeline data</td></tr>';
+
+    const accountRows = [];
+    const addAccountRow = function(label, val){
+      const value = (val === undefined || val === null || String(val).trim() === '') ? '-' : String(val);
+      accountRows.push('<tr><th style="width:220px">'+esc(label)+'</th><td class="copyable">'+esc(value)+'</td></tr>');
+    };
+    addAccountRow('Email', mysqlInfo.email || '-');
+    addAccountRow('UUID', mysqlInfo.uuid || '-');
+    addAccountRow('First Registration', mysqlInfo.creation_date || '-');
+    addAccountRow('Last Login', mysqlInfo.last_login || '-');
+    addAccountRow('Last Known IP', mysqlInfo.ip || '-');
+    addAccountRow('Registration IP', mysqlInfo.reg_ip || '-');
+    addAccountRow('Creation IP', mysqlInfo.creation_ip || '-');
+    addAccountRow('Verified', (mysqlInfo.is_verified === undefined || mysqlInfo.is_verified === null) ? '-' : String(mysqlInfo.is_verified));
+    addAccountRow('Duplicate Email Count', mysqlInfo.duplicate_email_count || '-');
+    document.getElementById('intelAccountRows').innerHTML = accountRows.join('');
   } catch (err) {
     setStatus('Entity intel request failed: ' + String(err && err.message ? err.message : err), true);
   }
@@ -3735,6 +3784,20 @@ document.body.addEventListener('click', function(ev){
     document.getElementById('intelType').value = type;
     document.getElementById('intelValue').value = value;
     searchIntel(type, value);
+  }
+});
+
+document.body.addEventListener('dblclick', function(ev){
+  const el = ev.target.closest('.copyable');
+  if(!el){ return; }
+  const raw = String((el.getAttribute('data-copy') || el.textContent || '')).trim();
+  if(!raw || raw === '-'){ return; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(raw)
+      .then(function(){ setStatus('Copied: ' + raw, false); })
+      .catch(function(){ setStatus('Copy failed for value: ' + raw, true); });
+  } else {
+    setStatus('Clipboard API is not available in this browser.', true);
   }
 });
 

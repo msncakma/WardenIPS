@@ -1,3 +1,14 @@
+wardenips (0.4.0~beta9-1) stable; urgency=medium
+
+  * Improve Minecraft admin event query: ASN label now includes organization name
+  * Add event-type color badges and country flag rendering in Minecraft views
+  * Expand entity intel modal with account details (email, registration/login, known IPs)
+  * Add double-click copy interaction for intel and table fields
+  * Improve user intel enrichment by always fetching MySQL profile payload
+  * Bump version to 0.4.0-beta-9
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 17:06:26 +03:00
+
 wardenips (0.4.0~beta8-1) stable; urgency=medium
 
   * Add minecraft operator actions: ban-player, whitelist-player, watchlist add/remove/list
