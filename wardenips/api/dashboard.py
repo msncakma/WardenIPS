@@ -47,6 +47,11 @@ from urllib.parse import quote, urlencode
 from aiohttp import web
 import yaml
 
+try:
+  import pymysql  # type: ignore
+except Exception:
+  pymysql = None
+
 from wardenips import __author__, __version__
 from wardenips.core.auth import (
   build_totp_qr_data_url,
@@ -533,6 +538,7 @@ class DashboardAPI:
     self._app.router.add_get("/api/minecraft/events", self._handle_minecraft_events)
     self._app.router.add_get("/api/minecraft/bursts", self._handle_minecraft_bursts)
     self._app.router.add_get("/api/minecraft/duplicates/email", self._handle_minecraft_duplicate_emails)
+    self._app.router.add_get("/api/minecraft/entity-intel", self._handle_minecraft_entity_intel)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
@@ -2643,49 +2649,256 @@ class DashboardAPI:
     except Exception as exc:
       return web.json_response({"error": str(exc)}, status=500)
 
+  async def _handle_minecraft_entity_intel(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+
+    entity_type = str(request.query.get("type", "")).strip().lower()
+    value = str(request.query.get("value", "")).strip()
+    if entity_type not in {"user", "ip", "asn"} or not value:
+      return web.json_response({"error": "invalid_query"}, status=400)
+
+    local_events = []
+    query = ""
+    params: tuple[object, ...] = ()
+
+    if entity_type == "user":
+      query = """
+        SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft' AND player_name = ?
+        ORDER BY id DESC
+        LIMIT 200
+      """
+      params = (value,)
+    elif entity_type == "ip":
+      query = """
+        SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft' AND source_ip = ?
+        ORDER BY id DESC
+        LIMIT 200
+      """
+      params = (value,)
+    else:
+      asn_value = value.upper().replace("AS", "").strip()
+      if not asn_value.isdigit():
+        return web.json_response({"error": "invalid_asn"}, status=400)
+      query = """
+        SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft' AND asn_number = ?
+        ORDER BY id DESC
+        LIMIT 200
+      """
+      params = (int(asn_value),)
+
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(query, params) as cursor:
+          rows = await cursor.fetchall()
+          cols = [d[0] for d in cursor.description]
+          local_events = [dict(zip(cols, row)) for row in rows]
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+    mysql_payload = None
+    mysql_backfilled = False
+    if entity_type == "user" and not local_events:
+      mysql_payload = await self._fetch_mysql_player_by_username(value)
+      if mysql_payload and mysql_payload.get("found"):
+        await self._backfill_mysql_player_snapshot(mysql_payload)
+        mysql_backfilled = True
+        try:
+          async with self._db._lock:
+            async with self._db._db.execute(query, params) as cursor:
+              rows = await cursor.fetchall()
+              cols = [d[0] for d in cursor.description]
+              local_events = [dict(zip(cols, row)) for row in rows]
+        except Exception:
+          pass
+
+    unique_ips = sorted({str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()})
+    unique_users = sorted({str(e.get("player_name") or "").strip() for e in local_events if str(e.get("player_name") or "").strip()})
+    risk_peak = max([int(e.get("risk_score") or 0) for e in local_events], default=0)
+
+    return web.json_response(
+      {
+        "type": entity_type,
+        "value": value,
+        "count": len(local_events),
+        "risk_peak": risk_peak,
+        "unique_ips": unique_ips,
+        "unique_users": unique_users,
+        "events": local_events,
+        "mysql": mysql_payload,
+        "mysql_backfilled": mysql_backfilled,
+      }
+    )
+
+  async def _fetch_mysql_player_by_username(self, username: str) -> Optional[dict]:
+    conf = self._config.get("plugins.minecraft.player_db", {})
+    if not isinstance(conf, dict) or not bool(conf.get("enabled", False)):
+      return {"enabled": False, "found": False, "reason": "player_db_disabled"}
+    if pymysql is None:
+      return {"enabled": True, "found": False, "reason": "pymysql_not_installed"}
+
+    host = str(conf.get("host", "127.0.0.1"))
+    port = int(conf.get("port", 3306) or 3306)
+    user = str(conf.get("user", ""))
+    password = str(conf.get("password", ""))
+    database = str(conf.get("database", ""))
+    table = str(conf.get("table", "")).strip()
+    columns = conf.get("columns", {}) if isinstance(conf.get("columns", {}), dict) else {}
+    username_col = str(columns.get("username", "username"))
+    ip_col = str(columns.get("ip", "ip"))
+    email_col = str(columns.get("email", "email"))
+    uuid_col = str(columns.get("uuid", "uuid"))
+    creation_ip_col = str(columns.get("creation_ip", "creationIP"))
+    creation_date_col = str(columns.get("creation_date", "creationDate"))
+    last_login_col = str(columns.get("last_login", "lastlogin"))
+    reg_ip_col = str(columns.get("reg_ip", "regip"))
+    is_verified_col = str(columns.get("is_verified", "isVerified"))
+
+    if not table or not user or not database:
+      return {"enabled": True, "found": False, "reason": "player_db_missing_credentials"}
+
+    def _query() -> dict:
+      conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+      )
+      try:
+        with conn.cursor() as cur:
+          sql = (
+            f"SELECT `{username_col}` AS username, `{ip_col}` AS ip, `{email_col}` AS email, "
+            f"`{uuid_col}` AS uuid, `{creation_ip_col}` AS creation_ip, `{creation_date_col}` AS creation_date, "
+            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified "
+            f"FROM `{table}` WHERE `{username_col}` = %s LIMIT 1"
+          )
+          cur.execute(sql, (username,))
+          row = cur.fetchone()
+          if not row:
+            return {"enabled": True, "found": False}
+
+          duplicate_count = 0
+          email_value = str(row.get("email") or "").strip()
+          if email_value:
+            dup_sql = f"SELECT COUNT(*) AS c FROM `{table}` WHERE `{email_col}` = %s"
+            cur.execute(dup_sql, (email_value,))
+            dup = cur.fetchone() or {"c": 0}
+            duplicate_count = int(dup.get("c") or 0)
+
+          row["duplicate_email_count"] = duplicate_count
+          row["enabled"] = True
+          row["found"] = True
+          return row
+      finally:
+        conn.close()
+
+    try:
+      return await asyncio.to_thread(_query)
+    except Exception as exc:
+      return {"enabled": True, "found": False, "reason": f"mysql_error:{exc}"}
+
+  async def _backfill_mysql_player_snapshot(self, payload: dict) -> None:
+    try:
+      source_ip = str(payload.get("ip") or payload.get("creation_ip") or payload.get("reg_ip") or "0.0.0.0").strip()
+      username = str(payload.get("username") or "unknown").strip() or "unknown"
+      details = {
+        "event_type": "mysql_backfill",
+        "parser_source": "mysql_player_db",
+        "email": payload.get("email"),
+        "uuid": payload.get("uuid"),
+        "creation_ip": payload.get("creation_ip"),
+        "creation_date": payload.get("creation_date"),
+        "last_login": payload.get("last_login"),
+        "reg_ip": payload.get("reg_ip"),
+        "is_verified": payload.get("is_verified"),
+        "duplicate_email_count": int(payload.get("duplicate_email_count") or 0),
+      }
+      async with self._db._lock:
+        await self._db._db.execute(
+          """
+          INSERT INTO connection_events
+            (timestamp, source_ip, player_name, connection_type, asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details)
+          VALUES (?, ?, ?, 'minecraft', NULL, NULL, 0, 0, 'NONE', ?)
+          """,
+          (
+            datetime.utcnow().isoformat(),
+            source_ip,
+            username,
+            json.dumps(details, ensure_ascii=False),
+          ),
+        )
+        await self._db._db.commit()
+    except Exception:
+      return
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Full SPA Dashboard — Dark theme, auto-refresh, CSS-only charts
 # ══════════════════════════════════════════════════════════════════════
 
 MINECRAFT_ADMIN_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WardenIPS Minecraft Admin</title>
 <style>
 *,*::before,*::after{box-sizing:border-box}
-body{margin:0;font-family:"Aptos","Segoe UI",sans-serif;color:#f5f6fb;background:radial-gradient(1200px 600px at 15% -10%,#143754 0%,#0f1724 45%,#090d14 100%)}
-.wrap{max-width:1180px;margin:0 auto;padding:22px}
+:root{--bg:#0f111a;--panel:#171b29;--panel2:#121622;--surface:#0f1420;--b:#2a3345;--txt:#eef2ff;--muted:#9ba7c0;--blue:#5ea1ff;--cyan:#39d0c6;--green:#4fd18f;--orange:#ff995c;--red:#ff6f7e}
+body{margin:0;font-family:"Aptos","Segoe UI",sans-serif;color:var(--txt);background:radial-gradient(circle at 10% -20%,#25304f 0%,#0f111a 52%,#0b0d15 100%)}
+.wrap{max-width:1280px;margin:0 auto;padding:22px}
 .top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.top a{color:#8ee6ff;text-decoration:none}
-.badge{display:inline-flex;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid #2e405a;background:#0e1b2b;color:#b9dff8;font-weight:600}
+.brand h1{margin:0 0 8px 0}
+.sub{color:var(--muted);font-size:.88rem}
+.linkbar{display:flex;flex-wrap:wrap;gap:10px}
+.linkbar a{text-decoration:none;color:#cde3ff;padding:8px 10px;border:1px solid var(--b);border-radius:999px;background:linear-gradient(180deg,var(--surface),#0d1320)}
+.badge{display:inline-flex;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid #2f4861;background:#0f1b2b;color:#b9dff8;font-weight:700}
 .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}
-.card{background:linear-gradient(180deg,#122236,#0d1727);border:1px solid #27405a;border-radius:14px;padding:14px}
-.k{color:#93abc4;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
+.k{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
 .v{font-size:1.5rem;font-weight:700;margin-top:6px}
-.panel{margin-top:14px;background:linear-gradient(180deg,#122236,#0b1523);border:1px solid #27405a;border-radius:14px;padding:14px}
+.panel{margin-top:14px;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
 .controls{display:grid;grid-template-columns:1.1fr 1fr 1fr auto;gap:10px;margin-bottom:12px}
+.intel-controls{display:grid;grid-template-columns:200px 1fr auto;gap:10px;margin-top:10px}
 input,select,button{border-radius:10px;border:1px solid #2f4861;background:#0c1a2a;color:#ecf3fb;padding:10px}
-button{background:linear-gradient(135deg,#26c6da,#2f80ed);border:0;font-weight:700;cursor:pointer}
+button{background:linear-gradient(135deg,#2ec3d9,#2f80ed);border:0;font-weight:700;cursor:pointer}
+button.ghost{background:#111a2a;border:1px solid #344968}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:10px;border-bottom:1px solid #23394f;font-size:.9rem}
 th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
-@media (max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.controls{grid-template-columns:1fr 1fr}}
-@media (max-width:640px){.grid{grid-template-columns:1fr}.controls{grid-template-columns:1fr}}
+.chip{display:inline-flex;padding:2px 8px;border-radius:999px;border:1px solid #35506e;color:#cde3ff;background:#12263d;font-size:.72rem}
+.link-btn{border:0;background:transparent;color:#8ed3ff;text-decoration:underline;cursor:pointer;padding:0}
+.modal{position:fixed;inset:0;background:#04070db8;display:none;align-items:center;justify-content:center;padding:16px}
+.modal.open{display:flex}
+.modal-card{width:min(100%,1000px);max-height:88vh;overflow:auto;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--b);border-radius:14px;padding:14px}
+.modal-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
+.mini{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.mini .item{padding:10px;border:1px solid var(--b);border-radius:10px;background:#0f1726}
+@media (max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.controls,.intel-controls{grid-template-columns:1fr 1fr}}
+@media (max-width:680px){.grid{grid-template-columns:1fr}.controls,.intel-controls{grid-template-columns:1fr}.mini{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
   <div class="wrap">
     <div class="top">
-      <div>
-        <h1 style="margin:0 0 8px 0">Minecraft Intelligence</h1>
-        <div class="badge" id="modeBadge">Loading mode...</div>
+      <div class="brand">
+        <h1>Minecraft Intelligence</h1>
+        <div class="sub">Deep investigation panel for player/IP/ASN behavior and burst analytics.</div>
+        <div class="badge" id="modeBadge" style="margin-top:10px">Loading mode...</div>
       </div>
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <a href="/admin">Open Main Admin</a>
-        <a href="/dashboard">Open Public Dashboard</a>
+      <div class="linkbar">
+        <a href="/admin">Main Admin</a>
+        <a href="/dashboard">Public Dashboard</a>
       </div>
     </div>
 
@@ -2694,6 +2907,16 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
       <div class="card"><div class="k">Unique IPs</div><div class="v" id="sumIps">0</div></div>
       <div class="card"><div class="k">Unique Players</div><div class="v" id="sumPlayers">0</div></div>
       <div class="card"><div class="k">Burst Alerts</div><div class="v" id="sumBursts">0</div></div>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Entity Investigation</h2>
+      <div class="intel-controls">
+        <select id="intelType"><option value="user">Username</option><option value="ip">IP</option><option value="asn">ASN</option></select>
+        <input id="intelValue" placeholder="Example: atma_12345, 45.141.178.192, AS14061">
+        <button id="intelSearchBtn">Investigate</button>
+      </div>
+      <div class="sub" id="intelHint" style="margin-top:8px">Search opens a popup with timeline and aggregated intel. If user not found locally, MySQL fallback is attempted.</div>
     </div>
 
     <div class="panel">
@@ -2708,6 +2931,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
           <option value="velocity_disconnect">velocity_disconnect</option>
           <option value="ip_disconnect">ip_disconnect</option>
           <option value="failed_packet">failed_packet</option>
+          <option value="mysql_backfill">mysql_backfill</option>
         </select>
         <button id="btnFilter">Apply</button>
       </div>
@@ -2726,6 +2950,26 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
     </div>
   </div>
 
+  <div class="modal" id="intelModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h3 id="intelTitle" style="margin:0">Entity Intel</h3>
+          <div class="sub" id="intelMeta">Loading...</div>
+        </div>
+        <button class="ghost" id="intelCloseBtn">Close</button>
+      </div>
+      <div class="mini" id="intelStats"></div>
+      <div class="panel" style="margin-top:12px">
+        <h4 style="margin:0 0 8px 0">Recent Timeline</h4>
+        <table>
+          <thead><tr><th>Time</th><th>IP</th><th>User</th><th>Type</th><th>Risk</th><th>ASN</th></tr></thead>
+          <tbody id="intelRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
 <script>
 async function api(path){
   const res = await fetch(path, {credentials:'same-origin'});
@@ -2733,6 +2977,14 @@ async function api(path){
   return await res.json();
 }
 function esc(v){ return String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
+
+function openIntelModal(){ document.getElementById('intelModal').classList.add('open'); }
+function closeIntelModal(){ document.getElementById('intelModal').classList.remove('open'); }
+
+function eventType(details){
+  try{ if(typeof details==='string'){ details=JSON.parse(details||'{}'); } }catch(_){ details={}; }
+  return (details&&details.event_type)||'';
+}
 
 async function loadSummary(){
   const s = await api('/api/minecraft/summary?hours=24');
@@ -2752,17 +3004,18 @@ async function loadEvents(){
   const type = encodeURIComponent(document.getElementById('fType').value);
   const q = '/api/minecraft/events?limit=150&username='+user+'&ip='+ip+'&event_type='+type;
   const data = await api(q);
-  const rows = (data.events || []).map(e =>
-    '<tr>'+
+  const rows = (data.events || []).map(e => {
+    const asnLabel = e.asn_number ? ('AS'+String(e.asn_number)) : '-';
+    return '<tr>'+
       '<td>'+esc(e.timestamp)+'</td>'+
-      '<td>'+esc(e.source_ip)+'</td>'+
-      '<td>'+esc(e.player_name || '-')+'</td>'+
-      '<td>'+esc(e.event_type || '-')+'</td>'+
+      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(e.source_ip)+'">'+esc(e.source_ip)+'</button></td>'+
+      '<td>'+(e.player_name?('<button class="link-btn" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'):'-')+'</td>'+
+      '<td><span class="chip">'+esc(e.event_type || eventType(e.details) || '-')+'</span></td>'+
       '<td>'+esc(e.risk_score || 0)+'</td>'+
-      '<td>'+esc(e.asn_org || '-')+'</td>'+
+      '<td>'+(e.asn_number?('<button class="link-btn" data-intel-type="asn" data-intel-value="AS'+esc(String(e.asn_number))+'">'+esc(asnLabel)+'</button>'):'-')+'</td>'+
       '<td>'+esc(e.country_code || '-')+'</td>'+
-    '</tr>'
-  ).join('');
+    '</tr>';
+  }).join('');
   document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="7">No events</td></tr>';
 }
 
@@ -2771,7 +3024,7 @@ async function loadBursts(){
   const rows = (data.alerts || []).map(a =>
     '<tr>'+
       '<td>'+esc(a.timestamp)+'</td>'+
-      '<td>'+esc(a.source_ip)+'</td>'+
+      '<td><button class="link-btn" data-intel-type="ip" data-intel-value="'+esc(a.source_ip)+'">'+esc(a.source_ip)+'</button></td>'+
       '<td>'+esc(a.event_count)+'</td>'+
       '<td>'+esc(a.window_seconds)+'</td>'+
       '<td>'+esc(a.plugin_name)+'</td>'+
@@ -2780,7 +3033,57 @@ async function loadBursts(){
   document.getElementById('burstRows').innerHTML = rows || '<tr><td colspan="5">No burst alerts</td></tr>';
 }
 
+async function searchIntel(type, value){
+  if(!value){ return; }
+  openIntelModal();
+  document.getElementById('intelTitle').textContent = 'Entity Intel: '+value;
+  document.getElementById('intelMeta').textContent = 'Loading...';
+  document.getElementById('intelStats').innerHTML = '';
+  document.getElementById('intelRows').innerHTML = '<tr><td colspan="6">Loading...</td></tr>';
+
+  const payload = await api('/api/minecraft/entity-intel?type='+encodeURIComponent(type)+'&value='+encodeURIComponent(value));
+  const mysqlInfo = payload.mysql || {};
+  const metaBits = ['Type: '+payload.type, 'Events: '+(payload.count||0), 'Peak Risk: '+(payload.risk_peak||0)];
+  if(payload.mysql_backfilled){ metaBits.push('MySQL backfill: yes'); }
+  if(mysqlInfo && mysqlInfo.reason){ metaBits.push('MySQL: '+mysqlInfo.reason); }
+  document.getElementById('intelMeta').textContent = metaBits.join(' · ');
+
+  const uniqueIps = (payload.unique_ips || []).slice(0,5).join(', ') || '-';
+  const uniqueUsers = (payload.unique_users || []).slice(0,5).join(', ') || '-';
+  document.getElementById('intelStats').innerHTML = ''
+    +'<div class="item"><div class="k">Entity</div><div class="v" style="font-size:1rem">'+esc(payload.value||'')+'</div></div>'
+    +'<div class="item"><div class="k">Event Count</div><div class="v" style="font-size:1rem">'+esc(payload.count||0)+'</div></div>'
+    +'<div class="item"><div class="k">Unique IPs</div><div class="v" style="font-size:.88rem">'+esc(uniqueIps)+'</div></div>'
+    +'<div class="item"><div class="k">Unique Users</div><div class="v" style="font-size:.88rem">'+esc(uniqueUsers)+'</div></div>';
+
+  const rows = (payload.events || []).map(e => {
+    const t = eventType(e.details) || '-';
+    return '<tr>'
+      +'<td>'+esc(e.timestamp)+'</td>'
+      +'<td>'+esc(e.source_ip||'-')+'</td>'
+      +'<td>'+esc(e.player_name||'-')+'</td>'
+      +'<td>'+esc(t)+'</td>'
+      +'<td>'+esc(e.risk_score||0)+'</td>'
+      +'<td>'+esc(e.asn_org || (e.asn_number ? ('AS'+String(e.asn_number)) : '-'))+'</td>'
+      +'</tr>';
+  }).join('');
+  document.getElementById('intelRows').innerHTML = rows || '<tr><td colspan="6">No timeline data</td></tr>';
+}
+
 document.getElementById('btnFilter').addEventListener('click', loadEvents);
+document.getElementById('intelSearchBtn').addEventListener('click', function(){
+  searchIntel(document.getElementById('intelType').value, document.getElementById('intelValue').value.trim());
+});
+document.getElementById('intelCloseBtn').addEventListener('click', closeIntelModal);
+document.getElementById('intelModal').addEventListener('click', function(ev){ if(ev.target===this){ closeIntelModal(); } });
+document.body.addEventListener('click', function(ev){
+  const btn = ev.target.closest('[data-intel-type]');
+  if(!btn){ return; }
+  const type = btn.getAttribute('data-intel-type');
+  const value = btn.getAttribute('data-intel-value');
+  if(type && value){ searchIntel(type, value); }
+});
+
 Promise.all([loadSummary(), loadEvents(), loadBursts()]).catch(err => {
   console.error(err);
   document.getElementById('modeBadge').textContent = 'Failed to load Minecraft analytics';

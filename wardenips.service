@@ -24,7 +24,7 @@ RestartSec=5
 # These restrict the process to only what WardenIPS actually needs.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=__PROTECT_HOME__
+ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

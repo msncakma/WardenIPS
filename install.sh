@@ -791,30 +791,24 @@ service_group = sys.argv[4]
 has_adm_group = sys.argv[5] == "1"
 config_path = Path(sys.argv[6])
 
-protect_home = "yes"
 extra_readonly_paths: list[str] = []
 
 try:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if isinstance(data, dict):
-        service_cfg = data.get("service", {})
-        if isinstance(service_cfg, dict):
-            systemd_cfg = service_cfg.get("systemd", {})
-            if isinstance(systemd_cfg, dict):
-                candidate = str(systemd_cfg.get("protect_home", "yes")).strip().lower()
-                if candidate in {"yes", "true", "1"}:
-                    protect_home = "yes"
-                elif candidate in {"read-only", "readonly", "read_only"}:
-                    protect_home = "read-only"
-                elif candidate in {"no", "false", "0"}:
-                    protect_home = "no"
+        plugins = data.get("plugins", {})
+        if isinstance(plugins, dict):
+            minecraft = plugins.get("minecraft", {})
+            if isinstance(minecraft, dict):
+                mc_log = str(minecraft.get("log_path", "") or "").strip()
+                if mc_log.startswith("/home/"):
+                    extra_readonly_paths.append(str(Path(mc_log).parent))
 
-                raw_paths = systemd_cfg.get("extra_readonly_paths", [])
-                if isinstance(raw_paths, list):
-                    for item in raw_paths:
-                        p = str(item or "").strip()
-                        if p.startswith("/"):
-                            extra_readonly_paths.append(p)
+                velocity = minecraft.get("velocity", {})
+                if isinstance(velocity, dict):
+                    velocity_log = str(velocity.get("log_path", "") or "").strip()
+                    if velocity_log.startswith("/home/"):
+                        extra_readonly_paths.append(str(Path(velocity_log).parent))
 except Exception:
     pass
 
@@ -831,7 +825,6 @@ text = text.replace(
     "__SUPPLEMENTARY_GROUPS__",
     "SupplementaryGroups=adm" if has_adm_group else "",
 )
-text = text.replace("__PROTECT_HOME__", protect_home)
 text = text.replace("__EXTRA_READ_ONLY_PATHS__", extra_readonly_line)
 service_path.write_text(text, encoding="utf-8")
 PY

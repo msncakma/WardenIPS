@@ -6,7 +6,7 @@ It is designed for teams that want stronger protection than static log-based ban
 
 Maintainer: msncakma
 
-[![Version](https://img.shields.io/badge/version-0.4.0-beta--4-green.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-0.4.0-beta--5-green.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -27,7 +27,7 @@ If you run internet-facing services and want practical prevention with transpare
 
 ## Transparent Status
 
-Current version: v0.4.0-beta-4
+Current version: v0.4.0-beta-5
 
 This project is in beta, and that matters.
 

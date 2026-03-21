@@ -1,6 +1,6 @@
 # WardenIPS — Installation & Configuration Guide
 
-**Version: 0.4.0-beta-4**
+**Version: 0.4.0-beta-5**
 
 Complete guide for deploying WardenIPS on a Linux server.
 
@@ -270,17 +270,11 @@ sudo systemctl status wardenips
 sudo journalctl -u wardenips -f
 ```
 
-If your Velocity/Minecraft logs are under `/home/...`, configure systemd hardening overrides in `config.yaml`:
+If your Velocity/Minecraft logs are under `/home/...`, WardenIPS now applies `ProtectHome=read-only` automatically.
 
-```yaml
-service:
-  systemd:
-    protect_home: "read-only"   # yes | read-only | no
-    extra_readonly_paths:
-      - "/home/mc/velocity/logs"
-```
+The installer also auto-adds read-only access for `/home`-based Minecraft and Velocity log directories based on configured `log_path` values.
 
-Apply changes by re-running installer (update mode) and restarting service.
+After changing log paths, re-run installer (update mode) and restart service.
 
 ### Docker
 
@@ -343,4 +337,4 @@ sudo sh uninstall.sh --purge  # Remove everything
 | Log file not found | Verify `log_path` values in the plugins section |
 | Dashboard shows HTTPS error | Dashboard is plain HTTP by default. Use `http://`, not `https://` |
 | Blocklist not loading | Check network connectivity and that `blocklist.enabled` is `true` |
-| Log path under `/home` unreadable | Set `service.systemd.protect_home: "read-only"` and add `service.systemd.extra_readonly_paths` |
+| Log path under `/home` unreadable | Re-run installer after updating plugin `log_path`; verify `systemctl cat wardenips` includes `ProtectHome=read-only` and matching `ReadOnlyPaths` |
