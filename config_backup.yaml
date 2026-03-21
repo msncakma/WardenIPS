@@ -28,6 +28,12 @@ whitelist:
 database:
   sqlite:
     path: "/var/lib/wardenips/warden.db" 
+  retention:
+    enabled: false
+    events_days: 30
+    interval_seconds: 3600
+    connection_types:
+      - "authme"
 
 asn_protection:
   # Uses GeoLite2-ASN.mmdb downloaded automatically from Loyalsoldier/geoip on GitHub.
@@ -147,6 +153,11 @@ plugins:
       discord:
         enabled: false
         webhook_url: ""
+
+  authme:
+    enabled: true
+    log_file_path: "plugins/authme/authme.log"
+    correlation_window_seconds: 30
 
   nginx:
     enabled: false

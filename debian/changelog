@@ -1,3 +1,37 @@
+wardenips (0.4.0~beta21-1) stable; urgency=medium
+
+  * Bump version to 0.4.0-beta-21
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 21:20:00 +03:00
+
+wardenips (0.4.0~beta20-1) stable; urgency=medium
+
+  * Complete Minecraft/AuthMe setup wizard integration with backend handlers and UI flow
+  * Extend Minecraft admin event APIs to include AuthMe records with source filtering
+  * Show AuthMe login_successful status in event payloads and admin event table
+  * Add disconnect-correlation DB update path to mark AuthMe logins as failed
+  * Add AuthMe-focused partial SQLite indexes for faster correlation/event queries
+  * Add optional database retention cleanup loop with configurable scope and interval
+  * Add database.retention defaults to config.yaml and config_backup.yaml
+  * Bump version to 0.4.0-beta-20
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 21:05:00 +03:00
+
+wardenips (0.4.0~beta19-1) stable; urgency=medium
+
+  * Add AuthMe plugin for parsing successful logins and registrations from plugins/authme/authme.log
+  * Create AuthMe as separate connection_type with login_successful tracking in event details
+  * Add first-time Minecraft section setup wizard with multi-step configuration flow
+  * Setup wizard: detect log files in common paths, validate format, review config
+  * Setup wizard: syntax validation with sample parse results and health checks
+  * Implement login/disconnect correlation to detect and mark failed login attempts
+  * Add setup wizard API endpoints: detect-logs, validate-log, get-config, complete
+  * Optimize AuthMe parsing for small VPS with async stream and immediate DB writes
+  * Config: add plugins.authme.log_file_path and correlation_window_seconds settings
+  * Bump version to 0.4.0-beta-19
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 20:15:00 +03:00
+
 wardenips (0.4.0~beta18-1) stable; urgency=medium
 
   * Add Minecraft admin historical log import endpoint for multi-file .log.gz uploads
@@ -10,17 +44,6 @@ wardenips (0.4.0~beta18-1) stable; urgency=medium
   * Bump version to 0.4.0-beta-18
 
  -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 19:21:00 +03:00
-
-wardenips (0.4.0~beta17-1) stable; urgency=medium
-
-  * Add Minecraft intel actions: direct ban-ip and ban-email endpoints/actions
-  * Add email-targeted ban flow using local events, cache, and MySQL matches
-  * Sync MySQL registration matches into connection events as mysql_register_sync records
-  * Add pagination to public Recent Events with backend offset/total metadata
-  * Replace heavy /api/events?limit=2000 fetch with page-based loading
-  * Bump version to 0.4.0-beta-17
-
- -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 19:02:00 +03:00
 
 wardenips (0.4.0~beta16-1) stable; urgency=medium
 

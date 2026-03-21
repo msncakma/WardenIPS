@@ -32,6 +32,7 @@ class ConnectionType(enum.Enum):
 
     SSH = "ssh"
     MINECRAFT = "minecraft"
+    AUTHME = "authme"
     NGINX = "nginx"
     PORTSCAN = "portscan"
     UNKNOWN = "unknown"

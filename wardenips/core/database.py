@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -76,6 +76,14 @@ CREATE INDEX IF NOT EXISTS idx_events_player_ts
 
 CREATE INDEX IF NOT EXISTS idx_events_source_ip_ts
     ON connection_events(source_ip, timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_events_authme_ip_ts
+    ON connection_events(source_ip, timestamp)
+    WHERE connection_type = 'authme';
+
+CREATE INDEX IF NOT EXISTS idx_events_authme_player_ts
+    ON connection_events(player_name, timestamp)
+    WHERE connection_type = 'authme';
 
 -- Ban history table
 CREATE TABLE IF NOT EXISTS ban_history (
@@ -315,10 +323,26 @@ class DatabaseManager:
                             await self._migrate_v5_to_v6_minecraft_watchlist()
                         if current < 7:
                             await self._migrate_v6_to_v7_minecraft_player_cache()
+                        if current < 8:
+                            await self._migrate_v7_to_v8_authme_indexes()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
                         )
+
+    async def _migrate_v7_to_v8_authme_indexes(self) -> None:
+        """Adds partial indexes to accelerate AuthMe correlation queries."""
+        await self._db.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_events_authme_ip_ts
+                ON connection_events(source_ip, timestamp)
+                WHERE connection_type = 'authme';
+
+            CREATE INDEX IF NOT EXISTS idx_events_authme_player_ts
+                ON connection_events(player_name, timestamp)
+                WHERE connection_type = 'authme';
+            """
+        )
 
     async def _migrate_v2_to_v3_source_ip(self) -> None:
         """Renames legacy ip_hash columns to source_ip and refreshes indexes."""
@@ -495,6 +519,126 @@ class DatabaseManager:
                 raise WardenDatabaseError(
                     f"Event logging failed: {exc}"
                 ) from exc
+
+    async def cleanup_old_connection_events(
+        self,
+        days: int = 30,
+        connection_types: Optional[List[str]] = None,
+    ) -> int:
+        """Deletes old connection_events rows and returns deleted row count."""
+        cutoff = (datetime.utcnow() - timedelta(days=max(int(days), 1))).isoformat()
+        normalized_types = [
+            str(item).strip().lower()
+            for item in (connection_types or [])
+            if str(item).strip()
+        ]
+
+        async with self._lock:
+            try:
+                if normalized_types:
+                    placeholders = ",".join(["?"] * len(normalized_types))
+                    query = (
+                        "DELETE FROM connection_events "
+                        "WHERE timestamp < ? AND LOWER(COALESCE(connection_type, '')) IN ("
+                        + placeholders
+                        + ")"
+                    )
+                    params: List[Any] = [cutoff, *normalized_types]
+                else:
+                    query = "DELETE FROM connection_events WHERE timestamp < ?"
+                    params = [cutoff]
+
+                cursor = await self._db.execute(query, tuple(params))
+                await self._db.commit()
+                deleted = int(cursor.rowcount or 0)
+                if deleted > 0:
+                    logger.info(
+                        "Retention cleanup deleted %d old event(s) older than %d day(s).",
+                        deleted,
+                        max(int(days), 1),
+                    )
+                return deleted
+            except Exception as exc:
+                logger.error("Retention cleanup failed: %s", exc)
+                return 0
+
+    async def mark_authme_login_failed_by_disconnect(
+        self,
+        source_ip: str,
+        disconnect_timestamp: datetime,
+        window_seconds: int = 30,
+        player_name: Optional[str] = None,
+        disconnect_event_type: str = "ip_disconnect",
+    ) -> int:
+        """Mark the latest matching AuthMe login as failed after a disconnect event.
+
+        Returns number of updated rows (0 or 1).
+        """
+        if not source_ip:
+            return 0
+
+        safe_window = max(int(window_seconds), 1)
+        end_ts = disconnect_timestamp
+        start_ts = disconnect_timestamp - timedelta(seconds=safe_window)
+
+        try:
+            async with self._lock:
+                select_sql = """
+                    SELECT id, details
+                    FROM connection_events
+                    WHERE connection_type = 'authme'
+                      AND source_ip = ?
+                      AND timestamp >= ?
+                      AND timestamp <= ?
+                      AND COALESCE(details, '') LIKE '%"event_type": "login"%'
+                      AND (
+                        COALESCE(details, '') NOT LIKE '%"login_successful": false%'
+                        AND COALESCE(details, '') NOT LIKE '%"login_successful":false%'
+                      )
+                """
+                params: list[Any] = [
+                    source_ip,
+                    start_ts.isoformat(),
+                    end_ts.isoformat(),
+                ]
+
+                normalized_player = str(player_name or "").strip().lower()
+                if normalized_player:
+                    select_sql += " AND LOWER(COALESCE(player_name, '')) = LOWER(?)"
+                    params.append(normalized_player)
+
+                select_sql += " ORDER BY timestamp DESC LIMIT 1"
+
+                async with self._db.execute(select_sql, tuple(params)) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    return 0
+
+                event_id = int(row[0])
+                details_raw = row[1]
+                details_obj: Dict[str, Any] = {}
+                if isinstance(details_raw, str) and details_raw:
+                    try:
+                        parsed = json.loads(details_raw)
+                        if isinstance(parsed, dict):
+                            details_obj = parsed
+                    except Exception:
+                        details_obj = {}
+
+                details_obj["login_successful"] = False
+                details_obj["failure_reason"] = "disconnect_correlation"
+                details_obj["failed_at"] = end_ts.isoformat()
+                details_obj["correlated_disconnect_event_type"] = str(disconnect_event_type or "ip_disconnect")
+
+                await self._db.execute(
+                    "UPDATE connection_events SET details = ? WHERE id = ?",
+                    (json.dumps(details_obj, ensure_ascii=False), event_id),
+                )
+                await self._db.commit()
+                return 1
+        except Exception as exc:
+            logger.debug("AuthMe correlation update failed for %s: %s", source_ip, exc)
+            return 0
 
     # ── Ban Gecmisi ──
 

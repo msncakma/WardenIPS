@@ -41,6 +41,7 @@ from wardenips.api.dashboard import DashboardAPI
 from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
+from wardenips.plugins.authme_plugin import AuthMePlugin
 from wardenips.plugins.velocity_plugin import VelocityPlugin
 from wardenips.plugins.nginx_plugin import NginxPlugin
 from wardenips.plugins.portscan_plugin import PortscanPlugin
@@ -227,6 +228,11 @@ class WardenIPS:
         if self._config.get("plugins.minecraft.enabled", True):
             mc_plugin = MinecraftPlugin(self._config)
             self._plugin_manager.register(mc_plugin)
+
+        # AuthMe successful login/registration plugin
+        if self._config.get("plugins.authme.enabled", True):
+            authme_plugin = AuthMePlugin(self._config)
+            self._plugin_manager.register(authme_plugin)
 
         # Velocity proxy log plugin can run independently from minecraft backend logs.
         if self._config.get("plugins.minecraft.velocity.enabled", False):
@@ -467,6 +473,27 @@ class WardenIPS:
                 },
             )
             await self._db.log_event(updated_event, source_ip)
+
+            event_type = str(event.details.get("event_type", "") or "").strip().lower()
+            if event.connection_type.value == "minecraft" and event_type in {"ip_disconnect", "velocity_disconnect"}:
+                correlation_window_seconds = max(
+                    int(self._config.get("plugins.authme.correlation_window_seconds", 30)),
+                    1,
+                )
+                correlated = await self._db.mark_authme_login_failed_by_disconnect(
+                    source_ip=source_ip,
+                    disconnect_timestamp=event.timestamp,
+                    window_seconds=correlation_window_seconds,
+                    player_name=event.player_name,
+                    disconnect_event_type=event_type,
+                )
+                if correlated > 0:
+                    self._logger.info(
+                        "AuthMe correlation updated login_successful=false for IP=%s User=%s Event=%s",
+                        source_ip,
+                        event.player_name or "unknown",
+                        event_type,
+                    )
 
             if is_success_event:
                 self._logger.info(
@@ -738,7 +765,37 @@ class WardenIPS:
                     db_stats.get("active_bans", 0),
                 )
 
+        async def _retention_loop():
+            enabled = bool(self._config.get("database.retention.enabled", False))
+            if not enabled:
+                return
+
+            interval = max(int(self._config.get("database.retention.interval_seconds", 3600)), 300)
+            retention_days = max(int(self._config.get("database.retention.events_days", 30)), 1)
+            configured_types = self._config.get("database.retention.connection_types", ["authme"])
+            if isinstance(configured_types, list):
+                connection_types = [str(item).strip().lower() for item in configured_types if str(item).strip()]
+            else:
+                connection_types = ["authme"]
+
+            self._logger.info(
+                "Retention cleanup enabled: every %ss, keeping %s day(s), types=%s",
+                interval,
+                retention_days,
+                ",".join(connection_types) if connection_types else "all",
+            )
+
+            while self._running:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    break
+                await self._db.cleanup_old_connection_events(
+                    days=retention_days,
+                    connection_types=connection_types,
+                )
+
         stats_task = asyncio.create_task(_stats_loop())
+        retention_task = asyncio.create_task(_retention_loop())
 
         try:
             await stop_event.wait()
@@ -746,6 +803,7 @@ class WardenIPS:
             pass
         finally:
             stats_task.cancel()
+            retention_task.cancel()
             await self.shutdown()
 
     def _log_system_info(self) -> None:

@@ -33,6 +33,12 @@ database:
     url: "redis://localhost:6379/0"
     prefix: "warden:"
     event_ttl: 86400          # Event retention in Redis (seconds, default 24h)
+  retention:
+    enabled: false
+    events_days: 30
+    interval_seconds: 3600
+    connection_types:
+      - "authme"
 
 asn_protection:
   # Uses GeoLite2-ASN.mmdb downloaded automatically from Loyalsoldier/geoip on GitHub.
@@ -166,6 +172,11 @@ plugins:
       discord:
         enabled: false
         webhook_url: ""  # Optional dedicated webhook for minecraft/velocity events
+
+  authme:
+    enabled: true
+    log_file_path: "plugins/authme/authme.log"  # AuthMe authentication logs
+    correlation_window_seconds: 30  # Window to detect login failures (correlation with disconnects)
 
   nginx:
     enabled: false

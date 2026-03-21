@@ -70,6 +70,7 @@ from wardenips.core.logger import get_logger
 from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.updater import UpdateChecker
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
+from wardenips.plugins.authme_plugin import AuthMePlugin
 from wardenips.plugins.velocity_plugin import VelocityPlugin
 
 logger = get_logger(__name__)
@@ -638,6 +639,12 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/minecraft/ban-email", self._handle_admin_minecraft_ban_email)
     self._app.router.add_post("/api/admin/minecraft/ban-asn", self._handle_admin_minecraft_ban_asn)
     self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
+    self._app.router.add_get("/admin/minecraft/setup", self._handle_minecraft_setup_page)
+    self._app.router.add_get("/api/minecraft/setup/detect-logs", self._handle_minecraft_setup_detect_logs)
+    self._app.router.add_post("/api/minecraft/setup/validate-log", self._handle_minecraft_setup_validate_log)
+    self._app.router.add_get("/api/minecraft/setup/get-config", self._handle_minecraft_setup_get_config)
+    self._app.router.add_post("/api/minecraft/setup/validate-complete", self._handle_minecraft_setup_validate_complete)
+    self._app.router.add_post("/api/minecraft/setup/complete", self._handle_minecraft_setup_complete)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
@@ -791,6 +798,16 @@ class DashboardAPI:
         elif isinstance(details_value, dict):
           details_obj = details_value
         event["event_type"] = str(details_obj.get("event_type") or "")
+        if str(event.get("connection_type") or "").strip().lower() == "authme":
+          login_successful_value = details_obj.get("login_successful")
+          if isinstance(login_successful_value, bool):
+            event["login_successful"] = login_successful_value
+          elif isinstance(login_successful_value, str):
+            event["login_successful"] = login_successful_value.strip().lower() in {"1", "true", "yes", "on"}
+          elif isinstance(login_successful_value, (int, float)):
+            event["login_successful"] = bool(int(login_successful_value))
+          else:
+            event["login_successful"] = None
         event["is_banned_current"] = bool(event.get("is_banned_current"))
         event["is_post_ban"] = False
         event["is_ban_trigger_event"] = False
@@ -2658,12 +2675,18 @@ class DashboardAPI:
     username = str(request.query.get("username", "")).strip()
     source_ip = str(request.query.get("ip", "")).strip()
     event_type = str(request.query.get("event_type", "")).strip().lower()
+    source_type = str(request.query.get("source", "all")).strip().lower()
     country = str(request.query.get("country", "")).strip().upper()
     asn_query = str(request.query.get("asn", "")).strip()
     hours_back = max(int(request.query.get("hours_back", "0")), 0)
     try:
       timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
-      where_clauses = ["connection_type = 'minecraft'"]
+      if source_type == "minecraft":
+        where_clauses = ["connection_type = 'minecraft'"]
+      elif source_type == "authme":
+        where_clauses = ["connection_type = 'authme'"]
+      else:
+        where_clauses = ["connection_type IN ('minecraft', 'authme')"]
       params: list[object] = []
       if hours_back > 0:
         where_clauses.append(f"{timestamp_expr} >= strftime('%s', 'now', ? || ' hours')")
@@ -2744,6 +2767,16 @@ class DashboardAPI:
           except Exception:
             details_obj = {}
         event["event_type"] = str(details_obj.get("event_type") or "")
+        if str(event.get("connection_type") or "").strip().lower() == "authme":
+          login_successful_raw = details_obj.get("login_successful")
+          if isinstance(login_successful_raw, bool):
+            event["login_successful"] = login_successful_raw
+          elif isinstance(login_successful_raw, str):
+            event["login_successful"] = login_successful_raw.strip().lower() in {"1", "true", "yes", "on"}
+          elif isinstance(login_successful_raw, (int, float)):
+            event["login_successful"] = bool(int(login_successful_raw))
+          else:
+            event["login_successful"] = None
         event["country_code"] = self._resolve_country_code(details_obj, event.get("source_ip"))
         event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
         banned_current = bool(event.get("is_banned_current"))
@@ -2771,6 +2804,7 @@ class DashboardAPI:
     username = str(request.query.get("username", "")).strip()
     source_ip = str(request.query.get("ip", "")).strip()
     event_type = str(request.query.get("event_type", "")).strip().lower()
+    source_type = str(request.query.get("source", "all")).strip().lower()
     hours_back = max(int(request.query.get("hours_back", "0")), 0)
     max_scan = min(max(int(request.query.get("scan_limit", "5000")), 200), 20000)
     try:
@@ -2778,8 +2812,14 @@ class DashboardAPI:
       query = """
         SELECT source_ip, asn_number, asn_org, details
         FROM connection_events
-        WHERE connection_type = 'minecraft'
+        WHERE 1=1
       """
+      if source_type == "minecraft":
+        query += " AND connection_type = 'minecraft'"
+      elif source_type == "authme":
+        query += " AND connection_type = 'authme'"
+      else:
+        query += " AND connection_type IN ('minecraft', 'authme')"
       params: list[object] = []
       if hours_back > 0:
         query += f" AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')"
@@ -4447,6 +4487,258 @@ class DashboardAPI:
       "emails": sorted(emails),
     }
 
+  async def _handle_minecraft_setup_page(self, request: web.Request) -> web.Response:
+    """Serve the AuthMe setup wizard page."""
+    auth_redirect = self._require_dashboard_auth(request)
+    if auth_redirect is not None:
+      return auth_redirect
+    self._touch_session(request)
+    html = MINECRAFT_SETUP_WIZARD_HTML
+    html = self._render_ui_template(html)
+    return web.Response(text=html, content_type="text/html")
+
+  async def _handle_minecraft_setup_detect_logs(self, request: web.Request) -> web.Response:
+    """Detect available AuthMe log files in common locations."""
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    
+    common_paths = [
+      "plugins/authme/authme.log",
+      "plugins/Minecraft/authme.log",
+      "plugins/AuthMe/authme.log",
+      "/opt/minecraft/plugins/authme/authme.log",
+      "/home/minecraft/plugins/authme/authme.log",
+    ]
+    
+    found: list[dict] = []
+    for path_candidate in common_paths:
+      abs_path = path_candidate if os.path.isabs(path_candidate) else os.path.join(os.getcwd(), path_candidate)
+      if not os.path.exists(abs_path):
+        continue
+      if not os.access(abs_path, os.R_OK):
+        continue
+      
+      try:
+        stat = os.stat(abs_path)
+        last_modified = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        found.append({
+          "path": path_candidate,
+          "abs_path": abs_path,
+          "size_bytes": stat.st_size,
+          "last_modified": last_modified,
+          "readable": True,
+        })
+      except Exception:
+        continue
+    
+    return web.json_response({
+      "ok": True,
+      "found_logs": found,
+      "count": len(found),
+    })
+
+  async def _handle_minecraft_setup_validate_log(self, request: web.Request) -> web.Response:
+    """Validate a log file and show sample parse results."""
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    
+    log_path = str(payload.get("log_path", "")).strip()
+    if not log_path:
+      return web.json_response(
+        {"error": "invalid_path", "message": "log_path is required."},
+        status=400,
+      )
+    
+    # Resolve path
+    abs_path = log_path if os.path.isabs(log_path) else os.path.join(os.getcwd(), log_path)
+    
+    if not os.path.exists(abs_path):
+      return web.json_response(
+        {"error": "path_not_found", "message": f"Log file not found: {log_path}"},
+        status=404,
+      )
+    
+    if not os.access(abs_path, os.R_OK):
+      return web.json_response(
+        {"error": "permission_denied", "message": f"Cannot read log file: {log_path}"},
+        status=403,
+      )
+    
+    # Parse first few lines to show sample results
+    sample_lines: list[str] = []
+    parsed_samples: list[dict] = []
+    match_count = 0
+    total_lines = 0
+    
+    try:
+      parser = AuthMePlugin(self._config)
+      
+      with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+        for idx, line in enumerate(f):
+          total_lines += 1
+          if len(sample_lines) < 10:
+            sample_lines.append(line.rstrip('\r\n'))
+          
+          event = await parser.parse_line(line)
+          if event:
+            match_count += 1
+            if len(parsed_samples) < 5:
+              parsed_samples.append({
+                "line_no": idx + 1,
+                "player": str(event.player_name or ""),
+                "ip": str(event.source_ip or ""),
+                "type": str(event.details.get("event_type", "")),
+                "timestamp": event.timestamp.isoformat(),
+              })
+    except Exception as exc:
+      return web.json_response(
+        {"error": "parse_error", "message": f"Error validating log file: {str(exc)}"},
+        status=500,
+      )
+    
+    match_rate = (match_count / total_lines * 100) if total_lines > 0 else 0
+    
+    return web.json_response({
+      "ok": True,
+      "log_path": log_path,
+      "abs_path": abs_path,
+      "total_lines": total_lines,
+      "matched_events": match_count,
+      "match_rate": f"{match_rate:.1f}%",
+      "sample_lines": sample_lines,
+      "parsed_samples": parsed_samples,
+      "expected_format": "[MM-DD HH:MM:SS]: [FINE] player_name (logged in|registered) ip_address",
+    })
+
+  async def _handle_minecraft_setup_get_config(self, request: web.Request) -> web.Response:
+    """Return current AuthMe and Minecraft config sections."""
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    
+    plugins_section = self._config.get_section("plugins") or {}
+    minecraft_config = plugins_section.get("minecraft", {})
+    authme_config = plugins_section.get("authme", {})
+    
+    return web.json_response({
+      "ok": True,
+      "plugins": {
+        "minecraft": minecraft_config,
+        "authme": authme_config,
+      },
+      "message": "Current configuration loaded successfully.",
+    })
+
+  async def _handle_minecraft_setup_validate_complete(self, request: web.Request) -> web.Response:
+    """Run complete validation checks before setup completes."""
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    
+    log_path = str(payload.get("log_path", "")).strip()
+    if not log_path:
+      return web.json_response(
+        {"errors": ["Log file path is missing."]},
+        status=400,
+      )
+    
+    errors: list[str] = []
+    warnings: list[str] = []
+    
+    # Check file permissions
+    abs_path = log_path if os.path.isabs(log_path) else os.path.join(os.getcwd(), log_path)
+    if not os.path.exists(abs_path):
+      errors.append(f"Log file not found: {log_path}")
+    elif not os.access(abs_path, os.R_OK):
+      errors.append(f"Log file is not readable: {log_path}")
+    
+    # Check if database table exists
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          "SELECT COUNT(*) FROM connection_events LIMIT 1"
+        ) as cursor:
+          pass
+    except Exception as exc:
+      errors.append(f"Database connection_events table check failed: {str(exc)}")
+    
+    # Check if log has recent entries
+    if os.path.exists(abs_path):
+      try:
+        stat = os.stat(abs_path)
+        age_seconds = time.time() - stat.st_mtime
+        if age_seconds > 86400 * 7:  # Older than 7 days
+          warnings.append(f"Log file hasn't been updated recently ({age_seconds/3600:.1f} hours ago)")
+      except Exception:
+        pass
+    
+    validation_ok = len(errors) == 0
+    
+    return web.json_response({
+      "ok": validation_ok,
+      "errors": errors,
+      "warnings": warnings,
+      "summary": f"Validation {'passed' if validation_ok else 'failed'}: {len(errors)} error(s), {len(warnings)} warning(s)",
+    })
+
+  async def _handle_minecraft_setup_complete(self, request: web.Request) -> web.Response:
+    """Mark setup as complete and configure AuthMe plugin."""
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    
+    actor = self._get_session_actor(request)
+    
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    
+    log_path = str(payload.get("log_path", "")).strip()
+    if not log_path:
+      return web.json_response(
+        {"error": "invalid_config", "message": "log_path is required."},
+        status=400,
+      )
+    
+    # Update config with the provided log path
+    try:
+      await self._config.patch_values({
+        "plugins.authme.enabled": True,
+        "plugins.authme.log_file_path": log_path,
+      })
+    except Exception as exc:
+      return web.json_response(
+        {"error": "config_update_failed", "message": str(exc)},
+        status=500,
+      )
+    
+    await self._log_audit(
+      request,
+      "minecraft.setup_complete",
+      actor_username=actor,
+      details={"log_path": log_path},
+    )
+    
+    return web.json_response({
+      "ok": True,
+      "message": "AuthMe setup complete. The plugin will begin parsing logs on service restart.",
+      "log_path": log_path,
+      "next_step": "Review logs in the dashboard or restart WardenIPS to activate the parser.",
+    })
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Full SPA Dashboard — Dark theme, auto-refresh, CSS-only charts
@@ -4559,9 +4851,15 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
       <div class="controls">
         <input id="fUser" placeholder="Username (case-insensitive exact)">
         <input id="fIp" placeholder="IP (exact)">
+        <select id="fSource">
+          <option value="all" selected>All sources</option>
+          <option value="minecraft">minecraft</option>
+          <option value="authme">authme</option>
+        </select>
         <select id="fType">
           <option value="">All event types</option>
           <option value="login">login</option>
+          <option value="registration">registration</option>
           <option value="velocity_connected">velocity_connected</option>
           <option value="velocity_disconnect">velocity_disconnect</option>
           <option value="ip_disconnect">ip_disconnect</option>
@@ -4586,7 +4884,7 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
         <button id="btnFilter">Apply</button>
       </div>
       <table>
-        <thead><tr><th>Time</th><th>IP</th><th>Player</th><th>Type</th><th>Risk</th><th>ASN</th><th>Country</th></tr></thead>
+        <thead><tr><th>Time</th><th>IP</th><th>Player</th><th>Source</th><th>Type</th><th>Auth</th><th>Risk</th><th>ASN</th><th>Country</th></tr></thead>
         <tbody id="eventRows"></tbody>
       </table>
       <div class="pagination">
@@ -4753,6 +5051,7 @@ function eventFilters(){
   return {
     user: document.getElementById('fUser').value.trim(),
     ip: document.getElementById('fIp').value.trim(),
+    source: document.getElementById('fSource').value || 'all',
     type: document.getElementById('fType').value,
     country: document.getElementById('fCountry').value || '',
     asn: document.getElementById('fAsn').value || '',
@@ -4769,6 +5068,7 @@ function currentEventPageSize(){
 async function loadEventFilterOptions(){
   const filters = eventFilters();
   const q = '/api/minecraft/filter-options?hours_back='+encodeURIComponent(filters.hours)
+    +'&source='+encodeURIComponent(filters.source)
     +'&username='+encodeURIComponent(filters.user)
     +'&ip='+encodeURIComponent(filters.ip)
     +'&event_type='+encodeURIComponent(filters.type);
@@ -4802,6 +5102,7 @@ async function loadEvents(resetPage){
   const q = '/api/minecraft/events?limit='+encodeURIComponent(pageSize)
     +'&offset='+encodeURIComponent(offset)
     +'&hours_back='+encodeURIComponent(filters.hours)
+    +'&source='+encodeURIComponent(filters.source)
     +'&username='+encodeURIComponent(filters.user)
     +'&ip='+encodeURIComponent(filters.ip)
     +'&event_type='+encodeURIComponent(filters.type)
@@ -4825,20 +5126,34 @@ async function loadEvents(resetPage){
     const watch = e.is_watchlisted_player ? ' <span class="chip warn">WATCH</span>' : '';
     const evType = e.event_type || eventType(e.details) || '-';
     const evClass = eventTypeClass(evType);
+    const sourceType = String(e.connection_type || '-').toLowerCase();
+    const sourceClass = sourceType === 'authme' ? 'type-other' : 'type-connect';
     const cc = String(e.country_code || '').toUpperCase();
     const flag = flagFromCountry(cc);
     const countryLabel = cc ? (flag ? (flag + ' ' + cc) : cc) : '-';
+    let authLabel = '-';
+    if(sourceType === 'authme' && evType === 'login'){
+      if(e.login_successful === true){
+        authLabel = '<span class="chip type-connect">success</span>';
+      }else if(e.login_successful === false){
+        authLabel = '<span class="chip type-error">failed</span>';
+      }else{
+        authLabel = '<span class="chip type-other">unknown</span>';
+      }
+    }
     return '<tr>'+
       '<td class="copyable">'+esc(e.timestamp)+'</td>'+
       '<td><button class="link-btn copyable" data-intel-type="ip" data-intel-value="'+esc(e.source_ip)+'">'+esc(e.source_ip)+'</button></td>'+
       '<td>'+(e.player_name?('<button class="link-btn copyable" data-intel-type="user" data-intel-value="'+esc(e.player_name)+'">'+esc(e.player_name)+'</button>'+watch):'-')+'</td>'+
+      '<td><span class="chip '+sourceClass+' copyable">'+esc(sourceType || '-')+'</span></td>'+
       '<td><span class="chip '+evClass+' copyable">'+esc(evType)+'</span></td>'+
+      '<td>'+authLabel+'</td>'+
       '<td class="copyable">'+esc(e.risk_score || 0)+'</td>'+
       '<td>'+(e.asn_number?('<button class="link-btn copyable" data-intel-type="asn" data-intel-value="AS'+esc(String(e.asn_number))+'">'+esc(asnLabel)+'</button>'):('<span class="copyable">'+esc(asnLabel)+'</span>'))+'</td>'+
       '<td class="copyable">'+esc(countryLabel)+'</td>'+
     '</tr>';
   }).join('');
-  document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="7">No events</td></tr>';
+  document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="9">No events</td></tr>';
 
   const pageInfo = 'Page '+String(window.minecraftEventsPage)+' / '+String(maxPage)+' · '+String(total)+' events';
   document.getElementById('eventPageInfo').textContent = pageInfo;
@@ -5227,6 +5542,7 @@ document.getElementById('btnFilter').addEventListener('click', function(){
 });
 document.getElementById('fCountry').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('Country filter failed: ' + String(err && err.message ? err.message : err), true)); });
 document.getElementById('fAsn').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('ASN filter failed: ' + String(err && err.message ? err.message : err), true)); });
+document.getElementById('fSource').addEventListener('change', function(){ Promise.all([loadEventFilterOptions(), loadEvents(true)]).catch(err => setStatus('Source filter failed: ' + String(err && err.message ? err.message : err), true)); });
 document.getElementById('summaryHours').addEventListener('change', refreshAll);
 document.getElementById('fHours').addEventListener('change', refreshAll);
 document.getElementById('eventPageSize').addEventListener('change', function(){ loadEvents(true).catch(err => setStatus('Page size update failed: ' + String(err && err.message ? err.message : err), true)); });
@@ -5337,6 +5653,247 @@ window.minecraftEventsPage = 1;
 document.getElementById('toggleBannedBtn').textContent = 'Show banned events';
 syncIntelActionButtons(document.getElementById('intelType').value);
 setupAutoRefresh();
+</script>
+</body>
+</html>
+"""
+
+MINECRAFT_SETUP_WIZARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WardenIPS Minecraft Setup</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",Tahoma,Arial,sans-serif;background:linear-gradient(120deg,#0f172a,#1e293b);color:#e2e8f0;min-height:100vh}
+.wrap{max-width:1100px;margin:0 auto;padding:24px}
+.hero{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.title{font-size:1.8rem;font-weight:700;letter-spacing:.3px}
+.sub{color:#94a3b8}
+.grid{display:grid;grid-template-columns:280px 1fr;gap:16px}
+.panel{background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:14px;box-shadow:0 10px 40px #00000033}
+.steps{display:grid;gap:8px}
+.step{padding:10px 12px;border-radius:8px;background:#111a2e;border:1px solid #223458;color:#cbd5e1;font-size:.95rem}
+.step.active{border-color:#22d3ee;background:#062230;color:#67e8f9}
+.step.done{border-color:#10b981;background:#06261d;color:#6ee7b7}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+button{border:1px solid #334155;background:#0f172a;color:#e2e8f0;padding:9px 12px;border-radius:8px;cursor:pointer}
+button.primary{background:#0ea5e9;border-color:#0284c7;color:#001018;font-weight:700}
+button:disabled{opacity:.55;cursor:not-allowed}
+input[type='text']{width:100%;padding:10px;border-radius:8px;border:1px solid #334155;background:#0b1327;color:#e2e8f0}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{border-bottom:1px solid #24314f;padding:8px;text-align:left;font-size:.92rem}
+.ok{color:#34d399}
+.warn{color:#fbbf24}
+.err{color:#f87171}
+.mono{font-family:Consolas,"Courier New",monospace;word-break:break-all}
+.hidden{display:none}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.8rem;border:1px solid #334155;background:#0f172a}
+@media (max-width: 880px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div>
+      <div class="title">Minecraft AuthMe Setup Wizard</div>
+      <div class="sub">Guide for first-time setup: detect logs, validate format, review config, and finalize.</div>
+    </div>
+    <div class="sub">WardenIPS __APP_VERSION__ by __APP_AUTHOR__</div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div style="font-weight:700;margin-bottom:8px">Progress</div>
+      <div class="steps" id="steps">
+        <div class="step active" data-step="1">1. Detect AuthMe Logs</div>
+        <div class="step" data-step="2">2. Validate Log Format</div>
+        <div class="step" data-step="3">3. Review Configuration</div>
+        <div class="step" data-step="4">4. Final Validation</div>
+        <div class="step" data-step="5">5. Complete Setup</div>
+      </div>
+      <div class="actions">
+        <button id="prevBtn">Back</button>
+        <button class="primary" id="nextBtn">Next</button>
+      </div>
+      <div id="status" class="sub" style="margin-top:10px">Ready.</div>
+    </div>
+
+    <div class="panel">
+      <section id="step1">
+        <h3>Step 1: Detect Logs</h3>
+        <p class="sub">Search common AuthMe log locations.</p>
+        <button class="primary" id="detectBtn">Scan Common Paths</button>
+        <table>
+          <thead><tr><th>Path</th><th>Size</th><th>Updated</th><th>Select</th></tr></thead>
+          <tbody id="logRows"><tr><td colspan="4" class="sub">No scan yet.</td></tr></tbody>
+        </table>
+      </section>
+
+      <section id="step2" class="hidden">
+        <h3>Step 2: Validate Log</h3>
+        <p class="sub">Confirm parser compatibility for the chosen file.</p>
+        <label>Log path</label>
+        <input id="logPath" type="text" placeholder="plugins/authme/authme.log">
+        <div class="actions">
+          <button class="primary" id="validateBtn">Validate</button>
+        </div>
+        <div id="validateOut" class="sub" style="margin-top:10px"></div>
+      </section>
+
+      <section id="step3" class="hidden">
+        <h3>Step 3: Current Config</h3>
+        <p class="sub">Review active minecraft/authme settings.</p>
+        <pre id="cfgOut" class="mono" style="white-space:pre-wrap;background:#0a1020;border:1px solid #223458;padding:10px;border-radius:8px">Loading...</pre>
+      </section>
+
+      <section id="step4" class="hidden">
+        <h3>Step 4: Final Validation</h3>
+        <p class="sub">Run final checks before saving setup.</p>
+        <button class="primary" id="finalCheckBtn">Run Validation</button>
+        <div id="finalOut" style="margin-top:10px"></div>
+      </section>
+
+      <section id="step5" class="hidden">
+        <h3>Step 5: Complete</h3>
+        <p class="sub">Persist AuthMe log path and finish wizard.</p>
+        <button class="primary" id="completeBtn">Complete Setup</button>
+        <div id="completeOut" style="margin-top:10px"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const state = { step: 1, logPath: '' };
+
+function setStatus(msg, isErr){
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = isErr ? 'err' : 'sub';
+}
+
+async function api(url, options){
+  const resp = await fetch(url, Object.assign({credentials:'same-origin'}, options || {}));
+  let data = {};
+  try { data = await resp.json(); } catch(_e){}
+  if(!resp.ok){ throw new Error(String(data.message || data.error || ('HTTP ' + resp.status))); }
+  return data;
+}
+
+function showStep(step){
+  state.step = Math.max(1, Math.min(5, Number(step || 1)));
+  for(let i=1;i<=5;i++){
+    const sec = document.getElementById('step'+i);
+    const badge = document.querySelector('.step[data-step="'+i+'"]');
+    if(sec){ sec.classList.toggle('hidden', i !== state.step); }
+    if(badge){
+      badge.classList.toggle('active', i === state.step);
+      badge.classList.toggle('done', i < state.step);
+    }
+  }
+  document.getElementById('prevBtn').disabled = state.step <= 1;
+  document.getElementById('nextBtn').disabled = state.step >= 5;
+}
+
+async function loadConfig(){
+  const data = await api('/api/minecraft/setup/get-config');
+  document.getElementById('cfgOut').textContent = JSON.stringify(data.plugins || {}, null, 2);
+}
+
+async function detectLogs(){
+  setStatus('Scanning common AuthMe paths...', false);
+  const data = await api('/api/minecraft/setup/detect-logs');
+  const rows = Array.isArray(data.found_logs) ? data.found_logs : [];
+  const tbody = document.getElementById('logRows');
+  if(!rows.length){
+    tbody.innerHTML = '<tr><td colspan="4" class="warn">No readable AuthMe logs found.</td></tr>';
+    setStatus('No logs detected. Enter path manually in Step 2.', true);
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const path = String(r.path || '');
+    const size = Number(r.size_bytes || 0);
+    const updated = String(r.last_modified || '-');
+    return '<tr>'+
+      '<td class="mono">'+path.replace(/</g,'&lt;')+'</td>'+
+      '<td>'+size+'</td>'+
+      '<td>'+updated.replace(/</g,'&lt;')+'</td>'+
+      '<td><button data-path="'+path.replace(/"/g,'&quot;')+'">Use</button></td>'+
+      '</tr>';
+  }).join('');
+  tbody.querySelectorAll('button[data-path]').forEach(btn => {
+    btn.addEventListener('click', function(){
+      const path = this.getAttribute('data-path') || '';
+      state.logPath = path;
+      document.getElementById('logPath').value = path;
+      setStatus('Selected: ' + path, false);
+      showStep(2);
+    });
+  });
+  setStatus('Detected ' + rows.length + ' log file(s).', false);
+}
+
+async function validateLog(){
+  const path = String(document.getElementById('logPath').value || '').trim();
+  if(!path){ setStatus('Please provide log path first.', true); return; }
+  state.logPath = path;
+  setStatus('Validating log format...', false);
+  const data = await api('/api/minecraft/setup/validate-log', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({log_path: path})
+  });
+  const out = document.getElementById('validateOut');
+  out.innerHTML = ''+
+    '<div><span class="badge">Matched</span> '+String(data.matched_events || 0)+'</div>'+
+    '<div><span class="badge">Total</span> '+String(data.total_lines || 0)+'</div>'+
+    '<div><span class="badge">Rate</span> '+String(data.match_rate || '0%')+'</div>';
+  setStatus('Validation completed.', false);
+}
+
+async function finalValidate(){
+  const path = state.logPath || String(document.getElementById('logPath').value || '').trim();
+  if(!path){ setStatus('Log path is missing.', true); return; }
+  setStatus('Running final checks...', false);
+  const data = await api('/api/minecraft/setup/validate-complete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({log_path: path})
+  });
+  const errs = Array.isArray(data.errors) ? data.errors : [];
+  const warns = Array.isArray(data.warnings) ? data.warnings : [];
+  const out = document.getElementById('finalOut');
+  out.innerHTML = '' +
+    '<div class="'+(data.ok ? 'ok' : 'err')+'">'+String(data.summary || '')+'</div>' +
+    (errs.length ? '<ul class="err">'+errs.map(x => '<li>'+String(x).replace(/</g,'&lt;')+'</li>').join('')+'</ul>' : '') +
+    (warns.length ? '<ul class="warn">'+warns.map(x => '<li>'+String(x).replace(/</g,'&lt;')+'</li>').join('')+'</ul>' : '');
+  setStatus(data.ok ? 'Final validation passed.' : 'Final validation failed.', !data.ok);
+}
+
+async function completeSetup(){
+  const path = state.logPath || String(document.getElementById('logPath').value || '').trim();
+  if(!path){ setStatus('Log path is missing.', true); return; }
+  setStatus('Saving setup...', false);
+  const data = await api('/api/minecraft/setup/complete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({log_path: path})
+  });
+  document.getElementById('completeOut').innerHTML = '<div class="ok">'+String(data.message || 'Setup completed.')+'</div>';
+  setStatus('Setup completed.', false);
+}
+
+document.getElementById('prevBtn').addEventListener('click', function(){ showStep(state.step - 1); });
+document.getElementById('nextBtn').addEventListener('click', function(){ showStep(state.step + 1); if(state.step === 3){ loadConfig().catch(err => setStatus(String(err.message || err), true)); } });
+document.getElementById('detectBtn').addEventListener('click', function(){ detectLogs().catch(err => setStatus(String(err.message || err), true)); });
+document.getElementById('validateBtn').addEventListener('click', function(){ validateLog().catch(err => setStatus(String(err.message || err), true)); });
+document.getElementById('finalCheckBtn').addEventListener('click', function(){ finalValidate().catch(err => setStatus(String(err.message || err), true)); });
+document.getElementById('completeBtn').addEventListener('click', function(){ completeSetup().catch(err => setStatus(String(err.message || err), true)); });
+
+showStep(1);
+loadConfig().catch(function(){ });
 </script>
 </body>
 </html>
