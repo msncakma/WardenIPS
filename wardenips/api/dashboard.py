@@ -40,7 +40,7 @@ import os
 import secrets
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote, urlencode
 
@@ -324,7 +324,24 @@ class DashboardAPI:
     connection_type = str(event.get("connection_type") or "").strip().lower()
     if connection_type == "ssh" and event_type == "accepted_login":
       return "SUCCESS"
+    if connection_type == "minecraft" and event_type in {"login", "velocity_connected"}:
+      return "SUCCESS"
     return str(event.get("threat_level") or "NONE").upper()
+
+  @staticmethod
+  def _to_jsonable(value):
+    if isinstance(value, dict):
+      return {str(k): DashboardAPI._to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+      return [DashboardAPI._to_jsonable(v) for v in value]
+    if isinstance(value, (datetime, date)):
+      return value.isoformat()
+    if isinstance(value, bytes):
+      try:
+        return value.decode("utf-8", errors="replace")
+      except Exception:
+        return str(value)
+    return value
 
   @staticmethod
   def _extract_event_port(event: dict, details_obj: Optional[dict] = None) -> Optional[str]:
@@ -2724,17 +2741,19 @@ class DashboardAPI:
     risk_peak = max([int(e.get("risk_score") or 0) for e in local_events], default=0)
 
     return web.json_response(
-      {
-        "type": entity_type,
-        "value": value,
-        "count": len(local_events),
-        "risk_peak": risk_peak,
-        "unique_ips": unique_ips,
-        "unique_users": unique_users,
-        "events": local_events,
-        "mysql": mysql_payload,
-        "mysql_backfilled": mysql_backfilled,
-      }
+      self._to_jsonable(
+        {
+          "type": entity_type,
+          "value": value,
+          "count": len(local_events),
+          "risk_peak": risk_peak,
+          "unique_ips": unique_ips,
+          "unique_users": unique_users,
+          "events": local_events,
+          "mysql": mysql_payload,
+          "mysql_backfilled": mysql_backfilled,
+        }
+      )
     )
 
   async def _fetch_mysql_player_by_username(self, username: str) -> Optional[dict]:
@@ -2798,7 +2817,7 @@ class DashboardAPI:
           row["duplicate_email_count"] = duplicate_count
           row["enabled"] = True
           row["found"] = True
-          return row
+          return self._to_jsonable(row)
       finally:
         conn.close()
 

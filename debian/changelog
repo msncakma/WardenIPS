@@ -1,3 +1,11 @@
+wardenips (0.4.0~beta6-1) stable; urgency=medium
+
+  * Fix Minecraft entity-intel JSON serialization for datetime/date payloads
+  * Mark Minecraft/Velocity successful login events as SUCCESS in dashboard threat labeling
+  * Bump version to 0.4.0-beta-6
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 14:45:00 +0000
+
 wardenips (0.4.0~beta5-1) stable; urgency=medium
 
   * Force systemd ProtectHome=read-only automatically (no config toggle)
