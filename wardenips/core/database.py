@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -67,6 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_events_risk_score
 
 CREATE INDEX IF NOT EXISTS idx_events_connection_type
     ON connection_events(connection_type);
+
+CREATE INDEX IF NOT EXISTS idx_events_connection_type_ts
+    ON connection_events(connection_type, timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_events_player_ts
+    ON connection_events(player_name, timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_events_source_ip_ts
+    ON connection_events(source_ip, timestamp);
 
 -- Ban history table
 CREATE TABLE IF NOT EXISTS ban_history (
@@ -116,6 +125,24 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_created_at
     ON audit_log(created_at);
+
+-- Minecraft observe-only burst anomalies
+CREATE TABLE IF NOT EXISTS minecraft_burst_alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT    NOT NULL,
+    source_ip       TEXT    NOT NULL,
+    event_count     INTEGER NOT NULL,
+    window_seconds  INTEGER NOT NULL,
+    unique_ip_count INTEGER NOT NULL DEFAULT 1,
+    plugin_name     TEXT    NOT NULL DEFAULT 'minecraft',
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mc_burst_timestamp
+    ON minecraft_burst_alerts(timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_mc_burst_source_ip
+    ON minecraft_burst_alerts(source_ip);
 
 -- Schema version table (for migrations)
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -238,6 +265,8 @@ class DatabaseManager:
                         )
                         if current < 3:
                             await self._migrate_v2_to_v3_source_ip()
+                        if current < 5:
+                            await self._migrate_v4_to_v5_minecraft_alerts()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
@@ -275,6 +304,38 @@ class DatabaseManager:
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_bans_source_ip ON ban_history(source_ip)"
+        )
+
+    async def _migrate_v4_to_v5_minecraft_alerts(self) -> None:
+        """Adds minecraft burst alert table and analytics indexes."""
+        await self._db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS minecraft_burst_alerts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       TEXT    NOT NULL,
+                source_ip       TEXT    NOT NULL,
+                event_count     INTEGER NOT NULL,
+                window_seconds  INTEGER NOT NULL,
+                unique_ip_count INTEGER NOT NULL DEFAULT 1,
+                plugin_name     TEXT    NOT NULL DEFAULT 'minecraft',
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mc_burst_timestamp
+                ON minecraft_burst_alerts(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_mc_burst_source_ip
+                ON minecraft_burst_alerts(source_ip);
+
+            CREATE INDEX IF NOT EXISTS idx_events_connection_type_ts
+                ON connection_events(connection_type, timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_events_player_ts
+                ON connection_events(player_name, timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_events_source_ip_ts
+                ON connection_events(source_ip, timestamp);
+            """
         )
 
     # ── Olay Kaydi ──
@@ -391,6 +452,40 @@ class DatabaseManager:
             except Exception as exc:
                 raise WardenDatabaseError(
                     f"Ban logging failed: {exc}"
+                ) from exc
+
+    async def log_minecraft_burst_alert(
+        self,
+        source_ip: str,
+        event_count: int,
+        window_seconds: int,
+        unique_ip_count: int = 1,
+        plugin_name: str = "minecraft",
+    ) -> int:
+        """Logs a Minecraft burst anomaly for observe-only analytics."""
+        async with self._lock:
+            try:
+                now = datetime.utcnow().isoformat()
+                async with self._db.execute(
+                    """
+                    INSERT INTO minecraft_burst_alerts
+                        (timestamp, source_ip, event_count, window_seconds, unique_ip_count, plugin_name)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        source_ip,
+                        int(event_count),
+                        int(window_seconds),
+                        max(int(unique_ip_count), 1),
+                        str(plugin_name or "minecraft").strip().lower(),
+                    ),
+                ) as cursor:
+                    await self._db.commit()
+                    return int(cursor.lastrowid)
+            except Exception as exc:
+                raise WardenDatabaseError(
+                    f"Minecraft burst alert logging failed: {exc}"
                 ) from exc
 
     # ── Sorgu Metodlari ──

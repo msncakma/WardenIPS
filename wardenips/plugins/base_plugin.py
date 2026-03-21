@@ -182,6 +182,20 @@ class BasePlugin(abc.ABC):
             Action recommendation string.
         """
         ban_threshold = self._config.get("firewall.ban_threshold", 70)
+        plugin_key = self.name.strip().lower()
+        if plugin_key in {"minecraft", "velocity"}:
+            observe_enabled = bool(
+                self._config.get("plugins.minecraft.observe_only.enabled", False)
+            )
+            enforce_enabled = bool(
+                self._config.get("plugins.minecraft.observe_only.enforcement_enabled", False)
+            )
+            if observe_enabled and not enforce_enabled:
+                if risk_score >= 40:
+                    return "WATCH"
+                elif risk_score >= 10:
+                    return "LOG"
+                return "IGNORE"
 
         if risk_score >= ban_threshold:
             return "BAN"

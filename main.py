@@ -41,6 +41,7 @@ from wardenips.api.dashboard import DashboardAPI
 from wardenips.plugins.base_plugin import PluginManager
 from wardenips.plugins.ssh_plugin import SSHPlugin
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
+from wardenips.plugins.velocity_plugin import VelocityPlugin
 from wardenips.plugins.nginx_plugin import NginxPlugin
 from wardenips.plugins.portscan_plugin import PortscanPlugin
 
@@ -207,6 +208,9 @@ class WardenIPS:
         if self._config.get("plugins.minecraft.enabled", True):
             mc_plugin = MinecraftPlugin(self._config)
             self._plugin_manager.register(mc_plugin)
+            if self._config.get("plugins.minecraft.velocity.enabled", False):
+                velocity_plugin = VelocityPlugin(self._config)
+                self._plugin_manager.register(velocity_plugin)
 
         # Nginx Plugin
         if self._config.get("plugins.nginx.enabled", False):
@@ -259,14 +263,25 @@ class WardenIPS:
             # brute-force / botnet floods that would slip through the
             # per-event scoring before enough events accumulate.
             now_mono = time.monotonic()
+            burst_window = self._burst_window
+            burst_threshold = self._burst_threshold
+            if plugin.name.strip().lower() in {"minecraft", "velocity"}:
+                burst_window = max(
+                    int(self._config.get("plugins.minecraft.observe_only.burst_window_seconds", 1)),
+                    1,
+                )
+                burst_threshold = max(
+                    int(self._config.get("plugins.minecraft.observe_only.burst_threshold_per_second", 10)),
+                    2,
+                )
             ts_list = self._burst_tracker[event.source_ip]
             ts_list.append(now_mono)
             # Prune old timestamps outside the window
-            cutoff = now_mono - self._burst_window
+            cutoff = now_mono - burst_window
             self._burst_tracker[event.source_ip] = ts_list = [
                 t for t in ts_list if t > cutoff
             ]
-            if len(ts_list) >= self._burst_threshold:
+            if len(ts_list) >= burst_threshold:
                 source_ip = event.source_ip
                 ban_duration = max(
                     int(self._config.get("firewall.ipset.default_ban_duration", 0)),
@@ -274,8 +289,25 @@ class WardenIPS:
                 )
                 reason = (
                     f"[{plugin.name}] BURST FLOOD — "
-                    f"{len(ts_list)} events in {self._burst_window}s"
+                    f"{len(ts_list)} events in {burst_window}s"
                 )
+                if self._is_minecraft_observe_only(plugin.name):
+                    await self._db.log_minecraft_burst_alert(
+                        source_ip=source_ip,
+                        event_count=len(ts_list),
+                        window_seconds=burst_window,
+                        unique_ip_count=1,
+                        plugin_name=plugin.name,
+                    )
+                    self._logger.warning(
+                        "MINECRAFT OBSERVE-ONLY BURST: IP=%s Events=%d/%ds Plugin=%s",
+                        event.source_ip,
+                        len(ts_list),
+                        burst_window,
+                        plugin.name,
+                    )
+                    self._burst_tracker.pop(source_ip, None)
+                    return
                 protected = await self._is_critical_protected_ip(source_ip)
                 if protected:
                     self._logger.critical(
@@ -296,12 +328,12 @@ class WardenIPS:
                         "BURST DETECTED: IP=%s Events=%d/%ds — AUTO-BANNED "
                         "Plugin=%s",
                         event.source_ip, len(ts_list),
-                        self._burst_window, plugin.name,
+                        burst_window, plugin.name,
                     )
                     await self._notifier.notify_burst(
                         ip=event.source_ip,
                         event_count=len(ts_list),
-                        window=self._burst_window,
+                        window=burst_window,
                         plugin=plugin.name,
                     )
                     # Clear tracker for this IP so we don't keep re-banning
@@ -319,7 +351,7 @@ class WardenIPS:
             )
             success_event_type_map = {
                 "ssh": ["accepted_login"],
-                "minecraft": ["login"],
+                "minecraft": ["login", "velocity_connected"],
             }
             success_event_types = success_event_type_map.get(
                 event.connection_type.value,
@@ -413,6 +445,14 @@ class WardenIPS:
             action = plugin.get_action_recommendation(risk_score)
 
             if action == "BAN":
+                if self._is_minecraft_observe_only(plugin.name):
+                    self._logger.info(
+                        "Minecraft observe-only active; ban suppressed for IP=%s Plugin=%s Risk=%d",
+                        source_ip,
+                        plugin.name,
+                        risk_score,
+                    )
+                    return
                 prior_ban_count = await self._db.get_total_ban_count_by_ip(source_ip)
                 ban_duration = max(
                     int(self._config.get("firewall.ipset.default_ban_duration", 0)),
@@ -490,6 +530,18 @@ class WardenIPS:
                 )
 
         return handler
+
+    def _is_minecraft_observe_only(self, plugin_name: str) -> bool:
+        plugin_key = str(plugin_name or "").strip().lower()
+        if plugin_key not in {"minecraft", "velocity"}:
+            return False
+        observe_enabled = bool(
+            self._config.get("plugins.minecraft.observe_only.enabled", False)
+        )
+        enforce_enabled = bool(
+            self._config.get("plugins.minecraft.observe_only.enforcement_enabled", False)
+        )
+        return observe_enabled and not enforce_enabled
 
     async def _apply_runtime_safety_whitelist(self) -> None:
         """Add runtime-only safety IPs to reduce accidental operator lockout."""

@@ -505,6 +505,7 @@ class DashboardAPI:
     self._app.router.add_get("/", self._handle_root)
     self._app.router.add_get("/dashboard", self._handle_dashboard)
     self._app.router.add_get("/admin", self._handle_dashboard_v2)
+    self._app.router.add_get("/admin/minecraft", self._handle_minecraft_admin_page)
     self._app.router.add_get("/v2", self._handle_dashboard_v2)
     self._app.router.add_get("/login", self._handle_login_page)
     self._app.router.add_get("/setup", self._handle_setup_page)
@@ -528,6 +529,10 @@ class DashboardAPI:
     self._app.router.add_get("/api/geo-heatmap", self._handle_geo_heatmap)
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
+    self._app.router.add_get("/api/minecraft/summary", self._handle_minecraft_summary)
+    self._app.router.add_get("/api/minecraft/events", self._handle_minecraft_events)
+    self._app.router.add_get("/api/minecraft/bursts", self._handle_minecraft_bursts)
+    self._app.router.add_get("/api/minecraft/duplicates/email", self._handle_minecraft_duplicate_emails)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
@@ -1744,6 +1749,24 @@ class DashboardAPI:
     if not categories:
       categories = [14]
 
+    raw_respect = payload.get("respect_report_rate_limit", True)
+    if isinstance(raw_respect, bool):
+      respect_report_rate_limit = raw_respect
+    elif isinstance(raw_respect, (int, float)):
+      respect_report_rate_limit = bool(int(raw_respect))
+    elif isinstance(raw_respect, str):
+      respect_report_rate_limit = raw_respect.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+      respect_report_rate_limit = True
+
+    try:
+      report_interval_ms = int(payload.get("report_interval_ms", 2200))
+    except Exception:
+      report_interval_ms = 2200
+    report_interval_ms = min(max(report_interval_ms, 500), 15000)
+    report_interval_seconds = report_interval_ms / 1000.0
+    last_report_at = 0.0
+
     entries: list[tuple[str, str]] = []
     for raw_line in lines_text.splitlines():
       line = str(raw_line or "").strip()
@@ -1801,14 +1824,35 @@ class DashboardAPI:
 
       reported = False
       if action in {"report", "report_and_ban"} and self._abuse_reporter:
+        if respect_report_rate_limit and last_report_at > 0:
+          elapsed = time.monotonic() - last_report_at
+          wait_seconds = report_interval_seconds - elapsed
+          if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
         try:
           reported = await self._abuse_reporter.report_ip(
             ip=ip_value,
             categories=categories,
             comment=f"{final_reason} | Trigger: admin bulk {action}",
           )
+          last_report_at = time.monotonic()
         except Exception:
           reported = False
+          last_report_at = time.monotonic()
+
+        # One paced retry helps when bursts hit provider-side throttling.
+        if not reported and respect_report_rate_limit:
+          await asyncio.sleep(report_interval_seconds)
+          try:
+            reported = await self._abuse_reporter.report_ip(
+              ip=ip_value,
+              categories=categories,
+              comment=f"{final_reason} | Trigger: admin bulk {action} (retry)",
+            )
+            last_report_at = time.monotonic()
+          except Exception:
+            reported = False
+            last_report_at = time.monotonic()
 
       item["ban_applied"] = ban_applied
       item["reported"] = reported
@@ -1817,10 +1861,10 @@ class DashboardAPI:
         item["message"] = "ban applied" if ban_applied else "ban skipped"
       elif action == "report":
         item["ok"] = bool(reported)
-        item["message"] = "reported" if reported else "report skipped"
+        item["message"] = "reported" if reported else "report skipped (rate-limit/provider/no-reporter)"
       else:
         item["ok"] = bool(ban_applied or reported)
-        parts = ["ban applied" if ban_applied else "ban skipped", "reported" if reported else "report skipped"]
+        parts = ["ban applied" if ban_applied else "ban skipped", "reported" if reported else "report skipped (rate-limit/provider/no-reporter)"]
         item["message"] = ", ".join(parts)
       results.append(item)
 
@@ -1854,6 +1898,8 @@ class DashboardAPI:
         "reported": reported_count,
         "ban_applied": ban_count,
         "categories": categories,
+        "respect_report_rate_limit": respect_report_rate_limit,
+        "report_interval_ms": report_interval_ms,
         "message": f"Bulk action completed: {success_count}/{len(results)} successful.",
         "results": results,
       }
@@ -2420,10 +2466,329 @@ class DashboardAPI:
     html = self._render_ui_template(html)
     return web.Response(text=html, content_type="text/html")
 
+  async def _handle_minecraft_admin_page(self, request: web.Request) -> web.Response:
+    auth_redirect = self._require_dashboard_auth(request)
+    if auth_redirect is not None:
+      return auth_redirect
+    self._touch_session(request)
+    html = self._render_ui_template(MINECRAFT_ADMIN_HTML)
+    return web.Response(text=html, content_type="text/html")
+
+  async def _handle_minecraft_summary(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    hours = min(max(int(request.query.get("hours", "24")), 1), 720)
+    try:
+      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
+      async with self._db._lock:
+        async with self._db._db.execute(
+          f"""
+          SELECT
+            COUNT(*) AS event_count,
+            COUNT(DISTINCT source_ip) AS unique_ips,
+            COUNT(DISTINCT COALESCE(player_name, '')) AS unique_players,
+            SUM(CASE WHEN details LIKE '%\"event_type\": \"velocity_connected\"%' OR details LIKE '%\"event_type\": \"login\"%' THEN 1 ELSE 0 END) AS login_like_events,
+            SUM(CASE WHEN details LIKE '%\"event_type\": \"velocity_disconnect\"%' OR details LIKE '%\"event_type\": \"ip_disconnect\"%' THEN 1 ELSE 0 END) AS disconnect_events,
+            MAX(risk_score) AS peak_risk
+          FROM connection_events
+          WHERE connection_type = 'minecraft'
+            AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')
+          """,
+          (f"-{hours}",),
+        ) as cursor:
+          row = await cursor.fetchone()
+
+        async with self._db._db.execute(
+          """
+          SELECT COUNT(*)
+          FROM minecraft_burst_alerts
+          WHERE COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')
+          """,
+          (f"-{hours}",),
+        ) as burst_cursor:
+          burst_row = await burst_cursor.fetchone()
+
+      payload = {
+        "hours": hours,
+        "event_count": int((row[0] or 0) if row else 0),
+        "unique_ips": int((row[1] or 0) if row else 0),
+        "unique_players": int((row[2] or 0) if row else 0),
+        "login_like_events": int((row[3] or 0) if row else 0),
+        "disconnect_events": int((row[4] or 0) if row else 0),
+        "peak_risk": int((row[5] or 0) if row else 0),
+        "burst_alerts": int((burst_row[0] or 0) if burst_row else 0),
+        "observe_only_enabled": bool(self._config.get("plugins.minecraft.observe_only.enabled", False)),
+        "enforcement_enabled": bool(self._config.get("plugins.minecraft.observe_only.enforcement_enabled", False)),
+      }
+      return web.json_response(payload)
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_minecraft_events(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    limit = min(max(int(request.query.get("limit", "100")), 1), 1000)
+    offset = max(int(request.query.get("offset", "0")), 0)
+    username = str(request.query.get("username", "")).strip()
+    source_ip = str(request.query.get("ip", "")).strip()
+    event_type = str(request.query.get("event_type", "")).strip().lower()
+    try:
+      query = """
+        SELECT id, timestamp, source_ip, player_name, connection_type,
+               asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details
+        FROM connection_events
+        WHERE connection_type = 'minecraft'
+      """
+      params: list[object] = []
+      if username:
+        query += " AND player_name = ?"
+        params.append(username)
+      if source_ip:
+        query += " AND source_ip = ?"
+        params.append(source_ip)
+      if event_type:
+        query += " AND LOWER(COALESCE(details, '')) LIKE ?"
+        params.append(f'%\"event_type\": \"{event_type}%')
+      query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+      params.extend([limit, offset])
+
+      async with self._db._lock:
+        async with self._db._db.execute(query, tuple(params)) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          events = [dict(zip(columns, row)) for row in rows]
+
+      for event in events:
+        details_obj = {}
+        details_raw = event.get("details")
+        if isinstance(details_raw, str) and details_raw:
+          try:
+            details_obj = json.loads(details_raw)
+          except Exception:
+            details_obj = {}
+        event["event_type"] = str(details_obj.get("event_type") or "")
+        event["country_code"] = self._resolve_country_code(details_obj, event.get("source_ip"))
+
+      return web.json_response({"events": events, "count": len(events), "limit": limit, "offset": offset})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_minecraft_bursts(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    limit = min(max(int(request.query.get("limit", "50")), 1), 500)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT id, timestamp, source_ip, event_count, window_seconds, unique_ip_count, plugin_name
+          FROM minecraft_burst_alerts
+          ORDER BY id DESC
+          LIMIT ?
+          """,
+          (limit,),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          alerts = [dict(zip(columns, row)) for row in rows]
+      return web.json_response({"alerts": alerts, "count": len(alerts)})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
+  async def _handle_minecraft_duplicate_emails(self, request: web.Request) -> web.Response:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    self._touch_session(request)
+    limit = min(max(int(request.query.get("limit", "50")), 1), 500)
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(
+          """
+          SELECT source_ip, player_name, timestamp, details
+          FROM connection_events
+          WHERE connection_type = 'minecraft'
+            AND COALESCE(details, '') LIKE '%"duplicate_email_count":%'
+          ORDER BY id DESC
+          LIMIT ?
+          """,
+          (limit,),
+        ) as cursor:
+          rows = await cursor.fetchall()
+
+      findings = []
+      for source_ip, player_name, timestamp, details_raw in rows:
+        details_obj = {}
+        if isinstance(details_raw, str) and details_raw:
+          try:
+            details_obj = json.loads(details_raw)
+          except Exception:
+            details_obj = {}
+        duplicate_count = int(details_obj.get("duplicate_email_count", 0) or 0)
+        email_value = str(details_obj.get("email") or "")
+        if duplicate_count <= 1:
+          continue
+        findings.append(
+          {
+            "timestamp": timestamp,
+            "source_ip": source_ip,
+            "player_name": player_name,
+            "email": email_value,
+            "duplicate_email_count": duplicate_count,
+          }
+        )
+      return web.json_response({"findings": findings, "count": len(findings)})
+    except Exception as exc:
+      return web.json_response({"error": str(exc)}, status=500)
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Full SPA Dashboard — Dark theme, auto-refresh, CSS-only charts
 # ══════════════════════════════════════════════════════════════════════
+
+MINECRAFT_ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WardenIPS Minecraft Admin</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;font-family:"Aptos","Segoe UI",sans-serif;color:#f5f6fb;background:radial-gradient(1200px 600px at 15% -10%,#143754 0%,#0f1724 45%,#090d14 100%)}
+.wrap{max-width:1180px;margin:0 auto;padding:22px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.top a{color:#8ee6ff;text-decoration:none}
+.badge{display:inline-flex;gap:8px;padding:8px 12px;border-radius:999px;border:1px solid #2e405a;background:#0e1b2b;color:#b9dff8;font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:14px}
+.card{background:linear-gradient(180deg,#122236,#0d1727);border:1px solid #27405a;border-radius:14px;padding:14px}
+.k{color:#93abc4;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
+.v{font-size:1.5rem;font-weight:700;margin-top:6px}
+.panel{margin-top:14px;background:linear-gradient(180deg,#122236,#0b1523);border:1px solid #27405a;border-radius:14px;padding:14px}
+.controls{display:grid;grid-template-columns:1.1fr 1fr 1fr auto;gap:10px;margin-bottom:12px}
+input,select,button{border-radius:10px;border:1px solid #2f4861;background:#0c1a2a;color:#ecf3fb;padding:10px}
+button{background:linear-gradient(135deg,#26c6da,#2f80ed);border:0;font-weight:700;cursor:pointer}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px;border-bottom:1px solid #23394f;font-size:.9rem}
+th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
+@media (max-width:980px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.controls{grid-template-columns:1fr 1fr}}
+@media (max-width:640px){.grid{grid-template-columns:1fr}.controls{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1 style="margin:0 0 8px 0">Minecraft Intelligence</h1>
+        <div class="badge" id="modeBadge">Loading mode...</div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <a href="/admin">Open Main Admin</a>
+        <a href="/dashboard">Open Public Dashboard</a>
+      </div>
+    </div>
+
+    <div class="grid" id="summaryCards">
+      <div class="card"><div class="k">Events (24h)</div><div class="v" id="sumEvents">0</div></div>
+      <div class="card"><div class="k">Unique IPs</div><div class="v" id="sumIps">0</div></div>
+      <div class="card"><div class="k">Unique Players</div><div class="v" id="sumPlayers">0</div></div>
+      <div class="card"><div class="k">Burst Alerts</div><div class="v" id="sumBursts">0</div></div>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Advanced Event Query</h2>
+      <div class="controls">
+        <input id="fUser" placeholder="Username (exact)">
+        <input id="fIp" placeholder="IP (exact)">
+        <select id="fType">
+          <option value="">All event types</option>
+          <option value="login">login</option>
+          <option value="velocity_connected">velocity_connected</option>
+          <option value="velocity_disconnect">velocity_disconnect</option>
+          <option value="ip_disconnect">ip_disconnect</option>
+          <option value="failed_packet">failed_packet</option>
+        </select>
+        <button id="btnFilter">Apply</button>
+      </div>
+      <table>
+        <thead><tr><th>Time</th><th>IP</th><th>Player</th><th>Type</th><th>Risk</th><th>ASN</th><th>Country</th></tr></thead>
+        <tbody id="eventRows"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin:0 0 10px 0;font-size:1rem">Recent Burst Alerts</h2>
+      <table>
+        <thead><tr><th>Time</th><th>IP</th><th>Events</th><th>Window (sec)</th><th>Plugin</th></tr></thead>
+        <tbody id="burstRows"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+async function api(path){
+  const res = await fetch(path, {credentials:'same-origin'});
+  if(!res.ok){ throw new Error('HTTP '+res.status); }
+  return await res.json();
+}
+function esc(v){ return String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
+
+async function loadSummary(){
+  const s = await api('/api/minecraft/summary?hours=24');
+  document.getElementById('sumEvents').textContent = String(s.event_count || 0);
+  document.getElementById('sumIps').textContent = String(s.unique_ips || 0);
+  document.getElementById('sumPlayers').textContent = String(s.unique_players || 0);
+  document.getElementById('sumBursts').textContent = String(s.burst_alerts || 0);
+  const observeOnly = !!s.observe_only_enabled && !s.enforcement_enabled;
+  document.getElementById('modeBadge').textContent = observeOnly
+    ? 'Observe-Only Active (No Firewall Actions)'
+    : 'Enforcement may be enabled for Minecraft';
+}
+
+async function loadEvents(){
+  const user = encodeURIComponent(document.getElementById('fUser').value.trim());
+  const ip = encodeURIComponent(document.getElementById('fIp').value.trim());
+  const type = encodeURIComponent(document.getElementById('fType').value);
+  const q = '/api/minecraft/events?limit=150&username='+user+'&ip='+ip+'&event_type='+type;
+  const data = await api(q);
+  const rows = (data.events || []).map(e =>
+    '<tr>'+
+      '<td>'+esc(e.timestamp)+'</td>'+
+      '<td>'+esc(e.source_ip)+'</td>'+
+      '<td>'+esc(e.player_name || '-')+'</td>'+
+      '<td>'+esc(e.event_type || '-')+'</td>'+
+      '<td>'+esc(e.risk_score || 0)+'</td>'+
+      '<td>'+esc(e.asn_org || '-')+'</td>'+
+      '<td>'+esc(e.country_code || '-')+'</td>'+
+    '</tr>'
+  ).join('');
+  document.getElementById('eventRows').innerHTML = rows || '<tr><td colspan="7">No events</td></tr>';
+}
+
+async function loadBursts(){
+  const data = await api('/api/minecraft/bursts?limit=80');
+  const rows = (data.alerts || []).map(a =>
+    '<tr>'+
+      '<td>'+esc(a.timestamp)+'</td>'+
+      '<td>'+esc(a.source_ip)+'</td>'+
+      '<td>'+esc(a.event_count)+'</td>'+
+      '<td>'+esc(a.window_seconds)+'</td>'+
+      '<td>'+esc(a.plugin_name)+'</td>'+
+    '</tr>'
+  ).join('');
+  document.getElementById('burstRows').innerHTML = rows || '<tr><td colspan="5">No burst alerts</td></tr>';
+}
+
+document.getElementById('btnFilter').addEventListener('click', loadEvents);
+Promise.all([loadSummary(), loadEvents(), loadBursts()]).catch(err => {
+  console.error(err);
+  document.getElementById('modeBadge').textContent = 'Failed to load Minecraft analytics';
+});
+</script>
+</body>
+</html>
+"""
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -3537,6 +3902,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .row-kind{font-size:.68rem;font-weight:800;display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;border:1px solid var(--b)}
 .row-kind.event{color:#c9deff;background:color-mix(in srgb,var(--blue) 16%,transparent)}
 .row-kind.ban{color:#ffd3d7;background:color-mix(in srgb,var(--red) 16%,transparent)}
+.row-kind.ok{color:#b8ffe0;background:color-mix(in srgb,var(--green) 16%,transparent)}
+.row-kind.fail{color:#ffd3d7;background:color-mix(in srgb,var(--red) 16%,transparent)}
+.bulk-result-summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:10px}
+.bulk-result-summary .intel-item{padding:9px}
 .chip-editor{display:flex;flex-wrap:wrap;gap:8px;min-height:42px;padding:8px 10px;border:1px solid var(--b);border-radius:12px;background:var(--surface2)}
 .chip-editor.empty::before{content:'No ignored ports';color:var(--muted);font-size:.78rem}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;background:color-mix(in srgb,var(--blue) 20%,var(--surface));border:1px solid color-mix(in srgb,var(--blue) 40%,var(--b));font-size:.78rem}
@@ -3559,12 +3928,12 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .config-kv-kind{font-size:.66rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding:3px 7px;border:1px solid var(--b);border-radius:999px;background:var(--surface2);white-space:nowrap}
 .config-kv-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border:1px solid var(--b);border-radius:13px;background:linear-gradient(180deg,var(--surface),var(--surface2))}
 .config-group{border:1px solid var(--b);border-radius:14px;background:linear-gradient(180deg,var(--surface),var(--surface2));overflow:hidden}
-.config-group summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;font-size:.84rem;font-weight:800;border-bottom:1px solid color-mix(in srgb,var(--b) 76%,transparent);background:color-mix(in srgb,var(--surface2) 88%,var(--surface));user-select:none}
-.config-group summary::-webkit-details-marker{display:none}
-.config-group summary::after{content:'+';font-size:1rem;color:var(--muted)}
-.config-group[open] summary::after{content:'-'}
+.config-group-toggle{all:unset;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:10px 12px;font-size:.84rem;font-weight:800;border-bottom:1px solid color-mix(in srgb,var(--b) 76%,transparent);background:color-mix(in srgb,var(--surface2) 88%,var(--surface))}
+.config-group-toggle:hover{background:color-mix(in srgb,var(--surface2) 80%,var(--surface))}
+.config-group-sign{font-size:1rem;color:var(--muted);line-height:1}
 .config-group-count{font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
 .config-group-body{padding:10px;display:grid;gap:10px}
+.config-group:not(.open) .config-group-body{display:none}
 @media(max-width:1280px){.config-sections{column-count:2}}
 @media(max-width:900px){.config-sections{column-count:1}}
 @media(max-width:1180px){.toolbar-grid.three{grid-template-columns:minmax(0,1fr) minmax(125px,170px)}.toolbar-grid.three button{grid-column:1/-1}.toolbar-grid.query-grid{grid-template-columns:1fr 1fr}.toolbar-grid.query-grid button{grid-column:1/-1}}
@@ -3572,6 +3941,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 @media(max-width:680px){.toolbar-grid.query-grid{grid-template-columns:1fr}}
 @media(max-width:980px){.action-center-grid{grid-template-columns:1fr}.intel-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){.intel-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.bulk-result-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:680px){.bulk-result-summary{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -3689,6 +4060,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <textarea id="bulkIpLines" class="config-editor" style="min-height:110px;grid-column:1/-1" spellcheck="false" placeholder="203.0.113.5&#10;198.51.100.20 | ssh brute force&#10;2001:db8::7 | scanner"></textarea>
               <input id="bulkDuration" class="ctrl" type="number" min="0" value="0" placeholder="Duration (sec)">
               <button id="bulkActionBtn" class="btn cyan">Run Bulk Action</button>
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:-6px">
+              <label class="theme-chip" style="padding:6px 10px"><input id="bulkRespectRateLimit" type="checkbox" checked style="accent-color:var(--accent);width:1rem;height:1rem"><span>Respect AbuseIPDB rate-limit</span></label>
+              <input id="bulkReportIntervalMs" class="ctrl" type="number" min="500" step="100" value="2200" placeholder="Report interval ms">
+              <div class="sub" style="align-self:center">Higher interval = fewer skipped reports.</div>
             </div>
             <div class="sub">Line format: <span class="mono">IP</span> or <span class="mono">IP | note</span>. Notes are appended to report comment/reason.</div>
             <div class="toolbar-grid stack-label"><div class="sub">Manual Unban</div></div>
@@ -4010,6 +4386,38 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
   </div>
 </div>
 
+<div id="bulkResultModal" class="modal-backdrop" hidden>
+  <div class="modal-card" style="width:min(100%,1000px);max-height:min(88vh,920px)" role="dialog" aria-modal="true" aria-labelledby="bulkResultTitle">
+    <div class="modal-header">
+      <div>
+        <h2 id="bulkResultTitle">Bulk Action Results</h2>
+        <p id="bulkResultMeta">Per-IP execution summary.</p>
+      </div>
+      <div class="modal-header-actions">
+        <button id="closeBulkResultBtn" class="btn ghost">Close</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div id="bulkResultSummary" class="bulk-result-summary"></div>
+      <div class="toolbar" style="margin-bottom:10px">
+        <select id="bulkResultFilter" class="ctrl" style="max-width:260px">
+          <option value="all">Show: All</option>
+          <option value="failed">Show: Failed</option>
+          <option value="report_skipped">Show: Report Skipped</option>
+          <option value="reported_success">Show: Reported Success</option>
+        </select>
+        <div id="bulkResultFilterMeta" class="sub">Showing 0/0 rows.</div>
+      </div>
+      <div class="table-wrap" style="max-height:480px">
+        <table>
+          <thead><tr><th>IP</th><th>Status</th><th>Ban</th><th>Report</th><th>Message</th></tr></thead>
+          <tbody id="bulkResultRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
 
 <a class="kofi-fab" href="https://ko-fi.com/msncakma" target="_blank" rel="noopener" title="Support WardenIPS on Ko-fi">
@@ -4026,7 +4434,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:'', adminIncludeHoneypot:true};
+var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:'', adminIncludeHoneypot:true, bulkResultPayload:null};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -4257,10 +4665,26 @@ function renderAllConfigControls(){
     return '<div class="config-kv-item"><div class="config-kv-top"><div class="config-kv-path">'+E(path)+'</div><span class="config-kv-kind">string</span></div><input class="config-input" type="text" data-allcfg-path="'+E(path)+'" data-allcfg-kind="string" value="'+E(String(value||''))+'"></div>';
   }
   var roots=Object.keys(groups).sort();
-  host.innerHTML=roots.map(function(root){
+  host.innerHTML=roots.map(function(root,index){
     var items=groups[root].slice().sort(function(a,b){ return String(a.path||'').localeCompare(String(b.path||'')); });
-    return '<details class="config-group" open><summary><span>'+E(root||'root')+'</span><span class="config-group-count">'+N(items.length)+' keys</span></summary><div class="config-group-body">'+items.map(renderEntryControl).join('')+'</div></details>';
+    var isOpen=index===0;
+    return '<section class="config-group'+(isOpen?' open':'')+'"><button type="button" class="config-group-toggle" data-group-toggle aria-expanded="'+(isOpen?'true':'false')+'"><span>'+E(root||'root')+'</span><span style="display:inline-flex;align-items:center;gap:10px"><span class="config-group-count">'+N(items.length)+' keys</span><span class="config-group-sign">'+(isOpen?'-':'+')+'</span></span></button><div class="config-group-body">'+items.map(renderEntryControl).join('')+'</div></section>';
   }).join('');
+}
+function bindAllSettingsGroupToggles(){
+  var host=$('#cfgAllSettings');
+  if(!host){ return; }
+  host.addEventListener('click', function(ev){
+    var btn=ev.target.closest('[data-group-toggle]');
+    if(!btn){ return; }
+    var group=btn.closest('.config-group');
+    if(!group){ return; }
+    var open=!group.classList.contains('open');
+    group.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open?'true':'false');
+    var sign=btn.querySelector('.config-group-sign');
+    if(sign){ sign.textContent=open?'-':'+'; }
+  });
 }
 function collectAllConfigControlChanges(){
   var controls=Array.from(document.querySelectorAll('[data-allcfg-path]'));
@@ -4625,6 +5049,63 @@ function parseBulkCategories(raw){
     return true;
   });
 }
+function closeBulkResultModal(){
+  $('#bulkResultModal').hidden=true;
+  document.body.style.overflow='';
+}
+function filterBulkResults(results, filter){
+  var mode=String(filter||'all');
+  if(mode==='failed'){
+    return results.filter(function(item){ return !item.ok; });
+  }
+  if(mode==='report_skipped'){
+    return results.filter(function(item){ return !item.reported; });
+  }
+  if(mode==='reported_success'){
+    return results.filter(function(item){ return !!item.reported; });
+  }
+  return results;
+}
+function renderBulkResultModal(){
+  var payload=state.bulkResultPayload||{};
+  var results=Array.isArray(payload.results)?payload.results:[];
+  var total=Number(payload.total||results.length||0);
+  var success=Number(payload.success||0);
+  var failed=Number(payload.failed||Math.max(total-success,0));
+  var banApplied=Number(payload.ban_applied||0);
+  var reported=Number(payload.reported||0);
+  var action=String(payload.action||'bulk');
+  var categories=Array.isArray(payload.categories)?payload.categories:[];
+  $('#bulkResultMeta').textContent='Action: '+action+' · Categories: '+(categories.length?categories.join(','):'-');
+  $('#bulkResultSummary').innerHTML=''
+    +'<div class="intel-item"><span class="k">Total</span><span class="v">'+N(total)+'</span></div>'
+    +'<div class="intel-item"><span class="k">Success</span><span class="v" style="color:var(--green)">'+N(success)+'</span></div>'
+    +'<div class="intel-item"><span class="k">Failed</span><span class="v" style="color:var(--red)">'+N(failed)+'</span></div>'
+    +'<div class="intel-item"><span class="k">Ban Applied</span><span class="v">'+N(banApplied)+'</span></div>'
+    +'<div class="intel-item"><span class="k">Reported</span><span class="v">'+N(reported)+'</span></div>';
+  var filter=$('#bulkResultFilter') ? $('#bulkResultFilter').value : 'all';
+  var visible=filterBulkResults(results, filter);
+  $('#bulkResultFilterMeta').textContent='Showing '+N(visible.length)+'/'+N(results.length)+' rows.';
+  $('#bulkResultRows').innerHTML=visible.length?visible.map(function(item){
+    var ok=!!item.ok;
+    var ban=!!item.ban_applied;
+    var rep=!!item.reported;
+    return '<tr>'
+      +'<td class="mono">'+E(String(item.ip||'-'))+'</td>'
+      +'<td><span class="row-kind '+(ok?'ok':'fail')+'">'+(ok?'SUCCESS':'FAILED')+'</span></td>'
+      +'<td><span class="row-kind '+(ban?'ok':'fail')+'">'+(ban?'YES':'NO')+'</span></td>'
+      +'<td><span class="row-kind '+(rep?'ok':'fail')+'">'+(rep?'SUCCESS':'SKIPPED')+'</span></td>'
+      +'<td style="max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(String(item.message||''))+'">'+E(String(item.message||'-'))+'</td>'
+      +'</tr>';
+  }).join(''):'<tr><td colspan="5" class="empty">No per-IP results returned.</td></tr>';
+}
+function openBulkResultModal(payload){
+  state.bulkResultPayload=payload||{};
+  if($('#bulkResultFilter')){ $('#bulkResultFilter').value='all'; }
+  renderBulkResultModal();
+  $('#bulkResultModal').hidden=false;
+  document.body.style.overflow='hidden';
+}
 async function runBulkIpAction(){
   var action=String($('#bulkActionType').value||'ban');
   var lines=String($('#bulkIpLines').value||'').trim();
@@ -4638,6 +5119,9 @@ async function runBulkIpAction(){
   if(!Number.isFinite(duration)||duration<0){ duration=0; }
   var categories=parseBulkCategories($('#bulkCategories').value);
   if((action==='report' || action==='report_and_ban') && !categories.length){ categories=[14]; }
+  var respectRateLimit=!!($('#bulkRespectRateLimit')&&$('#bulkRespectRateLimit').checked);
+  var reportIntervalMs=parseInt(($('#bulkReportIntervalMs')||{value:'2200'}).value,10);
+  if(!Number.isFinite(reportIntervalMs) || reportIntervalMs<500){ reportIntervalMs=2200; }
   var payload=await api('/api/admin/bulk-ip-action', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -4646,7 +5130,9 @@ async function runBulkIpAction(){
       lines:lines,
       reason:reason,
       duration:duration,
-      categories:categories
+      categories:categories,
+      respect_report_rate_limit: respectRateLimit,
+      report_interval_ms: reportIntervalMs
     })
   });
   if(!payload){ return; }
@@ -4657,6 +5143,7 @@ async function runBulkIpAction(){
     message += ' · Failed: '+failedRows.map(function(item){ return String(item.ip||'?')+' ('+String(item.message||'skipped')+')'; }).join('; ');
   }
   setStatus((payload.failed||0)>0?'err':'ok','Bulk action completed', message);
+  openBulkResultModal(payload);
   await refresh();
 }
 function renderTopPortscannedPorts(){
@@ -4823,11 +5310,14 @@ function bind(){
   $('#configSectionSearch').addEventListener('input', function(){ debounce('config-search', filterConfigSections, 120); });
   $('#closeConfigBtn').addEventListener('click', function(){ closeConfigModal(); });
   $('#closeIpDetailBtn').addEventListener('click', function(){ closeIpDetailModal(); });
+  $('#closeBulkResultBtn').addEventListener('click', function(){ closeBulkResultModal(); });
+  $('#bulkResultFilter').addEventListener('change', function(){ renderBulkResultModal(); });
   $('#ipDetailToggleBanBtn').addEventListener('click', async function(){ await runIpDetailToggleBan(); });
   $('#ipDetailReportBanBtn').addEventListener('click', async function(){ await runIpDetailReportAndBan(); });
   $('#configModal').addEventListener('click', function(ev){ if(ev.target===this){ closeConfigModal(); } });
   $('#ipDetailModal').addEventListener('click', function(ev){ if(ev.target===this){ closeIpDetailModal(); } });
-  document.addEventListener('keydown', function(ev){ if(ev.key==='Escape' && !$('#configModal').hidden){ closeConfigModal(); } if(ev.key==='Escape' && !$('#ipDetailModal').hidden){ closeIpDetailModal(); } });
+  $('#bulkResultModal').addEventListener('click', function(ev){ if(ev.target===this){ closeBulkResultModal(); } });
+  document.addEventListener('keydown', function(ev){ if(ev.key==='Escape' && !$('#configModal').hidden){ closeConfigModal(); } if(ev.key==='Escape' && !$('#ipDetailModal').hidden){ closeIpDetailModal(); } if(ev.key==='Escape' && !$('#bulkResultModal').hidden){ closeBulkResultModal(); } });
   $('#refreshNow').addEventListener('click', function(){ handleUserActivity(); refresh(); });
   $('#logoutBtn').addEventListener('click', function(){ logout('Logged out successfully.'); });
   $('#refreshRate').addEventListener('change', function(){ if(timer){ clearInterval(timer); } timer = setInterval(refresh, parseInt(this.value,10)||1000); });
@@ -4873,6 +5363,7 @@ function bind(){
 }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
 initTheme(); bind(); bindActivity(); loadConfig(); loadWhitelist(); loadAuthSettings(); loadUpdateStatus(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+bindAllSettingsGroupToggles();
 })();
 </script>
 </body>
