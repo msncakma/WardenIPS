@@ -1,3 +1,13 @@
+wardenips (0.4.0~beta15-1) stable; urgency=medium
+
+  * Expand Minecraft entity-intel with ASN relation aggregation for IP/email pivots
+  * Add MySQL email-wide account lookup and expose matches in API payload
+  * Show related ASN list and database account count in intel modal
+  * Add DB users-on-email row for fast cross-account investigation
+  * Bump version to 0.4.0-beta-15
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 18:36:00 +03:00
+
 wardenips (0.4.0~beta14-1) stable; urgency=medium
 
   * Fix Minecraft intel drilldowns for IP/email scopes by enriching related entity data

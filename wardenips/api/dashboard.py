@@ -3411,6 +3411,7 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
     mysql_payload = None
+    mysql_matches: list[dict] = []
     mysql_backfilled = False
     if entity_type == "user":
       if self._is_minecraft_local_cache_enabled():
@@ -3450,12 +3451,21 @@ class DashboardAPI:
                 local_events = [dict(zip(cols, row)) for row in rows]
           except Exception:
             pass
+    elif entity_type == "email":
+      mysql_email_matches = await self._fetch_mysql_players_by_email(value)
+      if isinstance(mysql_email_matches, dict) and mysql_email_matches.get("found"):
+        mysql_matches = list(mysql_email_matches.get("matches") or [])
 
     watch_names = await self._db.get_minecraft_watchlist_names()
     cache_relations = await self._query_minecraft_cache_relations(entity_type, value)
 
     unique_ip_set = {str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()}
     unique_user_set = {str(e.get("player_name") or "").strip() for e in local_events if str(e.get("player_name") or "").strip()}
+    asn_set = {
+      f"AS{int(e.get('asn_number'))}"
+      for e in local_events
+      if str(e.get("asn_number") or "").strip().isdigit()
+    }
     email_set = {
       self._extract_email_from_event_details(e.get("details"))
       for e in local_events
@@ -3465,6 +3475,23 @@ class DashboardAPI:
     unique_ip_set.update([str(v).strip() for v in cache_relations.get("ips", []) if str(v).strip()])
     unique_user_set.update([str(v).strip() for v in cache_relations.get("users", []) if str(v).strip()])
     email_set.update([str(v).strip() for v in cache_relations.get("emails", []) if str(v).strip()])
+
+    for match in mysql_matches:
+      mysql_ip = str(match.get("ip") or "").strip()
+      mysql_reg_ip = str(match.get("reg_ip") or "").strip()
+      mysql_creation_ip = str(match.get("creation_ip") or "").strip()
+      mysql_email = str(match.get("email") or "").strip()
+      mysql_user = str(match.get("username") or "").strip()
+      if mysql_ip:
+        unique_ip_set.add(mysql_ip)
+      if mysql_reg_ip:
+        unique_ip_set.add(mysql_reg_ip)
+      if mysql_creation_ip:
+        unique_ip_set.add(mysql_creation_ip)
+      if mysql_user:
+        unique_user_set.add(mysql_user)
+      if mysql_email:
+        email_set.add(mysql_email)
 
     if isinstance(mysql_payload, dict):
       mysql_ip = str(mysql_payload.get("ip") or "").strip()
@@ -3479,6 +3506,7 @@ class DashboardAPI:
 
     unique_ips = sorted(unique_ip_set)
     unique_users = sorted(unique_user_set)
+    unique_asns = sorted(asn_set)
     related_emails = sorted({mail for mail in email_set if mail})
     risk_peak = max([int(e.get("risk_score") or 0) for e in local_events], default=0)
 
@@ -3488,6 +3516,9 @@ class DashboardAPI:
     if self._is_minecraft_email_masking_enabled():
       if isinstance(mysql_payload, dict) and mysql_payload.get("email"):
         mysql_payload["email"] = self._mask_email(mysql_payload.get("email"))
+      for match in mysql_matches:
+        if isinstance(match, dict) and match.get("email"):
+          match["email"] = self._mask_email(match.get("email"))
       related_emails = [self._mask_email(mail) for mail in related_emails]
 
     watchlisted_users = [name for name in unique_users if name.strip().lower() in watch_names]
@@ -3504,10 +3535,12 @@ class DashboardAPI:
         "related": {
           "users": unique_users,
           "ips": unique_ips,
+          "asns": unique_asns,
           "emails": related_emails,
         },
         "events": local_events,
         "mysql": mysql_payload,
+        "mysql_matches": mysql_matches,
         "mysql_backfilled": mysql_backfilled,
       }
     )
@@ -3584,6 +3617,74 @@ class DashboardAPI:
       return await asyncio.to_thread(_query)
     except Exception as exc:
       return {"enabled": True, "found": False, "reason": f"mysql_error:{exc}"}
+
+  async def _fetch_mysql_players_by_email(self, email: str) -> dict:
+    conf = self._config.get("plugins.minecraft.player_db", {})
+    if not isinstance(conf, dict) or not bool(conf.get("enabled", False)):
+      return {"enabled": False, "found": False, "reason": "player_db_disabled", "matches": []}
+    if pymysql is None:
+      return {"enabled": True, "found": False, "reason": "pymysql_not_installed", "matches": []}
+
+    host = str(conf.get("host", "127.0.0.1"))
+    port = int(conf.get("port", 3306) or 3306)
+    user = str(conf.get("user", ""))
+    password = str(conf.get("password", ""))
+    database = str(conf.get("database", ""))
+    table = str(conf.get("table", "")).strip()
+    columns = conf.get("columns", {}) if isinstance(conf.get("columns", {}), dict) else {}
+    username_col = str(columns.get("username", "username"))
+    ip_col = str(columns.get("ip", "ip"))
+    email_col = str(columns.get("email", "email"))
+    uuid_col = str(columns.get("uuid", "uuid"))
+    creation_ip_col = str(columns.get("creation_ip", "creationIP"))
+    creation_date_col = str(columns.get("creation_date", "creationDate"))
+    last_login_col = str(columns.get("last_login", "lastlogin"))
+    reg_ip_col = str(columns.get("reg_ip", "regip"))
+    is_verified_col = str(columns.get("is_verified", "isVerified"))
+
+    if not table or not user or not database:
+      return {"enabled": True, "found": False, "reason": "player_db_missing_credentials", "matches": []}
+
+    normalized_email = str(email or "").strip().lower().replace("*", "%")
+    if not normalized_email:
+      return {"enabled": True, "found": False, "reason": "empty_email", "matches": []}
+
+    def _query() -> dict:
+      conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+      )
+      try:
+        with conn.cursor() as cur:
+          sql = (
+            f"SELECT `{username_col}` AS username, `{ip_col}` AS ip, `{email_col}` AS email, "
+            f"`{uuid_col}` AS uuid, `{creation_ip_col}` AS creation_ip, `{creation_date_col}` AS creation_date, "
+            f"`{last_login_col}` AS last_login, `{reg_ip_col}` AS reg_ip, `{is_verified_col}` AS is_verified "
+            f"FROM `{table}` WHERE LOWER(COALESCE(`{email_col}`, '')) LIKE %s LIMIT 300"
+          )
+          cur.execute(sql, (normalized_email,))
+          rows = cur.fetchall() or []
+          for row in rows:
+            row["enabled"] = True
+            row["found"] = True
+          return {
+            "enabled": True,
+            "found": len(rows) > 0,
+            "matches": self._to_jsonable(rows),
+            "count": len(rows),
+          }
+      finally:
+        conn.close()
+
+    try:
+      return await asyncio.to_thread(_query)
+    except Exception as exc:
+      return {"enabled": True, "found": False, "reason": f"mysql_error:{exc}", "matches": []}
 
   async def _backfill_mysql_player_snapshot(self, payload: dict) -> None:
     try:
@@ -4336,6 +4437,7 @@ async function searchIntel(type, value){
       const value = (val === undefined || val === null || String(val).trim() === '') ? '-' : String(val);
       accountRows.push('<tr><th style="width:220px">'+esc(label)+'</th><td class="copyable">'+esc(value)+'</td></tr>');
     };
+    const mysqlMatches = Array.isArray(payload.mysql_matches) ? payload.mysql_matches : [];
     addAccountRow('Email', mysqlInfo.email || '-');
     addAccountRow('UUID', mysqlInfo.uuid || '-');
     addAccountRow('First Registration', mysqlInfo.creation_date || '-');
@@ -4345,13 +4447,19 @@ async function searchIntel(type, value){
     addAccountRow('Creation IP', mysqlInfo.creation_ip || '-');
     addAccountRow('Verified', (mysqlInfo.is_verified === undefined || mysqlInfo.is_verified === null) ? '-' : String(mysqlInfo.is_verified));
     addAccountRow('Duplicate Email Count', mysqlInfo.duplicate_email_count || '-');
+    addAccountRow('DB Accounts on Email', mysqlMatches.length || '-');
     document.getElementById('intelAccountRows').innerHTML = accountRows.join('');
 
     const related = payload.related || {};
     const relatedRows = [];
     relatedRows.push('<tr><th style="width:220px">Users on this scope</th><td>'+renderRelatedPivotList('user', related.users || [])+'</td></tr>');
     relatedRows.push('<tr><th style="width:220px">IPs on this scope</th><td>'+renderRelatedPivotList('ip', related.ips || [])+'</td></tr>');
+    relatedRows.push('<tr><th style="width:220px">ASNs on this scope</th><td>'+renderRelatedPivotList('asn', related.asns || [])+'</td></tr>');
     relatedRows.push('<tr><th style="width:220px">Emails on this scope</th><td>'+renderRelatedPivotList('email', related.emails || [])+'</td></tr>');
+    if(mysqlMatches.length){
+      const dbUsers = mysqlMatches.map(function(m){ return (m && m.username) ? String(m.username) : ''; }).filter(Boolean);
+      relatedRows.push('<tr><th style="width:220px">DB users on this email</th><td>'+renderRelatedPivotList('user', dbUsers)+'</td></tr>');
+    }
     document.getElementById('intelRelatedRows').innerHTML = relatedRows.join('');
   } catch (err) {
     setStatus('Entity intel request failed: ' + String(err && err.message ? err.message : err), true);
