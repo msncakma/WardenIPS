@@ -98,6 +98,34 @@ plugins:
     global_connection_burst_threshold: 12  # Treat 12+ near-simultaneous Minecraft connects as a potential flood
     global_connection_burst_window_seconds: 15
     global_connection_burst_min_unique_ips: 8  # Require multiple source IPs to reduce false positives
+    observe_only:
+      enabled: true                 # Observe-only analytics mode (no firewall bans when enforcement_enabled is false)
+      enforcement_enabled: false    # Keep false for safe rollout
+      burst_threshold_per_second: 10
+      burst_window_seconds: 1
+    velocity:
+      enabled: false
+      log_path: "/opt/velocity/logs/latest.log"
+      parse_connected: true
+      parse_disconnect: true
+    player_db:
+      enabled: false
+      host: "127.0.0.1"
+      port: 3306
+      user: ""
+      password: ""
+      database: ""
+      table: ""
+      columns:
+        username: "username"
+        uuid: "uuid"
+        email: "email"
+        ip: "ip"
+        creation_ip: "creationIP"
+        creation_date: "creationDate"
+        last_login: "lastlogin"
+        reg_ip: "regip"
+        is_verified: "isVerified"
 
   nginx:
     enabled: false
