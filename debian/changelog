@@ -1,3 +1,13 @@
+wardenips (0.4.0~beta14-1) stable; urgency=medium
+
+  * Fix Minecraft intel drilldowns for IP/email scopes by enriching related entity data
+  * Add related users/IPs/emails aggregation from local cache and event details
+  * Add Related Entities section to intel modal with clickable pivots
+  * Improve email matching in entity-intel for both spaced and compact JSON forms
+  * Bump version to 0.4.0-beta-14
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 21 Mar 2026 18:22:26 +03:00
+
 wardenips (0.4.0~beta13-1) stable; urgency=medium
 
   * Improve Minecraft admin layout for event query controls

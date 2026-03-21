@@ -3380,11 +3380,14 @@ class DashboardAPI:
         SELECT id, timestamp, source_ip, player_name, asn_number, asn_org, risk_score, threat_level, details
         FROM connection_events
         WHERE connection_type = 'minecraft'
-          AND LOWER(COALESCE(details, '')) LIKE ?
+          AND (
+            LOWER(COALESCE(details, '')) LIKE ?
+            OR LOWER(COALESCE(details, '')) LIKE ?
+          )
         ORDER BY id DESC
         LIMIT 200
       """
-      params = (f'%"email": "{lowered}"%',)
+      params = (f'%"email": "{lowered}"%', f'%"email":"{lowered}"%')
     else:
       asn_value = value.upper().replace("AS", "").strip()
       if not asn_value.isdigit():
@@ -3449,8 +3452,34 @@ class DashboardAPI:
             pass
 
     watch_names = await self._db.get_minecraft_watchlist_names()
-    unique_ips = sorted({str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()})
-    unique_users = sorted({str(e.get("player_name") or "").strip() for e in local_events if str(e.get("player_name") or "").strip()})
+    cache_relations = await self._query_minecraft_cache_relations(entity_type, value)
+
+    unique_ip_set = {str(e.get("source_ip") or "").strip() for e in local_events if str(e.get("source_ip") or "").strip()}
+    unique_user_set = {str(e.get("player_name") or "").strip() for e in local_events if str(e.get("player_name") or "").strip()}
+    email_set = {
+      self._extract_email_from_event_details(e.get("details"))
+      for e in local_events
+      if self._extract_email_from_event_details(e.get("details"))
+    }
+
+    unique_ip_set.update([str(v).strip() for v in cache_relations.get("ips", []) if str(v).strip()])
+    unique_user_set.update([str(v).strip() for v in cache_relations.get("users", []) if str(v).strip()])
+    email_set.update([str(v).strip() for v in cache_relations.get("emails", []) if str(v).strip()])
+
+    if isinstance(mysql_payload, dict):
+      mysql_ip = str(mysql_payload.get("ip") or "").strip()
+      mysql_email = str(mysql_payload.get("email") or "").strip()
+      mysql_user = str(mysql_payload.get("username") or "").strip()
+      if mysql_ip:
+        unique_ip_set.add(mysql_ip)
+      if mysql_user:
+        unique_user_set.add(mysql_user)
+      if mysql_email:
+        email_set.add(mysql_email)
+
+    unique_ips = sorted(unique_ip_set)
+    unique_users = sorted(unique_user_set)
+    related_emails = sorted({mail for mail in email_set if mail})
     risk_peak = max([int(e.get("risk_score") or 0) for e in local_events], default=0)
 
     for event in local_events:
@@ -3459,6 +3488,7 @@ class DashboardAPI:
     if self._is_minecraft_email_masking_enabled():
       if isinstance(mysql_payload, dict) and mysql_payload.get("email"):
         mysql_payload["email"] = self._mask_email(mysql_payload.get("email"))
+      related_emails = [self._mask_email(mail) for mail in related_emails]
 
     watchlisted_users = [name for name in unique_users if name.strip().lower() in watch_names]
 
@@ -3471,6 +3501,11 @@ class DashboardAPI:
         "unique_ips": unique_ips,
         "unique_users": unique_users,
         "watchlisted_users": watchlisted_users,
+        "related": {
+          "users": unique_users,
+          "ips": unique_ips,
+          "emails": related_emails,
+        },
         "events": local_events,
         "mysql": mysql_payload,
         "mysql_backfilled": mysql_backfilled,
@@ -3588,6 +3623,88 @@ class DashboardAPI:
         await self._db._db.commit()
     except Exception:
       return
+
+  @staticmethod
+  def _extract_email_from_event_details(details_raw: object) -> str:
+    if isinstance(details_raw, dict):
+      value = str(details_raw.get("email") or "").strip()
+      return value
+    if isinstance(details_raw, str) and details_raw:
+      try:
+        parsed = json.loads(details_raw)
+        value = str(parsed.get("email") or "").strip()
+        return value
+      except Exception:
+        return ""
+    return ""
+
+  async def _query_minecraft_cache_relations(self, entity_type: str, value: str) -> dict:
+    if not self._is_minecraft_local_cache_enabled():
+      return {"users": [], "ips": [], "emails": []}
+
+    normalized_type = str(entity_type or "").strip().lower()
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+      return {"users": [], "ips": [], "emails": []}
+
+    query = ""
+    params: tuple[object, ...] = ()
+    if normalized_type == "user":
+      query = """
+        SELECT player_name, email, ip, creation_ip, reg_ip
+        FROM minecraft_player_cache
+        WHERE LOWER(COALESCE(player_name, '')) = LOWER(?)
+        LIMIT 200
+      """
+      params = (normalized_value,)
+    elif normalized_type == "ip":
+      query = """
+        SELECT player_name, email, ip, creation_ip, reg_ip
+        FROM minecraft_player_cache
+        WHERE COALESCE(ip, '') = ?
+           OR COALESCE(creation_ip, '') = ?
+           OR COALESCE(reg_ip, '') = ?
+        LIMIT 200
+      """
+      params = (normalized_value, normalized_value, normalized_value)
+    elif normalized_type == "email":
+      email_pattern = normalized_value.lower().replace("*", "%")
+      query = """
+        SELECT player_name, email, ip, creation_ip, reg_ip
+        FROM minecraft_player_cache
+        WHERE LOWER(COALESCE(email, '')) LIKE ?
+        LIMIT 200
+      """
+      params = (email_pattern,)
+    else:
+      return {"users": [], "ips": [], "emails": []}
+
+    users: set[str] = set()
+    ips: set[str] = set()
+    emails: set[str] = set()
+    try:
+      async with self._db._lock:
+        async with self._db._db.execute(query, params) as cursor:
+          rows = await cursor.fetchall()
+      for player_name, email_value, ip_value, creation_ip, reg_ip in rows:
+        user_text = str(player_name or "").strip()
+        if user_text:
+          users.add(user_text)
+        for candidate in (ip_value, creation_ip, reg_ip):
+          ip_text = str(candidate or "").strip()
+          if ip_text:
+            ips.add(ip_text)
+        email_text = str(email_value or "").strip()
+        if email_text:
+          emails.add(email_text)
+    except Exception:
+      return {"users": [], "ips": [], "emails": []}
+
+    return {
+      "users": sorted(users),
+      "ips": sorted(ips),
+      "emails": sorted(emails),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3810,6 +3927,12 @@ th{color:#a7bfd8;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
         <h4 style="margin:0 0 8px 0">Account Intel</h4>
         <table>
           <tbody id="intelAccountRows"></tbody>
+        </table>
+      </div>
+      <div class="panel" style="margin-top:12px">
+        <h4 style="margin:0 0 8px 0">Related Entities</h4>
+        <table>
+          <tbody id="intelRelatedRows"></tbody>
         </table>
       </div>
     </div>
@@ -4146,6 +4269,16 @@ function syncIntelActionButtons(type){
   document.getElementById('intelBanAsnBtn').style.display = isAsn ? '' : 'none';
 }
 
+function renderRelatedPivotList(type, values){
+  const list = Array.isArray(values) ? values : [];
+  if(!list.length){ return '<span class="sub">-</span>'; }
+  return list.slice(0, 30).map(function(v){
+    const text = String(v || '').trim();
+    if(!text){ return ''; }
+    return '<button class="link-btn copyable" data-intel-type="'+esc(type)+'" data-intel-value="'+esc(text)+'" style="margin-right:8px">'+esc(text)+'</button>';
+  }).join(' ');
+}
+
 async function whitelistPlayer(playerName){
   const value = String(playerName || '').trim();
   if(!value){ setStatus('Whitelist failed: player name is empty.', true); return; }
@@ -4213,6 +4346,13 @@ async function searchIntel(type, value){
     addAccountRow('Verified', (mysqlInfo.is_verified === undefined || mysqlInfo.is_verified === null) ? '-' : String(mysqlInfo.is_verified));
     addAccountRow('Duplicate Email Count', mysqlInfo.duplicate_email_count || '-');
     document.getElementById('intelAccountRows').innerHTML = accountRows.join('');
+
+    const related = payload.related || {};
+    const relatedRows = [];
+    relatedRows.push('<tr><th style="width:220px">Users on this scope</th><td>'+renderRelatedPivotList('user', related.users || [])+'</td></tr>');
+    relatedRows.push('<tr><th style="width:220px">IPs on this scope</th><td>'+renderRelatedPivotList('ip', related.ips || [])+'</td></tr>');
+    relatedRows.push('<tr><th style="width:220px">Emails on this scope</th><td>'+renderRelatedPivotList('email', related.emails || [])+'</td></tr>');
+    document.getElementById('intelRelatedRows').innerHTML = relatedRows.join('');
   } catch (err) {
     setStatus('Entity intel request failed: ' + String(err && err.message ? err.message : err), true);
   }
