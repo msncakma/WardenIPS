@@ -123,7 +123,7 @@ plugins:
       burst_threshold_per_second: 10
       burst_window_seconds: 1
     velocity:
-      enabled: false  # Velocity parser is independent; set true even if plugins.minecraft.enabled is false
+      enabled: true  # Velocity parser is independent; set true even if plugins.minecraft.enabled is false
       log_path: "/opt/velocity/logs/latest.log"
       parse_connected: true
       parse_disconnect: true
