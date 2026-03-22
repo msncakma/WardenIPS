@@ -24,7 +24,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import aiosqlite
 
@@ -35,7 +35,7 @@ from wardenips.core.logger import get_logger
 logger = get_logger(__name__)
 
 # Database schema version — used for migrations in the future
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 # Table creation SQL queries
 _CREATE_TABLES_SQL = """
@@ -115,6 +115,13 @@ CREATE TABLE IF NOT EXISTS admin_users (
     totp_secret     TEXT,
     totp_enabled    INTEGER NOT NULL DEFAULT 0,
     is_active       INTEGER NOT NULL DEFAULT 1,
+    is_owner        INTEGER NOT NULL DEFAULT 0,
+    display_name    TEXT,
+    created_by      TEXT,
+    disabled_reason TEXT,
+    failed_login_count INTEGER NOT NULL DEFAULT 0,
+    last_failed_login_at TEXT,
+    locked_until    TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_login_at   TEXT,
@@ -123,6 +130,9 @@ CREATE TABLE IF NOT EXISTS admin_users (
 
 CREATE INDEX IF NOT EXISTS idx_admin_users_active
     ON admin_users(is_active);
+
+CREATE INDEX IF NOT EXISTS idx_admin_users_owner
+    ON admin_users(is_owner);
 
 -- Audit log for operator actions
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -137,6 +147,95 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_created_at
     ON audit_log(created_at);
+
+-- RBAC roles
+CREATE TABLE IF NOT EXISTS auth_roles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_code       TEXT NOT NULL UNIQUE,
+    display_name    TEXT NOT NULL,
+    is_system       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS auth_permissions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    node            TEXT NOT NULL UNIQUE,
+    description     TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS auth_role_permissions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_id         INTEGER NOT NULL,
+    permission_id   INTEGER NOT NULL,
+    effect          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(role_id, permission_id),
+    FOREIGN KEY(role_id) REFERENCES auth_roles(id) ON DELETE CASCADE,
+    FOREIGN KEY(permission_id) REFERENCES auth_permissions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_role_permissions_role
+    ON auth_role_permissions(role_id);
+
+CREATE TABLE IF NOT EXISTS auth_user_roles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    role_id         INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, role_id),
+    FOREIGN KEY(user_id) REFERENCES admin_users(id) ON DELETE CASCADE,
+    FOREIGN KEY(role_id) REFERENCES auth_roles(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_user_roles_user
+    ON auth_user_roles(user_id);
+
+CREATE TABLE IF NOT EXISTS auth_user_permissions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    permission_id   INTEGER NOT NULL,
+    effect          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, permission_id),
+    FOREIGN KEY(user_id) REFERENCES admin_users(id) ON DELETE CASCADE,
+    FOREIGN KEY(permission_id) REFERENCES auth_permissions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_user_permissions_user
+    ON auth_user_permissions(user_id);
+
+CREATE TABLE IF NOT EXISTS auth_invite_tokens (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash      TEXT NOT NULL UNIQUE,
+    created_by      TEXT,
+    note            TEXT,
+    max_uses        INTEGER NOT NULL DEFAULT 1,
+    used_count      INTEGER NOT NULL DEFAULT 0,
+    expires_at      TEXT,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    role_codes_json TEXT,
+    permission_nodes_json TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_invite_active
+    ON auth_invite_tokens(is_active, expires_at);
+
+CREATE TABLE IF NOT EXISTS auth_query_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_username  TEXT,
+    endpoint        TEXT NOT NULL,
+    query_json      TEXT,
+    result_count    INTEGER NOT NULL DEFAULT 0,
+    duration_ms     INTEGER NOT NULL DEFAULT 0,
+    ip_address      TEXT,
+    user_agent      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_query_logs_created
+    ON auth_query_logs(created_at);
 
 -- Minecraft observe-only burst anomalies
 CREATE TABLE IF NOT EXISTS minecraft_burst_alerts (
@@ -331,10 +430,167 @@ class DatabaseManager:
                             await self._migrate_v7_to_v8_authme_indexes()
                         if current < 9:
                             await self._migrate_v8_to_v9_missing_asn_index()
+                        if current < 10:
+                            await self._migrate_v9_to_v10_rbac_auth()
                         await self._db.execute(
                             "UPDATE schema_version SET version = ?",
                             (_SCHEMA_VERSION,),
                         )
+
+    async def _migrate_v9_to_v10_rbac_auth(self) -> None:
+        """Adds RBAC tables, invite/query logs, and admin account ownership columns."""
+
+        async def _has_column(table: str, column: str) -> bool:
+            async with self._db.execute(f"PRAGMA table_info({table})") as cursor:
+                rows = await cursor.fetchall()
+                return any(str(row[1]) == column for row in rows)
+
+        admin_columns = {
+            "is_owner": "INTEGER NOT NULL DEFAULT 0",
+            "display_name": "TEXT",
+            "created_by": "TEXT",
+            "disabled_reason": "TEXT",
+            "failed_login_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_failed_login_at": "TEXT",
+            "locked_until": "TEXT",
+        }
+        for column_name, column_type in admin_columns.items():
+            if not await _has_column("admin_users", column_name):
+                await self._db.execute(
+                    f"ALTER TABLE admin_users ADD COLUMN {column_name} {column_type}"
+                )
+
+        await self._db.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_admin_users_owner
+                ON admin_users(is_owner);
+
+            CREATE TABLE IF NOT EXISTS auth_roles (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                role_code       TEXT NOT NULL UNIQUE,
+                display_name    TEXT NOT NULL,
+                is_system       INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_permissions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                node            TEXT NOT NULL UNIQUE,
+                description     TEXT,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_role_permissions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                role_id         INTEGER NOT NULL,
+                permission_id   INTEGER NOT NULL,
+                effect          INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(role_id, permission_id),
+                FOREIGN KEY(role_id) REFERENCES auth_roles(id) ON DELETE CASCADE,
+                FOREIGN KEY(permission_id) REFERENCES auth_permissions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_role_permissions_role
+                ON auth_role_permissions(role_id);
+
+            CREATE TABLE IF NOT EXISTS auth_user_roles (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                role_id         INTEGER NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, role_id),
+                FOREIGN KEY(user_id) REFERENCES admin_users(id) ON DELETE CASCADE,
+                FOREIGN KEY(role_id) REFERENCES auth_roles(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_user_roles_user
+                ON auth_user_roles(user_id);
+
+            CREATE TABLE IF NOT EXISTS auth_user_permissions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                permission_id   INTEGER NOT NULL,
+                effect          INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, permission_id),
+                FOREIGN KEY(user_id) REFERENCES admin_users(id) ON DELETE CASCADE,
+                FOREIGN KEY(permission_id) REFERENCES auth_permissions(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_user_permissions_user
+                ON auth_user_permissions(user_id);
+
+            CREATE TABLE IF NOT EXISTS auth_invite_tokens (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash      TEXT NOT NULL UNIQUE,
+                created_by      TEXT,
+                note            TEXT,
+                max_uses        INTEGER NOT NULL DEFAULT 1,
+                used_count      INTEGER NOT NULL DEFAULT 0,
+                expires_at      TEXT,
+                is_active       INTEGER NOT NULL DEFAULT 1,
+                role_codes_json TEXT,
+                permission_nodes_json TEXT,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_invite_active
+                ON auth_invite_tokens(is_active, expires_at);
+
+            CREATE TABLE IF NOT EXISTS auth_query_logs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_username  TEXT,
+                endpoint        TEXT NOT NULL,
+                query_json      TEXT,
+                result_count    INTEGER NOT NULL DEFAULT 0,
+                duration_ms     INTEGER NOT NULL DEFAULT 0,
+                ip_address      TEXT,
+                user_agent      TEXT,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_query_logs_created
+                ON auth_query_logs(created_at);
+            """
+        )
+
+        await self._seed_rbac_defaults()
+
+        # Ensure there is at least one owner account for bootstrap compatibility.
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM admin_users WHERE is_active = 1 AND is_owner = 1"
+        ) as cursor:
+            owner_row = await cursor.fetchone()
+            owner_count = int(owner_row[0] or 0) if owner_row else 0
+
+        if owner_count == 0:
+            async with self._db.execute(
+                "SELECT id, username FROM admin_users WHERE is_active = 1 ORDER BY id ASC LIMIT 1"
+            ) as cursor:
+                first_user = await cursor.fetchone()
+            if first_user:
+                first_user_id = int(first_user[0])
+                await self._db.execute(
+                    "UPDATE admin_users SET is_owner = 1 WHERE id = ?",
+                    (first_user_id,),
+                )
+                await self._assign_role_to_user_id(first_user_id, "owner")
+
+        # Assign admin role to remaining active users without roles.
+        async with self._db.execute(
+            """
+            SELECT u.id
+            FROM admin_users u
+            WHERE u.is_active = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM auth_user_roles ur WHERE ur.user_id = u.id
+              )
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            await self._assign_role_to_user_id(int(row[0]), "admin")
 
     async def _migrate_v8_to_v9_missing_asn_index(self) -> None:
         """Adds index for efficient missing-ASN backfill scans."""
@@ -1128,6 +1384,113 @@ class DatabaseManager:
 
     # ── Admin Auth and Audit ──
 
+    async def _seed_rbac_defaults(self) -> None:
+        roles = [
+            ("owner", "Owner"),
+            ("admin", "Admin"),
+            ("moderator", "Moderator"),
+            ("viewer", "Viewer"),
+        ]
+        permissions = [
+            ("*", "Owner wildcard"),
+            ("panel.view", "View panel routes"),
+            ("minecraft.view", "View minecraft panel"),
+            ("minecraft.intel.view", "Use minecraft entity intel"),
+            ("minecraft.email.view.masked", "View masked emails"),
+            ("minecraft.email.view.full", "View full emails"),
+            ("minecraft.ip.view.masked", "View masked IPs"),
+            ("minecraft.ip.view.full", "View full IPs"),
+            ("minecraft.uuid.view.masked", "View masked UUIDs"),
+            ("minecraft.uuid.view.full", "View full UUIDs"),
+            ("minecraft.profile.last_login.view", "View login timestamps"),
+            ("admin.query.run", "Run advanced query endpoint"),
+            ("admin.audit.view", "View audit and query logs"),
+            ("admin.users.manage", "Manage users and roles"),
+            ("admin.invites.manage", "Manage invite tokens"),
+            ("admin.config.edit", "Edit configuration"),
+            ("portal.view", "View portal homepage"),
+            ("portal.manage", "Manage portal links"),
+        ]
+
+        for role_code, display_name in roles:
+            await self._db.execute(
+                """
+                INSERT INTO auth_roles (role_code, display_name, is_system)
+                VALUES (?, ?, 1)
+                ON CONFLICT(role_code) DO UPDATE SET display_name = excluded.display_name
+                """,
+                (role_code, display_name),
+            )
+
+        for node, description in permissions:
+            await self._db.execute(
+                """
+                INSERT INTO auth_permissions (node, description)
+                VALUES (?, ?)
+                ON CONFLICT(node) DO UPDATE SET description = excluded.description
+                """,
+                (node, description),
+            )
+
+        role_permissions: dict[str, list[str]] = {
+            "owner": ["*"],
+            "admin": [
+                "panel.view",
+                "minecraft.view",
+                "minecraft.intel.view",
+                "minecraft.email.view.masked",
+                "minecraft.email.view.full",
+                "minecraft.ip.view.masked",
+                "minecraft.ip.view.full",
+                "minecraft.uuid.view.masked",
+                "minecraft.uuid.view.full",
+                "minecraft.profile.last_login.view",
+                "admin.query.run",
+                "admin.audit.view",
+                "admin.config.edit",
+                "portal.view",
+            ],
+            "moderator": [
+                "panel.view",
+                "minecraft.view",
+                "minecraft.intel.view",
+                "minecraft.email.view.masked",
+                "minecraft.ip.view.masked",
+                "minecraft.uuid.view.masked",
+                "admin.query.run",
+                "portal.view",
+            ],
+            "viewer": [
+                "panel.view",
+                "minecraft.view",
+                "minecraft.email.view.masked",
+                "minecraft.ip.view.masked",
+                "minecraft.uuid.view.masked",
+                "portal.view",
+            ],
+        }
+
+        for role_code, nodes in role_permissions.items():
+            for node in nodes:
+                await self._db.execute(
+                    """
+                    INSERT OR IGNORE INTO auth_role_permissions (role_id, permission_id, effect)
+                    SELECT r.id, p.id, 1
+                    FROM auth_roles r, auth_permissions p
+                    WHERE r.role_code = ? AND p.node = ?
+                    """,
+                    (role_code, node),
+                )
+
+    async def _assign_role_to_user_id(self, user_id: int, role_code: str) -> None:
+        await self._db.execute(
+            """
+            INSERT OR IGNORE INTO auth_user_roles (user_id, role_id)
+            SELECT ?, id FROM auth_roles WHERE role_code = ?
+            """,
+            (user_id, role_code),
+        )
+
     async def has_admin_users(self) -> bool:
         async with self._db.execute(
             "SELECT COUNT(*) FROM admin_users WHERE is_active = 1"
@@ -1139,7 +1502,9 @@ class DatabaseManager:
         async with self._db.execute(
             """
             SELECT id, username, password_hash, totp_secret, totp_enabled,
-                   is_active, created_at, updated_at, last_login_at, last_login_ip
+                   is_active, is_owner, display_name, created_by, disabled_reason,
+                   failed_login_count, last_failed_login_at, locked_until,
+                   created_at, updated_at, last_login_at, last_login_ip
             FROM admin_users
             WHERE username = ? AND is_active = 1
             LIMIT 1
@@ -1158,18 +1523,371 @@ class DatabaseManager:
         password_hash: str,
         totp_secret: str,
         totp_enabled: bool = True,
+        is_owner: bool = False,
+        display_name: str = "",
+        created_by: str = "",
+    ) -> int:
+        async with self._lock:
+            await self._seed_rbac_defaults()
+            async with self._db.execute(
+                """
+                INSERT INTO admin_users
+                    (username, password_hash, totp_secret, totp_enabled, is_active, is_owner,
+                     display_name, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, datetime('now'), datetime('now'))
+                """,
+                (
+                    username,
+                    password_hash,
+                    totp_secret,
+                    1 if totp_enabled else 0,
+                    1 if is_owner else 0,
+                    display_name or username,
+                    created_by or None,
+                ),
+            ) as cursor:
+                user_id = int(cursor.lastrowid)
+                await self._assign_role_to_user_id(
+                    user_id,
+                    "owner" if is_owner else "admin",
+                )
+                await self._db.commit()
+                return user_id
+
+    async def list_admin_users(self, limit: int = 250) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        async with self._db.execute(
+            """
+            SELECT id, username, is_active, is_owner, display_name, created_by,
+                   failed_login_count, last_failed_login_at, locked_until,
+                   created_at, updated_at, last_login_at, last_login_ip
+            FROM admin_users
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    async def upsert_user_permission(self, username: str, permission_node: str, effect: int = 1) -> bool:
+        node = str(permission_node or "").strip()
+        if not node:
+            return False
+        async with self._lock:
+            await self._seed_rbac_defaults()
+            await self._db.execute(
+                "INSERT INTO auth_permissions (node, description) VALUES (?, ?) ON CONFLICT(node) DO NOTHING",
+                (node, "Custom permission node"),
+            )
+            async with self._db.execute(
+                "SELECT id FROM admin_users WHERE username = ? AND is_active = 1 LIMIT 1",
+                (username,),
+            ) as cursor:
+                user_row = await cursor.fetchone()
+            if not user_row:
+                await self._db.rollback()
+                return False
+
+            await self._db.execute(
+                """
+                INSERT INTO auth_user_permissions (user_id, permission_id, effect)
+                SELECT ?, p.id, ?
+                FROM auth_permissions p
+                WHERE p.node = ?
+                ON CONFLICT(user_id, permission_id) DO UPDATE SET effect = excluded.effect
+                """,
+                (int(user_row[0]), 1 if int(effect) >= 0 else -1, node),
+            )
+            await self._db.commit()
+            return True
+
+    async def get_user_effective_permissions(self, username: str) -> Dict[str, Set[str]]:
+        async with self._db.execute(
+            "SELECT id, is_owner FROM admin_users WHERE username = ? AND is_active = 1 LIMIT 1",
+            (username,),
+        ) as cursor:
+            user_row = await cursor.fetchone()
+
+        if not user_row:
+            return {"allow": set(), "deny": set()}
+
+        user_id = int(user_row[0])
+        is_owner = bool(int(user_row[1] or 0))
+        if is_owner:
+            return {"allow": {"*"}, "deny": set()}
+
+        allow: Set[str] = set()
+        deny: Set[str] = set()
+
+        async with self._db.execute(
+            """
+            SELECT p.node, rp.effect
+            FROM auth_user_roles ur
+            JOIN auth_role_permissions rp ON rp.role_id = ur.role_id
+            JOIN auth_permissions p ON p.id = rp.permission_id
+            WHERE ur.user_id = ?
+            """,
+            (user_id,),
+        ) as cursor:
+            for node, effect in await cursor.fetchall():
+                node_text = str(node or "").strip()
+                if not node_text:
+                    continue
+                if int(effect or 1) >= 0:
+                    allow.add(node_text)
+                else:
+                    deny.add(node_text)
+
+        async with self._db.execute(
+            """
+            SELECT p.node, up.effect
+            FROM auth_user_permissions up
+            JOIN auth_permissions p ON p.id = up.permission_id
+            WHERE up.user_id = ?
+            """,
+            (user_id,),
+        ) as cursor:
+            for node, effect in await cursor.fetchall():
+                node_text = str(node or "").strip()
+                if not node_text:
+                    continue
+                if int(effect or 1) >= 0:
+                    allow.add(node_text)
+                else:
+                    deny.add(node_text)
+
+        return {"allow": allow, "deny": deny}
+
+    async def assign_role_to_user(self, username: str, role_code: str) -> bool:
+        normalized_role = str(role_code or "").strip().lower()
+        if not normalized_role:
+            return False
+        async with self._lock:
+            await self._seed_rbac_defaults()
+            async with self._db.execute(
+                "SELECT id FROM admin_users WHERE username = ? AND is_active = 1 LIMIT 1",
+                (username,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return False
+            await self._assign_role_to_user_id(int(row[0]), normalized_role)
+            await self._db.commit()
+            return True
+
+    async def create_invite_token(
+        self,
+        token_hash: str,
+        created_by: str,
+        expires_at: Optional[str],
+        max_uses: int = 1,
+        role_codes: Optional[List[str]] = None,
+        permission_nodes: Optional[List[str]] = None,
+        note: str = "",
     ) -> int:
         async with self._lock:
             async with self._db.execute(
                 """
-                INSERT INTO admin_users
-                    (username, password_hash, totp_secret, totp_enabled, is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+                INSERT INTO auth_invite_tokens
+                    (token_hash, created_by, note, max_uses, used_count, expires_at, is_active,
+                     role_codes_json, permission_nodes_json)
+                VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?)
                 """,
-                (username, password_hash, totp_secret, 1 if totp_enabled else 0),
+                (
+                    token_hash,
+                    created_by or None,
+                    note or None,
+                    max(1, int(max_uses or 1)),
+                    expires_at,
+                    json.dumps(role_codes or [], ensure_ascii=False),
+                    json.dumps(permission_nodes or [], ensure_ascii=False),
+                ),
             ) as cursor:
                 await self._db.commit()
-                return cursor.lastrowid
+                return int(cursor.lastrowid)
+
+    async def list_invite_tokens(self, limit: int = 100) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        async with self._db.execute(
+            """
+            SELECT id, token_hash, created_by, note, max_uses, used_count,
+                   expires_at, is_active, role_codes_json, permission_nodes_json, created_at
+            FROM auth_invite_tokens
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+
+    async def get_active_invite_by_hash(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        normalized = str(token_hash or "").strip()
+        if not normalized:
+            return None
+        async with self._db.execute(
+            """
+            SELECT id, token_hash, created_by, note, max_uses, used_count,
+                   expires_at, is_active, role_codes_json, permission_nodes_json, created_at
+            FROM auth_invite_tokens
+            WHERE token_hash = ? AND is_active = 1
+            LIMIT 1
+            """,
+            (normalized,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            invite = dict(zip(cols, row))
+
+        expires_raw = str(invite.get("expires_at") or "").strip()
+        if expires_raw:
+            try:
+                expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                if expires_at <= datetime.now(expires_at.tzinfo):
+                    return None
+            except Exception:
+                return None
+
+        if int(invite.get("used_count") or 0) >= int(invite.get("max_uses") or 1):
+            return None
+        return invite
+
+    async def consume_invite_token(self, invite_id: int) -> bool:
+        safe_id = int(invite_id)
+        async with self._lock:
+            async with self._db.execute(
+                """
+                UPDATE auth_invite_tokens
+                SET used_count = used_count + 1,
+                    is_active = CASE WHEN used_count + 1 >= max_uses THEN 0 ELSE is_active END
+                WHERE id = ? AND is_active = 1
+                """,
+                (safe_id,),
+            ) as cursor:
+                await self._db.commit()
+                return bool(cursor.rowcount and cursor.rowcount > 0)
+
+    async def log_query_event(
+        self,
+        actor_username: Optional[str],
+        endpoint: str,
+        query_payload: Optional[Dict[str, Any]],
+        result_count: int,
+        duration_ms: int,
+        ip_address: Optional[str],
+        user_agent: Optional[str],
+    ) -> int:
+        async with self._lock:
+            async with self._db.execute(
+                """
+                INSERT INTO auth_query_logs
+                    (actor_username, endpoint, query_json, result_count, duration_ms, ip_address, user_agent)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    actor_username,
+                    str(endpoint or "")[:255],
+                    json.dumps(query_payload or {}, ensure_ascii=False),
+                    max(0, int(result_count or 0)),
+                    max(0, int(duration_ms or 0)),
+                    ip_address,
+                    user_agent,
+                ),
+            ) as cursor:
+                await self._db.commit()
+                return int(cursor.lastrowid)
+
+    async def get_query_logs(
+        self,
+        limit: int = 200,
+        actor: str = "",
+        endpoint: str = "",
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        where_clauses: List[str] = []
+        params: List[Any] = []
+        if actor:
+            where_clauses.append("LOWER(COALESCE(actor_username, '')) = LOWER(?)")
+            params.append(actor)
+        if endpoint:
+            where_clauses.append("LOWER(COALESCE(endpoint, '')) LIKE ?")
+            params.append(f"%{endpoint.lower()}%")
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        async with self._db.execute(
+            f"""
+            SELECT id, actor_username, endpoint, query_json, result_count, duration_ms,
+                   ip_address, user_agent, created_at
+            FROM auth_query_logs
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, safe_limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+
+    async def get_audit_events(
+        self,
+        limit: int = 300,
+        actor: str = "",
+        action: str = "",
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 2000))
+        where_clauses: List[str] = []
+        params: List[Any] = []
+        if actor:
+            where_clauses.append("LOWER(COALESCE(actor_username, '')) = LOWER(?)")
+            params.append(actor)
+        if action:
+            where_clauses.append("LOWER(COALESCE(action, '')) LIKE ?")
+            params.append(f"%{action.lower()}%")
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        async with self._db.execute(
+            f"""
+            SELECT id, actor_username, action, target, ip_address, details_json, created_at
+            FROM audit_log
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, safe_limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+
+    async def record_admin_failed_login(self, username: str, lock_seconds: int = 0) -> int:
+        normalized = str(username or "").strip()
+        if not normalized:
+            return 0
+        async with self._lock:
+            lock_until = None
+            if int(lock_seconds or 0) > 0:
+                lock_until = (datetime.utcnow() + timedelta(seconds=int(lock_seconds))).isoformat()
+            async with self._db.execute(
+                """
+                UPDATE admin_users
+                SET failed_login_count = COALESCE(failed_login_count, 0) + 1,
+                    last_failed_login_at = datetime('now'),
+                    locked_until = COALESCE(?, locked_until),
+                    updated_at = datetime('now')
+                WHERE username = ?
+                """,
+                (lock_until, normalized),
+            ) as cursor:
+                await self._db.commit()
+                return cursor.rowcount if cursor.rowcount is not None else 0
 
     async def record_admin_login(self, username: str, client_ip: str) -> None:
         async with self._lock:
@@ -1178,6 +1896,8 @@ class DatabaseManager:
                 UPDATE admin_users
                 SET last_login_at = datetime('now'),
                     last_login_ip = ?,
+                    failed_login_count = 0,
+                    locked_until = NULL,
                     updated_at = datetime('now')
                 WHERE username = ?
                 """,

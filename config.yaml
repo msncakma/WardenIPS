@@ -99,11 +99,28 @@ dashboard:
   enabled: false
   host: "127.0.0.1"          # Bind address (use 0.0.0.0 for external access)
   port: 7680
-  homepage: "dashboard"      # Landing page for / : dashboard, login, or admin
+  homepage: "portal"         # Landing page for / : portal, dashboard, login, or admin
   public_dashboard: true      # Allow the overview dashboard without login; /admin still requires login
   api_key: ""                # Optional Bearer token for API auth
   session_ttl: 600            # Dashboard inactivity timeout in seconds (10 minutes)
   login_rate_limit_per_minute: 10
+  rbac:
+    enabled: true
+  portal:
+    enabled: true
+    links:
+      - title: "Admin Dashboard"
+        url: "/admin"
+        description: "Operational controls and analytics"
+        permission: "panel.view"
+      - title: "Minecraft Intelligence"
+        url: "/admin/minecraft"
+        description: "Minecraft telemetry and entity intel"
+        permission: "minecraft.view"
+      - title: "Public Dashboard"
+        url: "/dashboard"
+        description: "Read-only system overview"
+        permission: ""
   bootstrap:
     setup_required: false
     token_hash: ""
@@ -171,6 +188,9 @@ plugins:
       entity_intel_cache_ttl_seconds: 20
       parser_health_cache_ttl_seconds: 12
       mask_emails: true
+      mask_ips: true
+      mask_uuids: true
+      hide_profile_timestamps: true
       local_cache_enabled: true
       local_cache_manual_refresh_only: true
     notifications:

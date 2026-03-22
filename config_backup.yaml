@@ -94,11 +94,28 @@ dashboard:
   enabled: false
   host: "127.0.0.1"
   port: 7680
-  homepage: "dashboard"
+  homepage: "portal"
   public_dashboard: true
   api_key: ""
   session_ttl: 600
   login_rate_limit_per_minute: 10
+  rbac:
+    enabled: true
+  portal:
+    enabled: true
+    links:
+      - title: "Admin Dashboard"
+        url: "/admin"
+        description: "Operational controls and analytics"
+        permission: "panel.view"
+      - title: "Minecraft Intelligence"
+        url: "/admin/minecraft"
+        description: "Minecraft telemetry and entity intel"
+        permission: "minecraft.view"
+      - title: "Public Dashboard"
+        url: "/dashboard"
+        description: "Read-only system overview"
+        permission: ""
   bootstrap:
     setup_required: false
     token_hash: ""
@@ -152,6 +169,9 @@ plugins:
       entity_intel_cache_ttl_seconds: 20
       parser_health_cache_ttl_seconds: 12
       mask_emails: true
+      mask_ips: true
+      mask_uuids: true
+      hide_profile_timestamps: true
       local_cache_enabled: true
       local_cache_manual_refresh_only: true
     notifications:

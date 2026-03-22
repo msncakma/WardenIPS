@@ -43,7 +43,7 @@ import secrets
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote, urlencode
 
@@ -71,7 +71,6 @@ from wardenips.core.logger import get_logger
 from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.updater import UpdateChecker
 from wardenips.plugins.minecraft_plugin import MinecraftPlugin
-from wardenips.plugins.authme_plugin import AuthMePlugin
 from wardenips.plugins.velocity_plugin import VelocityPlugin
 
 logger = get_logger(__name__)
@@ -111,6 +110,9 @@ class DashboardAPI:
     self._login_rate_limit_per_minute: int = 10
     self._public_dashboard_enabled: bool = True
     self._homepage: str = "dashboard"
+    self._rbac_enabled: bool = False
+    self._portal_enabled: bool = True
+    self._portal_links: list[dict[str, object]] = []
     self._session_cookie_name: str = "wardenips_dashboard_session"
     self._sessions: dict[str, float] = {}
     self._session_users: dict[str, str] = {}
@@ -144,7 +146,33 @@ class DashboardAPI:
     )
     self._public_dashboard_enabled = bool(dash.get("public_dashboard", True))
     homepage = str(dash.get("homepage", "dashboard")).strip().lower()
-    self._homepage = homepage if homepage in {"dashboard", "login", "admin"} else "dashboard"
+    self._homepage = homepage if homepage in {"dashboard", "login", "admin", "portal"} else "dashboard"
+    self._rbac_enabled = bool(dash.get("rbac", {}).get("enabled", False)) if isinstance(dash.get("rbac", {}), dict) else False
+    portal = dash.get("portal", {}) if isinstance(dash.get("portal", {}), dict) else {}
+    self._portal_enabled = bool(portal.get("enabled", True))
+    configured_links = portal.get("links", []) if isinstance(portal.get("links", []), list) else []
+    self._portal_links = []
+    for item in configured_links:
+      if not isinstance(item, dict):
+        continue
+      title = str(item.get("title", "")).strip()
+      url = str(item.get("url", "")).strip()
+      if not title or not url:
+        continue
+      self._portal_links.append(
+        {
+          "title": title,
+          "url": url,
+          "description": str(item.get("description", "")).strip(),
+          "permission": str(item.get("permission", "")).strip(),
+        }
+      )
+    if not self._portal_links:
+      self._portal_links = [
+        {"title": "Admin Dashboard", "url": "/admin", "description": "Operational controls and analytics", "permission": "panel.view"},
+        {"title": "Minecraft Intelligence", "url": "/admin/minecraft", "description": "Minecraft telemetry and intel", "permission": "minecraft.view"},
+        {"title": "Public Dashboard", "url": "/dashboard", "description": "Read-only overview", "permission": ""},
+      ]
     bootstrap = dash.get("bootstrap", {}) if isinstance(dash.get("bootstrap", {}), dict) else {}
     self._bootstrap_setup_required = bool(bootstrap.get("setup_required", False))
     self._bootstrap_token_hash = str(bootstrap.get("token_hash", "") or "").strip()
@@ -275,11 +303,45 @@ class DashboardAPI:
     local, domain = value.split("@", 1)
     if not local:
       return f"***@{domain}"
-    if len(local) <= 2:
-      masked_local = local[0] + "*" * max(len(local) - 1, 1)
-    else:
-      masked_local = local[0] + ("*" * (len(local) - 2)) + local[-1]
+    keep = min(3, len(local))
+    masked_local = local[:keep] + "***"
     return f"{masked_local}@{domain}"
+
+  def _mask_ip(self, ip_value: str) -> str:
+    raw = str(ip_value or "").strip()
+    if not raw:
+      return raw
+    try:
+      parsed = ipaddress.ip_address(raw)
+    except Exception:
+      return raw
+    if isinstance(parsed, ipaddress.IPv4Address):
+      octets = raw.split(".")
+      if len(octets) == 4:
+        return f"{octets[0]}.{octets[1]}.{octets[2]}.*"
+    exploded = parsed.exploded.split(":")
+    return ":".join(exploded[:3]) + ":*:*:*:*:*"
+
+  @staticmethod
+  def _mask_uuid(uuid_value: str) -> str:
+    raw = str(uuid_value or "").strip()
+    if not raw:
+      return raw
+    if len(raw) <= 8:
+      return raw
+    return raw[:8] + "..."
+
+  @staticmethod
+  def _permission_pattern_match(node: str, pattern: str) -> bool:
+    requested = str(node or "").strip().lower()
+    granted = str(pattern or "").strip().lower()
+    if not requested or not granted:
+      return False
+    if granted == "*":
+      return True
+    if granted.endswith("*"):
+      return requested.startswith(granted[:-1])
+    return requested == granted
 
   def _minecraft_cache_get(self, key: str, ttl_seconds: int) -> Optional[dict]:
     if ttl_seconds <= 0:
@@ -349,6 +411,55 @@ class DashboardAPI:
       return False
     token = auth[7:]
     return token in bearer_secrets
+
+  async def _actor_has_permission(self, request: web.Request, permission_node: str) -> bool:
+    if not self._check_auth(request):
+      return False
+    if not self._rbac_enabled:
+      return True
+
+    actor = self._get_session_actor(request)
+    if not actor:
+      # Legacy bearer clients keep full access while RBAC is introduced for interactive users.
+      return True
+
+    try:
+      permission_map = await self._db.get_user_effective_permissions(actor)
+    except Exception:
+      return False
+
+    allow = set(permission_map.get("allow") or set())
+    deny = set(permission_map.get("deny") or set())
+    requested = str(permission_node or "").strip().lower()
+    if not requested:
+      return True
+
+    for denied in deny:
+      if self._permission_pattern_match(requested, str(denied)):
+        return False
+    for granted in allow:
+      if self._permission_pattern_match(requested, str(granted)):
+        return True
+    return False
+
+  async def _require_permission(self, request: web.Request, permission_node: str) -> Optional[web.Response]:
+    if not self._check_auth(request):
+      return self._json_auth_error()
+    if await self._actor_has_permission(request, permission_node):
+      return None
+    await self._log_audit(
+      request,
+      "auth.permission_denied",
+      details={"required": permission_node, "path": request.path_qs},
+    )
+    return web.json_response(
+      {
+        "error": "forbidden",
+        "message": "You do not have the required permission for this action.",
+        "required_permission": permission_node,
+      },
+      status=403,
+    )
 
   def _check_public_dashboard_access(self, request: web.Request) -> bool:
     self._client_ip(request)
@@ -444,6 +555,10 @@ class DashboardAPI:
     if not value.startswith("/") or value.startswith("//"):
       return default
     return value
+
+  @staticmethod
+  def _hash_invite_token(raw_token: str) -> str:
+    return hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
 
   def _render_ui_template(self, html: str) -> str:
     return (
@@ -599,6 +714,7 @@ class DashboardAPI:
 
     self._app = web.Application()
     self._app.router.add_get("/", self._handle_root)
+    self._app.router.add_get("/portal", self._handle_portal)
     self._app.router.add_get("/dashboard", self._handle_dashboard)
     self._app.router.add_get("/admin", self._handle_dashboard_v2)
     self._app.router.add_get("/admin/minecraft", self._handle_minecraft_admin_page)
@@ -609,6 +725,7 @@ class DashboardAPI:
     self._app.router.add_post("/api/login/totp", self._handle_login_totp)
     self._app.router.add_post("/api/setup/begin", self._handle_setup_begin)
     self._app.router.add_post("/api/setup/complete", self._handle_setup_complete)
+    self._app.router.add_post("/api/invite/register", self._handle_invite_register)
     self._app.router.add_post("/api/logout", self._handle_logout)
     self._app.router.add_post("/api/session/activity", self._handle_session_activity)
     self._app.router.add_get("/logout", self._handle_logout)
@@ -641,12 +758,6 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/minecraft/ban-email", self._handle_admin_minecraft_ban_email)
     self._app.router.add_post("/api/admin/minecraft/ban-asn", self._handle_admin_minecraft_ban_asn)
     self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
-    self._app.router.add_get("/admin/minecraft/setup", self._handle_minecraft_setup_page)
-    self._app.router.add_get("/api/minecraft/setup/detect-logs", self._handle_minecraft_setup_detect_logs)
-    self._app.router.add_post("/api/minecraft/setup/validate-log", self._handle_minecraft_setup_validate_log)
-    self._app.router.add_get("/api/minecraft/setup/get-config", self._handle_minecraft_setup_get_config)
-    self._app.router.add_post("/api/minecraft/setup/validate-complete", self._handle_minecraft_setup_validate_complete)
-    self._app.router.add_post("/api/minecraft/setup/complete", self._handle_minecraft_setup_complete)
     self._app.router.add_get("/api/blocklist", self._handle_blocklist)
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
@@ -661,7 +772,15 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/reconcile-bans", self._handle_admin_reconcile_bans)
     self._app.router.add_get("/api/admin/auth-settings", self._handle_admin_get_auth_settings)
     self._app.router.add_post("/api/admin/auth-settings", self._handle_admin_set_auth_settings)
+    self._app.router.add_get("/api/admin/users", self._handle_admin_list_users)
+    self._app.router.add_post("/api/admin/users", self._handle_admin_create_user)
+    self._app.router.add_post("/api/admin/users/assign-role", self._handle_admin_assign_role)
+    self._app.router.add_post("/api/admin/users/grant-permission", self._handle_admin_grant_permission)
+    self._app.router.add_get("/api/admin/invites", self._handle_admin_list_invites)
+    self._app.router.add_post("/api/admin/invites", self._handle_admin_create_invite)
     self._app.router.add_post("/api/admin/query-records", self._handle_admin_query_records)
+    self._app.router.add_get("/api/admin/audit/events", self._handle_admin_audit_events)
+    self._app.router.add_get("/api/admin/audit/queries", self._handle_admin_audit_queries)
     self._app.router.add_post("/api/admin/flush-firewall", self._handle_admin_flush_firewall)
     self._app.router.add_post("/api/admin/clear-events", self._handle_admin_clear_events)
     self._app.router.add_post("/api/admin/clear-ban-history", self._handle_admin_clear_ban_history)
@@ -670,6 +789,8 @@ class DashboardAPI:
     self._app.router.add_get("/api/admin/config", self._handle_admin_get_config)
     self._app.router.add_post("/api/admin/config", self._handle_admin_save_config)
     self._app.router.add_post("/api/admin/config/patch", self._handle_admin_patch_config)
+    self._app.router.add_get("/api/admin/portal-links", self._handle_admin_get_portal_links)
+    self._app.router.add_post("/api/admin/portal-links", self._handle_admin_set_portal_links)
 
     self._runner = web.AppRunner(self._app, access_log=None)
     await self._runner.setup()
@@ -1254,7 +1375,35 @@ class DashboardAPI:
     if not await self._admin_auth_available():
       return self._json_auth_error()
     user = await self._db.get_admin_user_by_username(username)
+    if user:
+      locked_until_raw = str(user.get("locked_until", "") or "").strip()
+      if locked_until_raw:
+        try:
+          locked_until = datetime.fromisoformat(locked_until_raw.replace("Z", "+00:00"))
+          if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+          if locked_until > datetime.now(timezone.utc):
+            await self._log_audit(
+              request,
+              "auth.login_failed",
+              actor_username=username or None,
+              details={"reason": "account_locked", "locked_until": locked_until.isoformat()},
+            )
+            return web.json_response(
+              {"error": "account_locked", "message": "Account is temporarily locked due to repeated failures."},
+              status=423,
+            )
+        except Exception:
+          pass
+
     if not user or not verify_password(str(user.get("password_hash", "")), password):
+      if user:
+        try:
+          failed_count = int(user.get("failed_login_count", 0) or 0) + 1
+        except Exception:
+          failed_count = 1
+        lock_seconds = 300 if failed_count >= 5 else 0
+        await self._db.record_admin_failed_login(username, lock_seconds=lock_seconds)
       await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "invalid_credentials"})
       return web.json_response(
         {"error": "invalid_credentials", "message": "Invalid username or password."},
@@ -1440,6 +1589,241 @@ class DashboardAPI:
       "totp_qr_data_url": build_totp_qr_data_url(totp_uri),
     })
 
+  async def _handle_admin_list_users(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.users.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    try:
+      limit = int(request.query.get("limit", "200") or 200)
+    except Exception:
+      limit = 200
+    rows = await self._db.list_admin_users(limit=limit)
+    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+
+  async def _handle_admin_create_user(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.users.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    actor = self._get_session_actor(request) or ""
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    display_name = str(payload.get("display_name", "")).strip()
+    roles = payload.get("roles", []) if isinstance(payload.get("roles", []), list) else []
+    permissions = payload.get("permissions", []) if isinstance(payload.get("permissions", []), list) else []
+    totp_enabled = bool(payload.get("totp_enabled", True))
+    is_owner = bool(payload.get("is_owner", False))
+
+    if not username:
+      return web.json_response({"error": "invalid_username", "message": "username is required."}, status=400)
+    if not password:
+      return web.json_response({"error": "invalid_password", "message": "password is required."}, status=400)
+    valid, message = check_password_policy(password)
+    if not valid:
+      return web.json_response({"error": "weak_password", "message": message}, status=400)
+    if is_owner and not await self._actor_has_permission(request, "*"):
+      return web.json_response({"error": "forbidden", "message": "Only owner can create another owner account."}, status=403)
+    if await self._db.get_admin_user_by_username(username):
+      return web.json_response({"error": "username_exists", "message": "Username already exists."}, status=409)
+
+    user_id = await self._db.create_admin_user(
+      username=username,
+      password_hash=hash_password(password),
+      totp_secret=generate_totp_secret(),
+      totp_enabled=totp_enabled,
+      is_owner=is_owner,
+      display_name=display_name or username,
+      created_by=actor,
+    )
+    for role in roles:
+      await self._db.assign_role_to_user(username, str(role or "").strip().lower())
+    for node in permissions:
+      await self._db.upsert_user_permission(username, str(node or "").strip(), effect=1)
+
+    await self._log_audit(
+      request,
+      "admin.users.create",
+      actor_username=actor,
+      target=username,
+      details={"user_id": user_id, "roles": roles, "permissions": permissions, "is_owner": is_owner},
+    )
+    return web.json_response({"ok": True, "user_id": user_id, "username": username}, status=201)
+
+  async def _handle_admin_assign_role(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.users.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    actor = self._get_session_actor(request) or ""
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    username = str(payload.get("username", "")).strip()
+    role_code = str(payload.get("role", "")).strip().lower()
+    if not username or not role_code:
+      return web.json_response({"error": "invalid_request", "message": "username and role are required."}, status=400)
+    ok = await self._db.assign_role_to_user(username, role_code)
+    if not ok:
+      return web.json_response({"error": "assignment_failed", "message": "Could not assign role."}, status=404)
+    await self._log_audit(request, "admin.users.assign_role", actor_username=actor, target=username, details={"role": role_code})
+    return web.json_response({"ok": True, "username": username, "role": role_code})
+
+  async def _handle_admin_grant_permission(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.users.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    actor = self._get_session_actor(request) or ""
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+    username = str(payload.get("username", "")).strip()
+    node = str(payload.get("permission", "")).strip()
+    effect = int(payload.get("effect", 1) or 1)
+    if not username or not node:
+      return web.json_response({"error": "invalid_request", "message": "username and permission are required."}, status=400)
+    ok = await self._db.upsert_user_permission(username, node, effect=effect)
+    if not ok:
+      return web.json_response({"error": "grant_failed", "message": "Could not update user permission."}, status=404)
+    await self._log_audit(request, "admin.users.permission", actor_username=actor, target=username, details={"permission": node, "effect": 1 if effect >= 0 else -1})
+    return web.json_response({"ok": True, "username": username, "permission": node, "effect": 1 if effect >= 0 else -1})
+
+  async def _handle_admin_list_invites(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.invites.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    try:
+      limit = int(request.query.get("limit", "100") or 100)
+    except Exception:
+      limit = 100
+    rows = await self._db.list_invite_tokens(limit=limit)
+    items = []
+    for row in rows:
+      token_hash = str(row.get("token_hash") or "")
+      try:
+        role_codes = json.loads(str(row.get("role_codes_json") or "[]"))
+      except Exception:
+        role_codes = []
+      try:
+        permission_nodes = json.loads(str(row.get("permission_nodes_json") or "[]"))
+      except Exception:
+        permission_nodes = []
+      items.append(
+        {
+          "id": row.get("id"),
+          "fingerprint": token_hash[:8] + "..." if token_hash else "",
+          "created_by": row.get("created_by"),
+          "note": row.get("note"),
+          "max_uses": row.get("max_uses"),
+          "used_count": row.get("used_count"),
+          "expires_at": row.get("expires_at"),
+          "is_active": bool(row.get("is_active")),
+          "role_codes": role_codes,
+          "permission_nodes": permission_nodes,
+          "created_at": row.get("created_at"),
+        }
+      )
+    return web.json_response({"ok": True, "count": len(items), "items": items})
+
+  async def _handle_admin_create_invite(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.invites.manage")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    actor = self._get_session_actor(request) or ""
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    note = str(payload.get("note", "")).strip()
+    max_uses = max(1, min(int(payload.get("max_uses", 1) or 1), 50))
+    expires_in_hours = max(1, min(int(payload.get("expires_in_hours", 24) or 24), 24 * 30))
+    roles = [str(item or "").strip().lower() for item in list(payload.get("roles", []) or []) if str(item or "").strip()]
+    permissions = [str(item or "").strip() for item in list(payload.get("permissions", []) or []) if str(item or "").strip()]
+    raw_token = secrets.token_urlsafe(24)
+    token_hash = self._hash_invite_token(raw_token)
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()
+    invite_id = await self._db.create_invite_token(
+      token_hash=token_hash,
+      created_by=actor,
+      expires_at=expires_at,
+      max_uses=max_uses,
+      role_codes=roles,
+      permission_nodes=permissions,
+      note=note,
+    )
+    await self._log_audit(request, "admin.invites.create", actor_username=actor, target=str(invite_id), details={"max_uses": max_uses, "expires_at": expires_at, "roles": roles, "permissions": permissions})
+    return web.json_response({"ok": True, "invite_id": invite_id, "invite_token": raw_token, "expires_at": expires_at, "max_uses": max_uses}, status=201)
+
+  async def _handle_invite_register(self, request: web.Request) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      return web.json_response({"error": "setup_required", "message": "Complete bootstrap setup first."}, status=403)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    invite_token = str(payload.get("invite_token", "")).strip()
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    password_confirm = str(payload.get("password_confirm", ""))
+    display_name = str(payload.get("display_name", "")).strip()
+    totp_enabled = bool(payload.get("totp_enabled", True))
+
+    if not invite_token or not username:
+      return web.json_response({"error": "invalid_request", "message": "invite_token and username are required."}, status=400)
+    if password != password_confirm:
+      return web.json_response({"error": "password_mismatch", "message": "Passwords do not match."}, status=400)
+    valid, message = check_password_policy(password)
+    if not valid:
+      return web.json_response({"error": "weak_password", "message": message}, status=400)
+    if await self._db.get_admin_user_by_username(username):
+      return web.json_response({"error": "username_exists", "message": "Username already exists."}, status=409)
+
+    invite = await self._db.get_active_invite_by_hash(self._hash_invite_token(invite_token))
+    if not invite:
+      return web.json_response({"error": "invalid_invite", "message": "Invite token is invalid or expired."}, status=401)
+
+    created_by = str(invite.get("created_by") or "")
+    user_id = await self._db.create_admin_user(
+      username=username,
+      password_hash=hash_password(password),
+      totp_secret=generate_totp_secret(),
+      totp_enabled=totp_enabled,
+      is_owner=False,
+      display_name=display_name or username,
+      created_by=created_by,
+    )
+    try:
+      role_codes = json.loads(str(invite.get("role_codes_json") or "[]"))
+    except Exception:
+      role_codes = []
+    try:
+      permission_nodes = json.loads(str(invite.get("permission_nodes_json") or "[]"))
+    except Exception:
+      permission_nodes = []
+    for role in role_codes if isinstance(role_codes, list) else []:
+      await self._db.assign_role_to_user(username, str(role or "").strip().lower())
+    for node in permission_nodes if isinstance(permission_nodes, list) else []:
+      await self._db.upsert_user_permission(username, str(node or "").strip(), effect=1)
+
+    await self._db.consume_invite_token(int(invite.get("id") or 0))
+    response = web.json_response({"ok": True, "redirect_to": "/portal", "message": "Registration completed."})
+    self._issue_session(response, request, username=username)
+    await self._db.record_admin_login(username, self._client_ip(request))
+    await self._log_audit(request, "auth.invite_register", actor_username=username, details={"invite_id": invite.get("id"), "created_by": created_by, "user_id": user_id})
+    return response
+
   async def _handle_setup_complete(self, request: web.Request) -> web.Response:
     try:
       payload = await request.json()
@@ -1465,6 +1849,9 @@ class DashboardAPI:
         password_hash=str(pending.get("password_hash", "")),
         totp_secret=str(pending.get("totp_secret", "")),
         totp_enabled=True,
+        is_owner=True,
+        display_name=username,
+        created_by="bootstrap_setup",
       )
     except Exception as exc:
       message = str(exc)
@@ -1520,18 +1907,79 @@ class DashboardAPI:
   async def _handle_root(self, request: web.Request) -> web.Response:
     if self._bootstrap_token_is_valid():
       raise web.HTTPFound("/setup")
+    if self._homepage == "portal":
+      raise web.HTTPFound("/portal")
     if self._homepage == "login":
       raise web.HTTPFound("/login")
     if self._homepage == "admin":
       raise web.HTTPFound("/admin")
     raise web.HTTPFound("/dashboard")
 
+  async def _handle_portal(self, request: web.Request) -> web.Response:
+    if self._bootstrap_token_is_valid():
+      raise web.HTTPFound("/setup")
+    if not self._portal_enabled:
+      raise web.HTTPFound("/dashboard")
+
+    is_authed = self._check_auth(request)
+    actor = self._get_session_actor(request) if is_authed else None
+    links: list[dict[str, str]] = []
+    for link in self._portal_links:
+      permission = str(link.get("permission", "")).strip()
+      if permission and (not is_authed or not await self._actor_has_permission(request, permission)):
+        continue
+      links.append(
+        {
+          "title": str(link.get("title", "")).strip(),
+          "url": str(link.get("url", "")).strip(),
+          "description": str(link.get("description", "")).strip(),
+        }
+      )
+
+    tiles = "".join(
+      [
+        '<a class="tile" href="{url}"><h3>{title}</h3><p>{description}</p></a>'.format(
+          url=str(item.get("url", "#")).replace('"', "&quot;"),
+          title=str(item.get("title", "")).replace("<", "&lt;"),
+          description=str(item.get("description", "")).replace("<", "&lt;"),
+        )
+        for item in links
+      ]
+    )
+    if not tiles:
+      tiles = '<div class="empty">No portal links are available for your account.</div>'
+
+    auth_row = (
+      '<a class="btn" href="/logout">Logout</a>' if is_authed else '<a class="btn" href="/login">Login</a>'
+    )
+    actor_text = f"Signed in as {actor}" if actor else "Guest session"
+    html = (
+      "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+      "<title>WardenIPS Portal</title>"
+      "<style>body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:linear-gradient(135deg,#0e1727,#132238);color:#eef3ff;min-height:100vh;}"
+      ".wrap{max-width:1100px;margin:0 auto;padding:28px;}h1{margin:0 0 10px 0;font-size:2rem}.sub{color:#a7bddf;margin-bottom:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}"
+      ".btn{display:inline-flex;padding:10px 14px;border:1px solid #355072;border-radius:10px;background:#0f1e33;color:#e7efff;text-decoration:none;font-weight:600}"
+      ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:14px}.tile{display:block;text-decoration:none;color:#eef3ff;border:1px solid #2f4668;background:linear-gradient(180deg,#142440,#101a2c);padding:16px;border-radius:14px}"
+      ".tile h3{margin:0 0 8px 0;font-size:1.02rem}.tile p{margin:0;color:#a7bddf;font-size:.9rem}.empty{border:1px dashed #335072;border-radius:12px;padding:16px;color:#9fb8dd;background:#0f1a2c}"
+      "</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h1>WardenIPS Portal</h1><div class=\"sub\">"
+      + actor_text
+      + "</div></div><div>"
+      + auth_row
+      + "</div></div><div class=\"grid\">"
+      + tiles
+      + "</div></div></body></html>"
+    )
+    return web.Response(text=self._render_ui_template(html), content_type="text/html")
+
   async def _handle_logout(self, request: web.Request) -> web.Response:
+    actor = self._get_session_actor(request)
     if request.method == "GET":
       response = web.HTTPFound("/login")
     else:
       response = web.json_response({"ok": True, "redirect_to": "/login"})
     self._clear_session(request, response)
+    if actor:
+      await self._log_audit(request, "auth.logout", actor_username=actor)
     return response
 
   async def _handle_session_activity(self, request: web.Request) -> web.Response:
@@ -1562,8 +2010,9 @@ class DashboardAPI:
     return str(ipaddress.ip_address(candidate)), "ip"
 
   async def _handle_admin_get_whitelist(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     return web.json_response(
       {
@@ -1574,8 +2023,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_add_whitelist(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -1613,8 +2063,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "message": f"Added {normalized} to whitelist.", "entry": normalized, "entry_type": entry_type})
 
   async def _handle_admin_remove_whitelist(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -1654,8 +2105,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "message": f"Removed {normalized} from whitelist.", "entry": normalized, "entry_type": entry_type})
 
   async def _handle_admin_unban_ip(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     payload = await request.json()
@@ -1674,8 +2126,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_ban_ip(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -1737,8 +2190,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_report_and_ban(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -1840,8 +2294,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_bulk_ip_action(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -2051,8 +2506,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_deactivate_ban(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     payload = await request.json()
@@ -2067,8 +2523,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "updated": updated})
 
   async def _handle_admin_deactivate_all_bans(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     updated = await self._db.deactivate_all_bans()
@@ -2076,8 +2533,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "updated": updated})
 
   async def _handle_admin_enforce_simulated_bans(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
 
@@ -2159,8 +2617,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_reconcile_bans(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
 
@@ -2285,10 +2744,12 @@ class DashboardAPI:
     )
 
   async def _handle_admin_query_records(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.query.run")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
+    started_at = time.perf_counter()
 
     try:
       payload = await request.json()
@@ -2608,6 +3069,30 @@ class DashboardAPI:
       },
     )
 
+    try:
+      await self._db.log_query_event(
+        actor_username=actor,
+        endpoint="/api/admin/query-records",
+        query_payload={
+          "field": resolved_field,
+          "value": value,
+          "record_kind": record_kind,
+          "connection_type": connection_type_filter,
+          "event_type": event_type_filter,
+          "country": country_filter,
+          "min_risk": min_risk,
+          "max_risk": max_risk,
+          "page": page,
+          "page_size": page_size,
+        },
+        result_count=len(records),
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+        ip_address=self._client_ip(request),
+        user_agent=request.headers.get("User-Agent", ""),
+      )
+    except Exception:
+      pass
+
     return web.json_response(
       {
         "ok": True,
@@ -2624,9 +3109,60 @@ class DashboardAPI:
       }
     )
 
+  async def _handle_admin_audit_events(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.audit.view")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+
+    try:
+      limit = int(request.query.get("limit", "200") or 200)
+    except Exception:
+      limit = 200
+    actor = str(request.query.get("actor", "") or "").strip()
+    action = str(request.query.get("action", "") or "").strip()
+
+    rows = await self._db.get_audit_events(limit=limit, actor=actor, action=action)
+    for row in rows:
+      details_value = row.get("details_json")
+      if isinstance(details_value, str) and details_value:
+        try:
+          row["details"] = json.loads(details_value)
+        except Exception:
+          row["details"] = details_value
+      else:
+        row["details"] = details_value
+    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+
+  async def _handle_admin_audit_queries(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.audit.view")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+
+    try:
+      limit = int(request.query.get("limit", "200") or 200)
+    except Exception:
+      limit = 200
+    actor = str(request.query.get("actor", "") or "").strip()
+    endpoint = str(request.query.get("endpoint", "") or "").strip()
+
+    rows = await self._db.get_query_logs(limit=limit, actor=actor, endpoint=endpoint)
+    for row in rows:
+      query_value = row.get("query_json")
+      if isinstance(query_value, str) and query_value:
+        try:
+          row["query"] = json.loads(query_value)
+        except Exception:
+          row["query"] = query_value
+      else:
+        row["query"] = query_value
+    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+
   async def _handle_admin_flush_firewall(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     flushed = await self._firewall.flush()
@@ -2635,8 +3171,9 @@ class DashboardAPI:
     return web.json_response({"ok": flushed, "deactivated_records": updated})
 
   async def _handle_admin_clear_events(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     deleted = await self._db.clear_events()
@@ -2644,8 +3181,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "deleted": deleted})
 
   async def _handle_admin_clear_ban_history(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     deleted = await self._db.clear_ban_history()
@@ -2653,8 +3191,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "deleted": deleted})
 
   async def _handle_admin_test_notification(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     if not self._notifier:
@@ -2678,8 +3217,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "message": f"Test notification dispatched ({summary}).", **result})
 
   async def _handle_admin_update_status(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "panel.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     checker = UpdateChecker(current_version=__version__)
     return web.json_response(await checker.get_status())
@@ -2695,8 +3235,9 @@ class DashboardAPI:
       current[segments[-1]] = value
 
   async def _handle_admin_get_config(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     config_data = self._config.raw
     yaml_text = await self._config.get_yaml_text()
@@ -2710,8 +3251,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_save_config(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -2744,8 +3286,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_patch_config(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -2775,6 +3318,78 @@ class DashboardAPI:
         "message": message,
         "config": self._config.raw,
         "yaml": current_yaml,
+      }
+    )
+
+  async def _handle_admin_get_portal_links(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    return web.json_response(
+      {
+        "ok": True,
+        "enabled": bool(self._portal_enabled),
+        "count": len(self._portal_links),
+        "links": list(self._portal_links),
+      }
+    )
+
+  async def _handle_admin_set_portal_links(self, request: web.Request) -> web.Response:
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
+    self._touch_session(request)
+    actor = self._get_session_actor(request)
+    try:
+      payload = await request.json()
+    except Exception:
+      payload = {}
+
+    raw_links = payload.get("links", [])
+    if not isinstance(raw_links, list):
+      return web.json_response({"error": "invalid_links", "message": "links must be a JSON array."}, status=400)
+
+    normalized_links: list[dict[str, str]] = []
+    for item in raw_links[:40]:
+      if not isinstance(item, dict):
+        continue
+      title = str(item.get("title", "")).strip()
+      url = str(item.get("url", "")).strip()
+      description = str(item.get("description", "")).strip()
+      permission = str(item.get("permission", "")).strip()
+      if not title or not url:
+        continue
+      normalized_links.append(
+        {
+          "title": title[:120],
+          "url": url[:500],
+          "description": description[:260],
+          "permission": permission[:120],
+        }
+      )
+
+    enabled = bool(payload.get("enabled", True))
+    await self._config.patch_values(
+      {
+        "dashboard.portal.enabled": enabled,
+        "dashboard.portal.links": normalized_links,
+      }
+    )
+    self._initialize_config()
+    await self._log_audit(
+      request,
+      "admin.portal.links.update",
+      actor_username=actor,
+      details={"enabled": enabled, "count": len(normalized_links)},
+    )
+    return web.json_response(
+      {
+        "ok": True,
+        "enabled": bool(self._portal_enabled),
+        "count": len(self._portal_links),
+        "links": list(self._portal_links),
+        "message": "Portal links updated.",
       }
     )
 
@@ -2813,8 +3428,9 @@ class DashboardAPI:
     return web.Response(text=html, content_type="text/html")
 
   async def _handle_minecraft_summary(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     hours = min(max(int(request.query.get("hours", "24")), 1), 720)
     try:
@@ -2864,8 +3480,9 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_minecraft_events(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     limit = min(max(int(request.query.get("limit", "100")), 1), 1000)
     offset = max(int(request.query.get("offset", "0")), 0)
@@ -2995,8 +3612,9 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_minecraft_filter_options(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     username = str(request.query.get("username", "")).strip()
     source_ip = str(request.query.get("ip", "")).strip()
@@ -3072,8 +3690,9 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_minecraft_bursts(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     limit = min(max(int(request.query.get("limit", "50")), 1), 500)
     hours_back = max(int(request.query.get("hours_back", "0")), 0)
@@ -3104,8 +3723,9 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_minecraft_duplicate_emails(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     if self._consume_minecraft_rate_limit(request, "minecraft.duplicates"):
       return web.json_response({"error": "rate_limited", "message": "Too many duplicate-email requests."}, status=429)
@@ -3202,8 +3822,9 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_admin_minecraft_parser_health(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     if self._consume_minecraft_rate_limit(request, "minecraft.parser_health"):
       return web.json_response({"error": "rate_limited", "message": "Too many parser-health requests."}, status=429)
@@ -3510,8 +4131,9 @@ class DashboardAPI:
       }
 
   async def _handle_admin_minecraft_import_logs(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
 
@@ -3610,16 +4232,18 @@ class DashboardAPI:
     )
 
   async def _handle_admin_minecraft_watchlist(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     limit = min(max(int(request.query.get("limit", "200")), 1), 1000)
     entries = await self._db.list_minecraft_watchlist(limit=limit)
     return web.json_response({"entries": entries, "count": len(entries)})
 
   async def _handle_admin_minecraft_watchlist_add(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3645,8 +4269,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "player_name": player_name, "watch_id": watch_id, "message": f"{player_name} added to minecraft watchlist."})
 
   async def _handle_admin_minecraft_watchlist_remove(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3670,8 +4295,9 @@ class DashboardAPI:
     return web.json_response({"ok": True, "player_name": player_name, "updated": updated, "message": f"Watchlist entries removed: {updated}"})
 
   async def _handle_admin_minecraft_ban_player(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3735,8 +4361,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_minecraft_ban_ip(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3799,8 +4426,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_minecraft_ban_email(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3888,8 +4516,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_minecraft_ban_asn(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -3994,8 +4623,9 @@ class DashboardAPI:
     )
 
   async def _handle_admin_minecraft_whitelist_player(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "admin.config.edit")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     actor = self._get_session_actor(request)
     try:
@@ -4051,8 +4681,9 @@ class DashboardAPI:
     )
 
   async def _handle_minecraft_entity_intel(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
+    permission_error = await self._require_permission(request, "minecraft.intel.view")
+    if permission_error is not None:
+      return permission_error
     self._touch_session(request)
     if self._consume_minecraft_rate_limit(request, "minecraft.entity_intel"):
       return web.json_response({"error": "rate_limited", "message": "Too many entity-intel requests."}, status=429)
@@ -4240,13 +4871,46 @@ class DashboardAPI:
     for event in local_events:
       event["is_watchlisted_player"] = str(event.get("player_name") or "").strip().lower() in watch_names
 
-    if self._is_minecraft_email_masking_enabled():
+    can_view_full_email = await self._actor_has_permission(request, "minecraft.email.view.full")
+    can_view_full_ip = await self._actor_has_permission(request, "minecraft.ip.view.full")
+    can_view_full_uuid = await self._actor_has_permission(request, "minecraft.uuid.view.full")
+    can_view_login_timestamp = await self._actor_has_permission(request, "minecraft.profile.last_login.view")
+
+    if self._is_minecraft_email_masking_enabled() and not can_view_full_email:
       if isinstance(mysql_payload, dict) and mysql_payload.get("email"):
         mysql_payload["email"] = self._mask_email(mysql_payload.get("email"))
       for match in mysql_matches:
         if isinstance(match, dict) and match.get("email"):
           match["email"] = self._mask_email(match.get("email"))
       related_emails = [self._mask_email(mail) for mail in related_emails]
+
+    if not can_view_full_ip:
+      unique_ips = [self._mask_ip(ip) for ip in unique_ips]
+      for event in local_events:
+        event["source_ip"] = self._mask_ip(str(event.get("source_ip") or ""))
+      if isinstance(mysql_payload, dict):
+        for key in ("ip", "creation_ip", "reg_ip"):
+          if mysql_payload.get(key):
+            mysql_payload[key] = self._mask_ip(str(mysql_payload.get(key) or ""))
+      for match in mysql_matches:
+        if isinstance(match, dict):
+          for key in ("ip", "creation_ip", "reg_ip"):
+            if match.get(key):
+              match[key] = self._mask_ip(str(match.get(key) or ""))
+
+    if not can_view_full_uuid:
+      if isinstance(mysql_payload, dict) and mysql_payload.get("uuid"):
+        mysql_payload["uuid"] = self._mask_uuid(str(mysql_payload.get("uuid") or ""))
+      for match in mysql_matches:
+        if isinstance(match, dict) and match.get("uuid"):
+          match["uuid"] = self._mask_uuid(str(match.get("uuid") or ""))
+
+    if not can_view_login_timestamp:
+      if isinstance(mysql_payload, dict):
+        mysql_payload.pop("last_login", None)
+      for match in mysql_matches:
+        if isinstance(match, dict):
+          match.pop("last_login", None)
 
     watchlisted_users = [name for name in unique_users if name.strip().lower() in watch_names]
 
@@ -4683,259 +5347,6 @@ class DashboardAPI:
       "ips": sorted(ips),
       "emails": sorted(emails),
     }
-
-  async def _handle_minecraft_setup_page(self, request: web.Request) -> web.Response:
-    """Serve the AuthMe setup wizard page."""
-    auth_redirect = self._require_dashboard_auth(request)
-    if auth_redirect is not None:
-      return auth_redirect
-    self._touch_session(request)
-    html = MINECRAFT_SETUP_WIZARD_HTML
-    html = self._render_ui_template(html)
-    return web.Response(text=html, content_type="text/html")
-
-  async def _handle_minecraft_setup_detect_logs(self, request: web.Request) -> web.Response:
-    """Detect available AuthMe log files in common locations."""
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    self._touch_session(request)
-    
-    common_paths = [
-      "plugins/authme/authme.log",
-      "plugins/Minecraft/authme.log",
-      "plugins/AuthMe/authme.log",
-      "/opt/minecraft/plugins/authme/authme.log",
-      "/home/minecraft/plugins/authme/authme.log",
-    ]
-    
-    found: list[dict] = []
-    for path_candidate in common_paths:
-      abs_path = path_candidate if os.path.isabs(path_candidate) else os.path.join(os.getcwd(), path_candidate)
-      if not os.path.exists(abs_path):
-        continue
-      if not os.access(abs_path, os.R_OK):
-        continue
-      
-      try:
-        stat = os.stat(abs_path)
-        last_modified = datetime.fromtimestamp(stat.st_mtime).isoformat()
-        found.append({
-          "path": path_candidate,
-          "abs_path": abs_path,
-          "size_bytes": stat.st_size,
-          "last_modified": last_modified,
-          "readable": True,
-        })
-      except Exception:
-        continue
-    
-    return web.json_response({
-      "ok": True,
-      "found_logs": found,
-      "count": len(found),
-    })
-
-  async def _handle_minecraft_setup_validate_log(self, request: web.Request) -> web.Response:
-    """Validate a log file and show sample parse results."""
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    self._touch_session(request)
-    
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    
-    log_path = str(payload.get("log_path", "")).strip()
-    if not log_path:
-      return web.json_response(
-        {"error": "invalid_path", "message": "log_path is required."},
-        status=400,
-      )
-    
-    # Resolve path
-    abs_path = log_path if os.path.isabs(log_path) else os.path.join(os.getcwd(), log_path)
-    
-    if not os.path.exists(abs_path):
-      return web.json_response(
-        {"error": "path_not_found", "message": f"Log file not found: {log_path}"},
-        status=404,
-      )
-    
-    if not os.access(abs_path, os.R_OK):
-      return web.json_response(
-        {"error": "permission_denied", "message": f"Cannot read log file: {log_path}"},
-        status=403,
-      )
-    
-    # Parse first few lines to show sample results
-    sample_lines: list[str] = []
-    parsed_samples: list[dict] = []
-    match_count = 0
-    total_lines = 0
-    
-    try:
-      parser = AuthMePlugin(self._config)
-      
-      with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
-        for idx, line in enumerate(f):
-          total_lines += 1
-          if len(sample_lines) < 10:
-            sample_lines.append(line.rstrip('\r\n'))
-          
-          event = await parser.parse_line(line)
-          if event:
-            match_count += 1
-            if len(parsed_samples) < 5:
-              parsed_samples.append({
-                "line_no": idx + 1,
-                "player": str(event.player_name or ""),
-                "ip": str(event.source_ip or ""),
-                "type": str(event.details.get("event_type", "")),
-                "timestamp": event.timestamp.isoformat(),
-              })
-    except Exception as exc:
-      return web.json_response(
-        {"error": "parse_error", "message": f"Error validating log file: {str(exc)}"},
-        status=500,
-      )
-    
-    match_rate = (match_count / total_lines * 100) if total_lines > 0 else 0
-    
-    return web.json_response({
-      "ok": True,
-      "log_path": log_path,
-      "abs_path": abs_path,
-      "total_lines": total_lines,
-      "matched_events": match_count,
-      "match_rate": f"{match_rate:.1f}%",
-      "sample_lines": sample_lines,
-      "parsed_samples": parsed_samples,
-      "expected_format": "[MM-DD HH:MM:SS]: [FINE] player_name (logged in|registered) ip_address",
-    })
-
-  async def _handle_minecraft_setup_get_config(self, request: web.Request) -> web.Response:
-    """Return current AuthMe and Minecraft config sections."""
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    self._touch_session(request)
-    
-    plugins_section = self._config.get_section("plugins") or {}
-    minecraft_config = plugins_section.get("minecraft", {})
-    authme_config = plugins_section.get("authme", {})
-    
-    return web.json_response({
-      "ok": True,
-      "plugins": {
-        "minecraft": minecraft_config,
-        "authme": authme_config,
-      },
-      "message": "Current configuration loaded successfully.",
-    })
-
-  async def _handle_minecraft_setup_validate_complete(self, request: web.Request) -> web.Response:
-    """Run complete validation checks before setup completes."""
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    self._touch_session(request)
-    
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    
-    log_path = str(payload.get("log_path", "")).strip()
-    if not log_path:
-      return web.json_response(
-        {"errors": ["Log file path is missing."]},
-        status=400,
-      )
-    
-    errors: list[str] = []
-    warnings: list[str] = []
-    
-    # Check file permissions
-    abs_path = log_path if os.path.isabs(log_path) else os.path.join(os.getcwd(), log_path)
-    if not os.path.exists(abs_path):
-      errors.append(f"Log file not found: {log_path}")
-    elif not os.access(abs_path, os.R_OK):
-      errors.append(f"Log file is not readable: {log_path}")
-    
-    # Check if database table exists
-    try:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          "SELECT COUNT(*) FROM connection_events LIMIT 1"
-        ) as cursor:
-          pass
-    except Exception as exc:
-      errors.append(f"Database connection_events table check failed: {str(exc)}")
-    
-    # Check if log has recent entries
-    if os.path.exists(abs_path):
-      try:
-        stat = os.stat(abs_path)
-        age_seconds = time.time() - stat.st_mtime
-        if age_seconds > 86400 * 7:  # Older than 7 days
-          warnings.append(f"Log file hasn't been updated recently ({age_seconds/3600:.1f} hours ago)")
-      except Exception:
-        pass
-    
-    validation_ok = len(errors) == 0
-    
-    return web.json_response({
-      "ok": validation_ok,
-      "errors": errors,
-      "warnings": warnings,
-      "summary": f"Validation {'passed' if validation_ok else 'failed'}: {len(errors)} error(s), {len(warnings)} warning(s)",
-    })
-
-  async def _handle_minecraft_setup_complete(self, request: web.Request) -> web.Response:
-    """Mark setup as complete and configure AuthMe plugin."""
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    self._touch_session(request)
-    
-    actor = self._get_session_actor(request)
-    
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    
-    log_path = str(payload.get("log_path", "")).strip()
-    if not log_path:
-      return web.json_response(
-        {"error": "invalid_config", "message": "log_path is required."},
-        status=400,
-      )
-    
-    # Update config with the provided log path
-    try:
-      await self._config.patch_values({
-        "plugins.authme.enabled": True,
-        "plugins.authme.log_file_path": log_path,
-      })
-    except Exception as exc:
-      return web.json_response(
-        {"error": "config_update_failed", "message": str(exc)},
-        status=500,
-      )
-    
-    await self._log_audit(
-      request,
-      "minecraft.setup_complete",
-      actor_username=actor,
-      details={"log_path": log_path},
-    )
-    
-    return web.json_response({
-      "ok": True,
-      "message": "AuthMe setup complete. The plugin will begin parsing logs on service restart.",
-      "log_path": log_path,
-      "next_step": "Review logs in the dashboard or restart WardenIPS to activate the parser.",
-    })
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  Full SPA Dashboard — Dark theme, auto-refresh, CSS-only charts
@@ -5850,247 +6261,6 @@ window.minecraftEventsPage = 1;
 document.getElementById('toggleBannedBtn').textContent = 'Show banned events';
 syncIntelActionButtons(document.getElementById('intelType').value);
 setupAutoRefresh();
-</script>
-</body>
-</html>
-"""
-
-MINECRAFT_SETUP_WIZARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WardenIPS Minecraft Setup</title>
-<style>
-*,*::before,*::after{box-sizing:border-box}
-body{margin:0;font-family:"Segoe UI",Tahoma,Arial,sans-serif;background:linear-gradient(120deg,#0f172a,#1e293b);color:#e2e8f0;min-height:100vh}
-.wrap{max-width:1100px;margin:0 auto;padding:24px}
-.hero{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.title{font-size:1.8rem;font-weight:700;letter-spacing:.3px}
-.sub{color:#94a3b8}
-.grid{display:grid;grid-template-columns:280px 1fr;gap:16px}
-.panel{background:#0b1220;border:1px solid #1f2a44;border-radius:12px;padding:14px;box-shadow:0 10px 40px #00000033}
-.steps{display:grid;gap:8px}
-.step{padding:10px 12px;border-radius:8px;background:#111a2e;border:1px solid #223458;color:#cbd5e1;font-size:.95rem}
-.step.active{border-color:#22d3ee;background:#062230;color:#67e8f9}
-.step.done{border-color:#10b981;background:#06261d;color:#6ee7b7}
-.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-button{border:1px solid #334155;background:#0f172a;color:#e2e8f0;padding:9px 12px;border-radius:8px;cursor:pointer}
-button.primary{background:#0ea5e9;border-color:#0284c7;color:#001018;font-weight:700}
-button:disabled{opacity:.55;cursor:not-allowed}
-input[type='text']{width:100%;padding:10px;border-radius:8px;border:1px solid #334155;background:#0b1327;color:#e2e8f0}
-table{width:100%;border-collapse:collapse;margin-top:10px}
-th,td{border-bottom:1px solid #24314f;padding:8px;text-align:left;font-size:.92rem}
-.ok{color:#34d399}
-.warn{color:#fbbf24}
-.err{color:#f87171}
-.mono{font-family:Consolas,"Courier New",monospace;word-break:break-all}
-.hidden{display:none}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.8rem;border:1px solid #334155;background:#0f172a}
-@media (max-width: 880px){.grid{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="hero">
-    <div>
-      <div class="title">Minecraft AuthMe Setup Wizard</div>
-      <div class="sub">Guide for first-time setup: detect logs, validate format, review config, and finalize.</div>
-    </div>
-    <div class="sub">WardenIPS __APP_VERSION__ by __APP_AUTHOR__</div>
-  </div>
-
-  <div class="grid">
-    <div class="panel">
-      <div style="font-weight:700;margin-bottom:8px">Progress</div>
-      <div class="steps" id="steps">
-        <div class="step active" data-step="1">1. Detect AuthMe Logs</div>
-        <div class="step" data-step="2">2. Validate Log Format</div>
-        <div class="step" data-step="3">3. Review Configuration</div>
-        <div class="step" data-step="4">4. Final Validation</div>
-        <div class="step" data-step="5">5. Complete Setup</div>
-      </div>
-      <div class="actions">
-        <button id="prevBtn">Back</button>
-        <button class="primary" id="nextBtn">Next</button>
-      </div>
-      <div id="status" class="sub" style="margin-top:10px">Ready.</div>
-    </div>
-
-    <div class="panel">
-      <section id="step1">
-        <h3>Step 1: Detect Logs</h3>
-        <p class="sub">Search common AuthMe log locations.</p>
-        <button class="primary" id="detectBtn">Scan Common Paths</button>
-        <table>
-          <thead><tr><th>Path</th><th>Size (bytes)</th><th>Last Modified</th><th>Action</th></tr></thead>
-          <tbody id="logRows"><tr><td colspan="4" class="sub">No scan yet.</td></tr></tbody>
-        </table>
-      </section>
-
-      <section id="step2" class="hidden">
-        <h3>Step 2: Validate Log</h3>
-        <p class="sub">Confirm parser compatibility for the chosen file.</p>
-        <label>Log path</label>
-        <input id="logPath" type="text" placeholder="plugins/authme/authme.log">
-        <div class="actions">
-          <button class="primary" id="validateBtn">Validate</button>
-        </div>
-        <div id="validateOut" class="sub" style="margin-top:10px"></div>
-      </section>
-
-      <section id="step3" class="hidden">
-        <h3>Step 3: Current Config</h3>
-        <p class="sub">Review active minecraft/authme settings.</p>
-        <pre id="cfgOut" class="mono" style="white-space:pre-wrap;background:#0a1020;border:1px solid #223458;padding:10px;border-radius:8px">Loading...</pre>
-      </section>
-
-      <section id="step4" class="hidden">
-        <h3>Step 4: Final Validation</h3>
-        <p class="sub">Run final checks before saving setup.</p>
-        <button class="primary" id="finalCheckBtn">Run Validation</button>
-        <div id="finalOut" style="margin-top:10px"></div>
-      </section>
-
-      <section id="step5" class="hidden">
-        <h3>Step 5: Complete</h3>
-        <p class="sub">Persist AuthMe log path and finish wizard.</p>
-        <button class="primary" id="completeBtn">Complete Setup</button>
-        <div id="completeOut" style="margin-top:10px"></div>
-      </section>
-    </div>
-  </div>
-</div>
-
-<script>
-const state = { step: 1, logPath: '' };
-
-function setStatus(msg, isErr){
-  const el = document.getElementById('status');
-  el.textContent = msg;
-  el.className = isErr ? 'err' : 'sub';
-}
-
-async function api(url, options){
-  const resp = await fetch(url, Object.assign({credentials:'same-origin'}, options || {}));
-  let data = {};
-  try { data = await resp.json(); } catch(_e){}
-  if(!resp.ok){ throw new Error(String(data.message || data.error || ('HTTP ' + resp.status))); }
-  return data;
-}
-
-function showStep(step){
-  state.step = Math.max(1, Math.min(5, Number(step || 1)));
-  for(let i=1;i<=5;i++){
-    const sec = document.getElementById('step'+i);
-    const badge = document.querySelector('.step[data-step="'+i+'"]');
-    if(sec){ sec.classList.toggle('hidden', i !== state.step); }
-    if(badge){
-      badge.classList.toggle('active', i === state.step);
-      badge.classList.toggle('done', i < state.step);
-    }
-  }
-  document.getElementById('prevBtn').disabled = state.step <= 1;
-  document.getElementById('nextBtn').disabled = state.step >= 5;
-}
-
-async function loadConfig(){
-  const data = await api('/api/minecraft/setup/get-config');
-  document.getElementById('cfgOut').textContent = JSON.stringify(data.plugins || {}, null, 2);
-}
-
-async function detectLogs(){
-  setStatus('Scanning common AuthMe paths...', false);
-  const data = await api('/api/minecraft/setup/detect-logs');
-  const rows = Array.isArray(data.found_logs) ? data.found_logs : [];
-  const tbody = document.getElementById('logRows');
-  if(!rows.length){
-    tbody.innerHTML = '<tr><td colspan="4" class="warn">No readable AuthMe logs found.</td></tr>';
-    setStatus('No logs detected. Enter path manually in Step 2.', true);
-    return;
-  }
-  tbody.innerHTML = rows.map(r => {
-    const path = String(r.path || '');
-    const size = Number(r.size_bytes || 0);
-    const updated = String(r.last_modified || '-');
-    return '<tr>'+
-      '<td class="mono">'+path.replace(/</g,'&lt;')+'</td>'+
-      '<td>'+size+'</td>'+
-      '<td>'+updated.replace(/</g,'&lt;')+'</td>'+
-      '<td><button data-path="'+path.replace(/"/g,'&quot;')+'">Use</button></td>'+
-      '</tr>';
-  }).join('');
-  tbody.querySelectorAll('button[data-path]').forEach(btn => {
-    btn.addEventListener('click', function(){
-      const path = this.getAttribute('data-path') || '';
-      state.logPath = path;
-      document.getElementById('logPath').value = path;
-      setStatus('Selected: ' + path, false);
-      showStep(2);
-    });
-  });
-  setStatus('Detected ' + rows.length + ' log file(s).', false);
-}
-
-async function validateLog(){
-  const path = String(document.getElementById('logPath').value || '').trim();
-  if(!path){ setStatus('Please provide log path first.', true); return; }
-  state.logPath = path;
-  setStatus('Validating log format...', false);
-  const data = await api('/api/minecraft/setup/validate-log', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({log_path: path})
-  });
-  const out = document.getElementById('validateOut');
-  out.innerHTML = ''+
-    '<div><span class="badge">Matched</span> '+String(data.matched_events || 0)+'</div>'+
-    '<div><span class="badge">Total</span> '+String(data.total_lines || 0)+'</div>'+
-    '<div><span class="badge">Rate</span> '+String(data.match_rate || '0%')+'</div>';
-  setStatus('Validation completed.', false);
-}
-
-async function finalValidate(){
-  const path = state.logPath || String(document.getElementById('logPath').value || '').trim();
-  if(!path){ setStatus('Log path is missing.', true); return; }
-  setStatus('Running final checks...', false);
-  const data = await api('/api/minecraft/setup/validate-complete', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({log_path: path})
-  });
-  const errs = Array.isArray(data.errors) ? data.errors : [];
-  const warns = Array.isArray(data.warnings) ? data.warnings : [];
-  const out = document.getElementById('finalOut');
-  out.innerHTML = '' +
-    '<div class="'+(data.ok ? 'ok' : 'err')+'">'+String(data.summary || '')+'</div>' +
-    (errs.length ? '<ul class="err">'+errs.map(x => '<li>'+String(x).replace(/</g,'&lt;')+'</li>').join('')+'</ul>' : '') +
-    (warns.length ? '<ul class="warn">'+warns.map(x => '<li>'+String(x).replace(/</g,'&lt;')+'</li>').join('')+'</ul>' : '');
-  setStatus(data.ok ? 'Final validation passed.' : 'Final validation failed.', !data.ok);
-}
-
-async function completeSetup(){
-  const path = state.logPath || String(document.getElementById('logPath').value || '').trim();
-  if(!path){ setStatus('Log path is missing.', true); return; }
-  setStatus('Saving setup...', false);
-  const data = await api('/api/minecraft/setup/complete', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({log_path: path})
-  });
-  document.getElementById('completeOut').innerHTML = '<div class="ok">'+String(data.message || 'Setup completed.')+'</div>';
-  setStatus('Setup completed.', false);
-}
-
-document.getElementById('prevBtn').addEventListener('click', function(){ showStep(state.step - 1); });
-document.getElementById('nextBtn').addEventListener('click', function(){ showStep(state.step + 1); if(state.step === 3){ loadConfig().catch(err => setStatus(String(err.message || err), true)); } });
-document.getElementById('detectBtn').addEventListener('click', function(){ detectLogs().catch(err => setStatus(String(err.message || err), true)); });
-document.getElementById('validateBtn').addEventListener('click', function(){ validateLog().catch(err => setStatus(String(err.message || err), true)); });
-document.getElementById('finalCheckBtn').addEventListener('click', function(){ finalValidate().catch(err => setStatus(String(err.message || err), true)); });
-document.getElementById('completeBtn').addEventListener('click', function(){ completeSetup().catch(err => setStatus(String(err.message || err), true)); });
-
-showStep(1);
-loadConfig().catch(function(){ });
 </script>
 </body>
 </html>
@@ -7534,6 +7704,110 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
               <button id="saveAdminTotpBtn" class="btn ghost">Save TOTP Setting</button>
             </div>
           </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">User & Role Management</div></div>
+            <div class="toolbar-grid three">
+              <input id="rbacCreateUsername" class="ctrl" placeholder="Username">
+              <input id="rbacCreateDisplayName" class="ctrl" placeholder="Display Name (optional)">
+              <input id="rbacCreatePassword" class="ctrl" type="password" placeholder="Password">
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <input id="rbacCreateRoles" class="ctrl" placeholder="Roles CSV (example: admin,viewer)">
+              <input id="rbacCreatePermissions" class="ctrl" placeholder="Allow nodes CSV (example: admin.audit.view)">
+              <button id="rbacCreateUserBtn" class="btn cyan">Create User</button>
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <input id="rbacAssignUsername" class="ctrl" placeholder="Username">
+              <input id="rbacAssignRole" class="ctrl" placeholder="Role code (example: analyst)">
+              <button id="rbacAssignRoleBtn" class="btn ghost">Assign Role</button>
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <input id="rbacPermUsername" class="ctrl" placeholder="Username">
+              <input id="rbacPermNode" class="ctrl" placeholder="Permission node (example: minecraft.records.view.full)">
+              <button id="rbacGrantPermBtn" class="btn ghost">Grant Permission</button>
+            </div>
+            <div class="toolbar-grid stack-label" style="margin-top:8px">
+              <div class="sub">Current Admin Users</div>
+              <button id="rbacRefreshUsersBtn" class="btn ghost">Refresh Users</button>
+            </div>
+            <div class="table-wrap" style="max-height:220px">
+              <table>
+                <thead><tr><th>User</th><th>Owner</th><th>Status</th><th>Failed Logins</th><th>Last Login</th></tr></thead>
+                <tbody id="rbacUsersRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Invite Tokens</div></div>
+            <div class="toolbar-grid query-grid">
+              <input id="inviteNote" class="ctrl" placeholder="Invite note (optional)">
+              <input id="inviteRoles" class="ctrl" placeholder="Roles CSV (example: viewer)">
+              <input id="invitePermissions" class="ctrl" placeholder="Permission nodes CSV (optional)">
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <input id="inviteMaxUses" class="ctrl" type="number" min="1" max="50" value="1" placeholder="Max uses">
+              <input id="inviteExpiresHours" class="ctrl" type="number" min="1" max="720" value="24" placeholder="Expires in hours">
+              <button id="createInviteBtn" class="btn cyan">Create Invite</button>
+            </div>
+            <div class="toolbar-grid stack-label" style="margin-top:8px">
+              <div class="sub">Latest invite token</div>
+            </div>
+            <div class="panel-box" style="margin-bottom:8px"><span id="inviteLatestToken" class="mono">No invite token generated in this session.</span></div>
+            <div class="toolbar-grid stack-label" style="margin-top:8px">
+              <div class="sub">Active/Recent Invites</div>
+              <button id="refreshInvitesBtn" class="btn ghost">Refresh Invites</button>
+            </div>
+            <div class="table-wrap" style="max-height:220px">
+              <table>
+                <thead><tr><th>Fingerprint</th><th>Uses</th><th>Roles</th><th>Expires</th><th>State</th></tr></thead>
+                <tbody id="inviteRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Audit Streams</div></div>
+            <div class="toolbar-grid query-grid">
+              <input id="auditActorFilter" class="ctrl" placeholder="Actor filter (username)">
+              <input id="auditActionFilter" class="ctrl" placeholder="Action filter (example: admin.users)">
+              <button id="refreshAuditEventsBtn" class="btn ghost">Load Action Audit</button>
+            </div>
+            <div class="table-wrap" style="max-height:180px;margin-top:8px">
+              <table>
+                <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Source IP</th></tr></thead>
+                <tbody id="auditEventsRows"></tbody>
+              </table>
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:10px">
+              <input id="auditQueryActorFilter" class="ctrl" placeholder="Query actor filter">
+              <input id="auditQueryEndpointFilter" class="ctrl" placeholder="Endpoint filter (example: /api/admin/query-records)">
+              <button id="refreshAuditQueriesBtn" class="btn ghost">Load Query Audit</button>
+            </div>
+            <div class="table-wrap" style="max-height:180px;margin-top:8px">
+              <table>
+                <thead><tr><th>Time</th><th>Actor</th><th>Endpoint</th><th>Rows</th><th>Duration</th></tr></thead>
+                <tbody id="auditQueriesRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="action-panel">
+            <div class="toolbar-grid stack-label"><div class="sub">Portal Link Management</div></div>
+            <div class="toolbar-grid query-grid">
+              <label class="theme-chip" style="justify-self:start;align-self:center;padding:6px 10px"><input id="portalEnabled" type="checkbox" style="accent-color:var(--accent);width:1rem;height:1rem"><span>Portal Enabled</span></label>
+              <div class="sub" style="align-self:center">Edit dashboard.portal.links directly as JSON array.</div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button id="portalLoadBtn" class="btn ghost">Load Portal Links</button>
+                <button id="portalSaveBtn" class="btn cyan">Save Portal Links</button>
+              </div>
+            </div>
+            <div class="toolbar-grid" style="margin-top:8px">
+              <textarea id="portalLinksJson" class="config-editor" style="min-height:180px" spellcheck="false" placeholder='[{"title":"Admin Dashboard","url":"/admin","description":"Operational controls","permission":"panel.view"}]'></textarea>
+            </div>
+            <div class="sub">Each item supports: title, url, description, permission. Entries missing title/url are ignored on save.</div>
+          </div>
         </div>
 
         <div class="action-grid" style="margin-top:14px">
@@ -7847,7 +8121,7 @@ var activityPingTimer = null;
 var idleTimer = null;
 var toastTimer = null;
 var SESSION_IDLE_MS = __SESSION_TIMEOUT_MS__;
-var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:'', adminIncludeHoneypot:true, bulkResultPayload:null};
+var state = {events:[], bans:[], firewall:[], topPorts:[], topPortsExpanded:false, mesh:null, stats:null, health:null, theme:'dark', config:null, configYaml:'', advancedYamlOpen:false, updateInfo:null, portscanIgnoredPorts:[], authSettings:null, whitelist:{ips:[],cidr_ranges:[]}, ipDetailOpen:false, ipDetailIp:'', adminIncludeHoneypot:true, bulkResultPayload:null, adminUsers:[], inviteItems:[], auditEvents:[], auditQueries:[], portalEnabled:true, portalLinks:[]};
 function $(s){return document.querySelector(s)}
 function N(n){return (n||0).toLocaleString()}
 function E(s){var d=document.createElement('div'); d.textContent=s||''; return d.innerHTML}
@@ -8464,6 +8738,272 @@ function resetQueryPaging(){
   window.adminQueryPage = 1;
 }
 
+function parseCsvValues(raw){
+  var seen={};
+  return String(raw||'').split(',').map(function(item){ return item.trim(); }).filter(function(item){
+    if(!item){ return false; }
+    var key=item.toLowerCase();
+    if(seen[key]){ return false; }
+    seen[key]=true;
+    return true;
+  });
+}
+
+function shortenJson(value, maxLen){
+  var cap=Number(maxLen||220);
+  var raw='';
+  if(value===null||value===undefined){
+    raw='';
+  }else if(typeof value==='string'){
+    raw=value;
+  }else{
+    try{ raw=JSON.stringify(value); }catch(error){ raw=String(value); }
+  }
+  if(raw.length<=cap){ return raw; }
+  return raw.slice(0, Math.max(cap-3, 0))+'...';
+}
+
+function renderAdminUsers(rows){
+  var target=$('#rbacUsersRows');
+  if(!rows||!rows.length){
+    target.innerHTML='<tr><td colspan="5" class="empty">No admin users found.</td></tr>';
+    return;
+  }
+  target.innerHTML=rows.map(function(user){
+    var username=String(user.username||'-');
+    var lockedUntil=parseTs(user.locked_until);
+    var now=Date.now();
+    var status='Active';
+    if(!user.is_active){ status='Disabled'; }
+    else if(lockedUntil!==null && lockedUntil>now){ status='Locked'; }
+    var statusClass=status==='Active'?'ok':'fail';
+    var loginText=user.last_login_at?new Date(parseTs(user.last_login_at)||Date.now()).toLocaleString():'-';
+    return '<tr>'
+      +'<td class="mono">'+E(username)+'</td>'
+      +'<td>'+((user.is_owner)?'Yes':'No')+'</td>'
+      +'<td><span class="row-kind '+statusClass+'">'+E(status)+'</span></td>'
+      +'<td>'+E(String(user.failed_login_count||0))+'</td>'
+      +'<td>'+E(loginText)+'</td>'
+      +'</tr>';
+  }).join('');
+}
+
+async function loadAdminUsers(showToast){
+  var payload=await api('/api/admin/users?limit=300');
+  if(!payload){ return false; }
+  state.adminUsers=Array.isArray(payload.items)?payload.items:[];
+  renderAdminUsers(state.adminUsers);
+  if(showToast){ setStatus('ok','Users loaded', 'Loaded '+N(payload.count||0)+' admin user(s).'); }
+  return true;
+}
+
+function renderInviteItems(rows){
+  var target=$('#inviteRows');
+  if(!rows||!rows.length){
+    target.innerHTML='<tr><td colspan="5" class="empty">No invites created yet.</td></tr>';
+    return;
+  }
+  target.innerHTML=rows.map(function(item){
+    var roles=Array.isArray(item.role_codes)?item.role_codes.join(', '):'';
+    var stateText=item.is_active?'Active':'Inactive';
+    var stateClass=item.is_active?'ok':'fail';
+    var used=N(item.used_count||0)+' / '+N(item.max_uses||0);
+    return '<tr>'
+      +'<td class="mono">'+E(String(item.fingerprint||'-'))+'</td>'
+      +'<td>'+E(used)+'</td>'
+      +'<td>'+E(roles||'-')+'</td>'
+      +'<td>'+E(item.expires_at?new Date(parseTs(item.expires_at)||Date.now()).toLocaleString():'-')+'</td>'
+      +'<td><span class="row-kind '+stateClass+'">'+E(stateText)+'</span></td>'
+      +'</tr>';
+  }).join('');
+}
+
+async function loadInviteItems(showToast){
+  var payload=await api('/api/admin/invites?limit=200');
+  if(!payload){ return false; }
+  state.inviteItems=Array.isArray(payload.items)?payload.items:[];
+  renderInviteItems(state.inviteItems);
+  if(showToast){ setStatus('ok','Invites loaded', 'Loaded '+N(payload.count||0)+' invite record(s).'); }
+  return true;
+}
+
+function renderAuditEvents(rows){
+  var target=$('#auditEventsRows');
+  if(!rows||!rows.length){
+    target.innerHTML='<tr><td colspan="5" class="empty">No action-audit entries found.</td></tr>';
+    return;
+  }
+  target.innerHTML=rows.map(function(item){
+    var details=shortenJson(item.details, 180);
+    return '<tr>'
+      +'<td>'+E(ago(item.created_at))+'</td>'
+      +'<td>'+E(String(item.actor_username||'-'))+'</td>'
+      +'<td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(details)+'">'+E(String(item.action||'-'))+'</td>'
+      +'<td>'+E(String(item.target||'-'))+'</td>'
+      +'<td class="mono">'+E(String(item.ip_address||'-'))+'</td>'
+      +'</tr>';
+  }).join('');
+}
+
+function renderAuditQueries(rows){
+  var target=$('#auditQueriesRows');
+  if(!rows||!rows.length){
+    target.innerHTML='<tr><td colspan="5" class="empty">No query-audit entries found.</td></tr>';
+    return;
+  }
+  target.innerHTML=rows.map(function(item){
+    var queryText=shortenJson(item.query, 220);
+    return '<tr>'
+      +'<td>'+E(ago(item.created_at))+'</td>'
+      +'<td>'+E(String(item.actor_username||'-'))+'</td>'
+      +'<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+E(queryText)+'">'+E(String(item.endpoint||'-'))+'</td>'
+      +'<td>'+E(String(item.result_count||0))+'</td>'
+      +'<td>'+E(String(item.duration_ms||0)+'ms')+'</td>'
+      +'</tr>';
+  }).join('');
+}
+
+async function loadAuditEvents(showToast){
+  var actor=$('#auditActorFilter').value.trim();
+  var action=$('#auditActionFilter').value.trim();
+  var qs='?limit=200';
+  if(actor){ qs += '&actor='+encodeURIComponent(actor); }
+  if(action){ qs += '&action='+encodeURIComponent(action); }
+  var payload=await api('/api/admin/audit/events'+qs);
+  if(!payload){ return false; }
+  state.auditEvents=Array.isArray(payload.items)?payload.items:[];
+  renderAuditEvents(state.auditEvents);
+  if(showToast){ setStatus('ok','Action audit loaded', 'Loaded '+N(payload.count||0)+' action audit record(s).'); }
+  return true;
+}
+
+async function loadAuditQueries(showToast){
+  var actor=$('#auditQueryActorFilter').value.trim();
+  var endpoint=$('#auditQueryEndpointFilter').value.trim();
+  var qs='?limit=200';
+  if(actor){ qs += '&actor='+encodeURIComponent(actor); }
+  if(endpoint){ qs += '&endpoint='+encodeURIComponent(endpoint); }
+  var payload=await api('/api/admin/audit/queries'+qs);
+  if(!payload){ return false; }
+  state.auditQueries=Array.isArray(payload.items)?payload.items:[];
+  renderAuditQueries(state.auditQueries);
+  if(showToast){ setStatus('ok','Query audit loaded', 'Loaded '+N(payload.count||0)+' query audit record(s).'); }
+  return true;
+}
+
+function renderPortalLinksEditor(){
+  $('#portalEnabled').checked=!!state.portalEnabled;
+  var pretty='[]';
+  try{ pretty=JSON.stringify(state.portalLinks||[], null, 2); }catch(error){ pretty='[]'; }
+  $('#portalLinksJson').value=pretty;
+}
+
+async function loadPortalLinks(showToast){
+  var payload=await api('/api/admin/portal-links');
+  if(!payload){ return false; }
+  state.portalEnabled=!!payload.enabled;
+  state.portalLinks=Array.isArray(payload.links)?payload.links:[];
+  renderPortalLinksEditor();
+  if(showToast){ setStatus('ok','Portal links loaded', 'Loaded '+N(payload.count||0)+' portal link(s).'); }
+  return true;
+}
+
+async function savePortalLinks(){
+  var text=$('#portalLinksJson').value.trim();
+  var links=[];
+  if(text){
+    try{ links=JSON.parse(text); }
+    catch(error){ setStatus('err','Invalid portal JSON','portal links must be valid JSON array.'); return; }
+  }
+  if(!Array.isArray(links)){
+    setStatus('err','Invalid portal JSON','portal links must be a JSON array.');
+    return;
+  }
+  var payload=await api('/api/admin/portal-links', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled:$('#portalEnabled').checked, links:links})
+  });
+  if(!payload){ return; }
+  state.portalEnabled=!!payload.enabled;
+  state.portalLinks=Array.isArray(payload.links)?payload.links:[];
+  renderPortalLinksEditor();
+  setStatus('ok','Portal links updated', payload.message || 'Portal link configuration saved.');
+}
+
+async function createAdminUser(){
+  var username=$('#rbacCreateUsername').value.trim();
+  var password=$('#rbacCreatePassword').value;
+  var displayName=$('#rbacCreateDisplayName').value.trim();
+  var roles=parseCsvValues($('#rbacCreateRoles').value).map(function(item){ return item.toLowerCase(); });
+  var permissions=parseCsvValues($('#rbacCreatePermissions').value);
+  if(!username || !password){
+    setStatus('err','Missing input','Username and password are required to create a user.');
+    return;
+  }
+  var payload=await api('/api/admin/users', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username:username, password:password, display_name:displayName, roles:roles, permissions:permissions})
+  });
+  if(!payload){ return; }
+  setStatus('ok','User created', 'Created admin user '+username+'.');
+  $('#rbacCreatePassword').value='';
+  await loadAdminUsers(false);
+}
+
+async function assignRoleToUser(){
+  var username=$('#rbacAssignUsername').value.trim();
+  var role=$('#rbacAssignRole').value.trim().toLowerCase();
+  if(!username || !role){
+    setStatus('err','Missing input','Provide both username and role code.');
+    return;
+  }
+  var payload=await api('/api/admin/users/assign-role', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username:username, role:role})
+  });
+  if(!payload){ return; }
+  setStatus('ok','Role assigned', 'Assigned role '+role+' to '+username+'.');
+  await loadAdminUsers(false);
+}
+
+async function grantUserPermission(){
+  var username=$('#rbacPermUsername').value.trim();
+  var permission=$('#rbacPermNode').value.trim();
+  if(!username || !permission){
+    setStatus('err','Missing input','Provide both username and permission node.');
+    return;
+  }
+  var payload=await api('/api/admin/users/grant-permission', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username:username, permission:permission, effect:1})
+  });
+  if(!payload){ return; }
+  setStatus('ok','Permission granted', 'Granted '+permission+' to '+username+'.');
+}
+
+async function createInviteToken(){
+  var note=$('#inviteNote').value.trim();
+  var roles=parseCsvValues($('#inviteRoles').value).map(function(item){ return item.toLowerCase(); });
+  var permissions=parseCsvValues($('#invitePermissions').value);
+  var maxUses=parseInt($('#inviteMaxUses').value||'1',10);
+  var expiresHours=parseInt($('#inviteExpiresHours').value||'24',10);
+  if(!Number.isFinite(maxUses)||maxUses<1){ maxUses=1; }
+  if(!Number.isFinite(expiresHours)||expiresHours<1){ expiresHours=24; }
+  var payload=await api('/api/admin/invites', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({note:note, roles:roles, permissions:permissions, max_uses:maxUses, expires_in_hours:expiresHours})
+  });
+  if(!payload){ return; }
+  $('#inviteLatestToken').textContent=String(payload.invite_token||'-');
+  setStatus('ok','Invite created', 'Invite token generated. Expires at '+String(payload.expires_at||'-')+'.');
+  await loadInviteItems(false);
+}
+
 async function runRecordQuery(){
   var value=$('#queryValue').value.trim();
   if(!value){
@@ -8817,6 +9357,16 @@ function bind(){
     renderAuthSettings();
     setStatus('ok','Admin auth updated', payload.message || (enabled ? 'TOTP is now required at login.' : 'TOTP requirement is now disabled.'));
   });
+  $('#rbacCreateUserBtn').addEventListener('click', async function(){ handleUserActivity(); await createAdminUser(); });
+  $('#rbacAssignRoleBtn').addEventListener('click', async function(){ handleUserActivity(); await assignRoleToUser(); });
+  $('#rbacGrantPermBtn').addEventListener('click', async function(){ handleUserActivity(); await grantUserPermission(); });
+  $('#rbacRefreshUsersBtn').addEventListener('click', async function(){ handleUserActivity(); await loadAdminUsers(true); });
+  $('#createInviteBtn').addEventListener('click', async function(){ handleUserActivity(); await createInviteToken(); });
+  $('#refreshInvitesBtn').addEventListener('click', async function(){ handleUserActivity(); await loadInviteItems(true); });
+  $('#refreshAuditEventsBtn').addEventListener('click', async function(){ handleUserActivity(); await loadAuditEvents(true); });
+  $('#refreshAuditQueriesBtn').addEventListener('click', async function(){ handleUserActivity(); await loadAuditQueries(true); });
+  $('#portalLoadBtn').addEventListener('click', async function(){ handleUserActivity(); await loadPortalLinks(true); });
+  $('#portalSaveBtn').addEventListener('click', async function(){ handleUserActivity(); await savePortalLinks(); });
   $('#banManualBtn').addEventListener('click', async function(){ var ip=$('#manualBanIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the ban action.'); return; } var duration=parseInt($('#manualBanDuration').value,10); if(!Number.isFinite(duration)||duration<0){ duration=parseInt(getConfigValue('firewall.ipset.default_ban_duration',0),10); } if(!Number.isFinite(duration)||duration<0){ duration=0; } var reason=$('#manualBanReason').value.trim(); handleUserActivity(); await performAction('/api/admin/ban-ip', {ip:ip, duration:duration, reason:reason}, 'Firewall IP banned', function(payload){ return payload.message || ('Added '+ip+' to firewall bans.'); }); $('#manualBanIp').value=''; });
   $('#unbanManualBtn').addEventListener('click', async function(){ var ip=$('#manualIp').value.trim(); if(!ip){ setStatus('err','Missing input','Enter an IP address before running the unban action.'); return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); $('#manualIp').value=''; });
   $('#addWhitelistBtn').addEventListener('click', async function(){ var value=$('#manualWhitelist').value.trim(); if(!value){ setStatus('err','Missing input','Enter an IP or CIDR before adding to whitelist.'); return; } handleUserActivity(); var ok=await performAction('/api/admin/whitelist/add', {value:value}, 'Whitelist updated', function(payload){ return payload.message || ('Added '+value+' to whitelist.'); }); if(ok){ await loadWhitelist(); } });
@@ -8843,7 +9393,11 @@ function bind(){
   $('#firewallRows').addEventListener('click', async function(ev){ var button = ev.target.closest('.fw-action'); if(!button){ return; } var ip = button.getAttribute('data-ip'); if(!ip || !confirm('Remove this IP from the firewall set?')){ return; } handleUserActivity(); await performAction('/api/admin/unban-ip', {ip:ip}, 'Firewall IP removed', function(payload){ return payload.message || ('Removed '+ip+' from the firewall.'); }); });
 }
 var flashMessage = sessionStorage.getItem('wardenips_logout_message'); if(flashMessage){ setStatus('ok','Session notice', flashMessage); sessionStorage.removeItem('wardenips_logout_message'); }
-initTheme(); bind(); bindActivity(); loadConfig(); loadWhitelist(); loadAuthSettings(); loadUpdateStatus(); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
+renderAdminUsers([]);
+renderInviteItems([]);
+renderAuditEvents([]);
+renderAuditQueries([]);
+initTheme(); bind(); bindActivity(); loadConfig(); loadWhitelist(); loadAuthSettings(); loadUpdateStatus(); loadPortalLinks(false); refresh(); timer=setInterval(refresh, parseInt($('#refreshRate').value,10)||1000);
 bindAllSettingsGroupToggles();
 })();
 </script>

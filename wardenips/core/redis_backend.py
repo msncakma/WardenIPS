@@ -26,7 +26,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from wardenips.core.logger import get_logger
 
@@ -300,8 +300,10 @@ class RedisDatabaseManager:
         if not data or data.get("is_active") != "1":
             return None
         data["id"] = int(data.get("id", 0) or 0)
+        data["is_owner"] = int(data.get("is_owner", 0) or 0)
         data["totp_enabled"] = int(data.get("totp_enabled", 0) or 0)
         data["is_active"] = int(data.get("is_active", 0) or 0)
+        data["failed_login_count"] = int(data.get("failed_login_count", 0) or 0)
         return data
 
     async def create_admin_user(
@@ -310,6 +312,9 @@ class RedisDatabaseManager:
         password_hash: str,
         totp_secret: str,
         totp_enabled: bool = True,
+        is_owner: bool = False,
+        display_name: str = "",
+        created_by: str = "",
     ) -> int:
         user_id = await self._redis.incr(self._key("admin_user_id_seq"))
         now = datetime.utcnow().isoformat()
@@ -320,6 +325,12 @@ class RedisDatabaseManager:
             "totp_secret": totp_secret,
             "totp_enabled": 1 if totp_enabled else 0,
             "is_active": 1,
+            "is_owner": 1 if is_owner else 0,
+            "display_name": display_name or username,
+            "created_by": created_by,
+            "failed_login_count": 0,
+            "last_failed_login_at": "",
+            "locked_until": "",
             "created_at": now,
             "updated_at": now,
             "last_login_at": "",
@@ -335,8 +346,183 @@ class RedisDatabaseManager:
         now = datetime.utcnow().isoformat()
         await self._redis.hset(
             self._key("admin_user", username),
-            mapping={"last_login_at": now, "last_login_ip": client_ip, "updated_at": now},
+            mapping={
+                "last_login_at": now,
+                "last_login_ip": client_ip,
+                "updated_at": now,
+                "failed_login_count": 0,
+                "locked_until": "",
+            },
         )
+
+    async def record_admin_failed_login(self, username: str, lock_seconds: int = 0) -> int:
+        key = self._key("admin_user", username)
+        exists = await self._redis.exists(key)
+        if not exists:
+            return 0
+        now = datetime.utcnow().isoformat()
+        payload = {"last_failed_login_at": now, "updated_at": now}
+        if int(lock_seconds or 0) > 0:
+            payload["locked_until"] = (datetime.utcnow() + timedelta(seconds=int(lock_seconds))).isoformat()
+        await self._redis.hincrby(key, "failed_login_count", 1)
+        await self._redis.hset(key, mapping=payload)
+        return 1
+
+    async def get_user_effective_permissions(self, username: str) -> Dict[str, Set[str]]:
+        user = await self.get_admin_user_by_username(username)
+        if user and int(user.get("is_owner", 0) or 0) == 1:
+            return {"allow": {"*"}, "deny": set()}
+        return {"allow": {"panel.view", "minecraft.view", "admin.query.run"}, "deny": set()}
+
+    async def upsert_user_permission(self, username: str, permission_node: str, effect: int = 1) -> bool:
+        # Redis backend keeps a permissive fallback until full RBAC sync is implemented.
+        return bool(username and permission_node)
+
+    async def assign_role_to_user(self, username: str, role_code: str) -> bool:
+        return bool(username and role_code)
+
+    async def list_admin_users(self, limit: int = 250) -> List[Dict[str, Any]]:
+        members = await self._redis.smembers(self._key("admin_users"))
+        rows: List[Dict[str, Any]] = []
+        for username in sorted(list(members))[: max(1, min(int(limit), 1000))]:
+            user = await self.get_admin_user_by_username(str(username))
+            if user:
+                rows.append(user)
+        return rows
+
+    async def create_invite_token(
+        self,
+        token_hash: str,
+        created_by: str,
+        expires_at: Optional[str],
+        max_uses: int = 1,
+        role_codes: Optional[List[str]] = None,
+        permission_nodes: Optional[List[str]] = None,
+        note: str = "",
+    ) -> int:
+        invite_id = await self._redis.incr(self._key("invite_id_seq"))
+        payload = {
+            "id": invite_id,
+            "token_hash": token_hash,
+            "created_by": created_by or "",
+            "note": note or "",
+            "max_uses": max(1, int(max_uses or 1)),
+            "used_count": 0,
+            "expires_at": expires_at or "",
+            "is_active": 1,
+            "role_codes_json": json.dumps(role_codes or [], ensure_ascii=False),
+            "permission_nodes_json": json.dumps(permission_nodes or [], ensure_ascii=False),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        await self._redis.hset(self._key("invite", str(invite_id)), mapping=payload)
+        await self._redis.zadd(self._key("invites"), {str(invite_id): time.time()})
+        return int(invite_id)
+
+    async def list_invite_tokens(self, limit: int = 100) -> List[Dict[str, Any]]:
+        invite_ids = await self._redis.zrevrange(self._key("invites"), 0, max(0, int(limit) - 1))
+        rows: List[Dict[str, Any]] = []
+        for invite_id in invite_ids:
+            data = await self._redis.hgetall(self._key("invite", str(invite_id)))
+            if data:
+                rows.append(data)
+        return rows
+
+    async def get_active_invite_by_hash(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        token_value = str(token_hash or "").strip()
+        if not token_value:
+            return None
+        invite_ids = await self._redis.zrevrange(self._key("invites"), 0, 999)
+        for invite_id in invite_ids:
+            data = await self._redis.hgetall(self._key("invite", str(invite_id)))
+            if not data:
+                continue
+            if str(data.get("token_hash", "")) != token_value:
+                continue
+            if str(data.get("is_active", "1")) != "1":
+                continue
+            try:
+                used = int(data.get("used_count", 0) or 0)
+                max_uses = int(data.get("max_uses", 1) or 1)
+            except Exception:
+                used = 0
+                max_uses = 1
+            if used >= max_uses:
+                continue
+            return data
+        return None
+
+    async def consume_invite_token(self, invite_id: int) -> bool:
+        key = self._key("invite", str(invite_id))
+        data = await self._redis.hgetall(key)
+        if not data or str(data.get("is_active", "1")) != "1":
+            return False
+        try:
+            used = int(data.get("used_count", 0) or 0) + 1
+            max_uses = int(data.get("max_uses", 1) or 1)
+        except Exception:
+            used = 1
+            max_uses = 1
+        is_active = 0 if used >= max_uses else 1
+        await self._redis.hset(key, mapping={"used_count": used, "is_active": is_active})
+        return True
+
+    async def log_query_event(
+        self,
+        actor_username: Optional[str],
+        endpoint: str,
+        query_payload: Optional[Dict[str, Any]],
+        result_count: int,
+        duration_ms: int,
+        ip_address: Optional[str],
+        user_agent: Optional[str],
+    ) -> int:
+        query_id = await self._redis.incr(self._key("query_log_id_seq"))
+        payload = {
+            "id": query_id,
+            "actor_username": actor_username or "",
+            "endpoint": endpoint,
+            "query_json": json.dumps(query_payload or {}, ensure_ascii=False),
+            "result_count": int(result_count or 0),
+            "duration_ms": int(duration_ms or 0),
+            "ip_address": ip_address or "",
+            "user_agent": user_agent or "",
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        await self._redis.hset(self._key("query_log", str(query_id)), mapping=payload)
+        await self._redis.zadd(self._key("query_logs"), {str(query_id): time.time()})
+        return int(query_id)
+
+    async def get_query_logs(self, limit: int = 200, actor: str = "", endpoint: str = "") -> List[Dict[str, Any]]:
+        query_ids = await self._redis.zrevrange(self._key("query_logs"), 0, max(0, int(limit) - 1))
+        rows: List[Dict[str, Any]] = []
+        actor_l = str(actor or "").lower()
+        endpoint_l = str(endpoint or "").lower()
+        for query_id in query_ids:
+            data = await self._redis.hgetall(self._key("query_log", str(query_id)))
+            if not data:
+                continue
+            if actor_l and str(data.get("actor_username", "")).lower() != actor_l:
+                continue
+            if endpoint_l and endpoint_l not in str(data.get("endpoint", "")).lower():
+                continue
+            rows.append(data)
+        return rows
+
+    async def get_audit_events(self, limit: int = 300, actor: str = "", action: str = "") -> List[Dict[str, Any]]:
+        audit_ids = await self._redis.zrevrange(self._key("audit_log"), 0, max(0, int(limit) - 1))
+        rows: List[Dict[str, Any]] = []
+        actor_l = str(actor or "").lower()
+        action_l = str(action or "").lower()
+        for audit_id in audit_ids:
+            data = await self._redis.hgetall(self._key("audit", str(audit_id)))
+            if not data:
+                continue
+            if actor_l and str(data.get("actor_username", "")).lower() != actor_l:
+                continue
+            if action_l and action_l not in str(data.get("action", "")).lower():
+                continue
+            rows.append(data)
+        return rows
 
     async def log_audit_event(
         self,
