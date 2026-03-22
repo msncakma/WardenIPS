@@ -66,6 +66,7 @@ from wardenips.core.auth import (
   verify_password,
   verify_totp_code,
 )
+from wardenips.core.asn_lookup import ASNLookupEngine
 from wardenips.core.logger import get_logger
 from wardenips.core.geoip_country import CountryLookupEngine
 from wardenips.core.updater import UpdateChecker
@@ -124,6 +125,7 @@ class DashboardAPI:
     self._bootstrap_setup_required: bool = False
     self._bootstrap_token_hash: str = ""
     self._bootstrap_token_expires_at: str = ""
+    self._asn_lookup = ASNLookupEngine(self._config)
     self._country_lookup = CountryLookupEngine(self._config)
     self._initialize_config()
 
@@ -681,6 +683,8 @@ class DashboardAPI:
       logger.info("Dashboard API stopped.")
     if self._country_lookup:
       self._country_lookup.close()
+    if self._asn_lookup:
+      self._asn_lookup.close()
 
   async def _handle_health(self, request: web.Request) -> web.Response:
     uptime = int(time.monotonic() - self._start_time)
@@ -2293,13 +2297,34 @@ class DashboardAPI:
 
     field = str(payload.get("field", "auto") or "auto").strip().lower()
     value = str(payload.get("value", "") or "").strip()
-    limit = min(max(int(payload.get("limit", 200) or 200), 1), 1000)
+    page = max(int(payload.get("page", 1) or 1), 1)
+    page_size = min(max(int(payload.get("page_size", payload.get("limit", 100)) or 100), 1), 500)
+    offset = (page - 1) * page_size
+    record_kind = str(payload.get("record_kind", "event") or "event").strip().lower()
+    connection_type_filter = str(payload.get("connection_type", "") or "").strip().lower()
+    event_type_filter = str(payload.get("event_type", "") or "").strip().lower()
+    country_filter = str(payload.get("country", "") or "").strip().upper()
+    try:
+      min_risk = int(payload.get("min_risk", 0) or 0)
+    except Exception:
+      min_risk = 0
+    try:
+      max_risk = int(payload.get("max_risk", 100) or 100)
+    except Exception:
+      max_risk = 100
+    min_risk = min(max(min_risk, 0), 100)
+    max_risk = min(max(max_risk, 0), 100)
+    if min_risk > max_risk:
+      min_risk, max_risk = max_risk, min_risk
+    refresh_missing_geo = bool(payload.get("refresh_missing_geo", True))
 
     if not value:
       return web.json_response({"error": "invalid_query", "message": "Query value is required."}, status=400)
 
     if field not in {"auto", "ip", "asn", "user"}:
       return web.json_response({"error": "invalid_field", "message": "Field must be one of: auto, ip, asn, user."}, status=400)
+    if record_kind not in {"event", "ban", "all"}:
+      return web.json_response({"error": "invalid_record_kind", "message": "record_kind must be one of: event, ban, all."}, status=400)
 
     if field == "auto":
       try:
@@ -2316,16 +2341,12 @@ class DashboardAPI:
     else:
       resolved_field = field
 
-    event_query = """
-      SELECT timestamp, source_ip, player_name, connection_type,
-             asn_number, asn_org, risk_score, threat_level, details
-      FROM connection_events
-    """
-    event_params: list[object] = []
+    event_where_clauses: list[str] = ["risk_score >= ?", "risk_score <= ?"]
+    event_where_params: list[object] = [min_risk, max_risk]
 
     if resolved_field == "ip":
-      event_query += " WHERE source_ip = ?"
-      event_params.append(value)
+      event_where_clauses.append("source_ip = ?")
+      event_where_params.append(value)
     elif resolved_field == "asn":
       normalized = value.upper().strip()
       asn_number: Optional[int] = None
@@ -2334,25 +2355,128 @@ class DashboardAPI:
       if normalized.isdigit():
         asn_number = int(normalized)
       if asn_number is not None:
-        event_query += " WHERE asn_number = ? OR LOWER(COALESCE(asn_org, '')) LIKE ?"
-        event_params.extend([asn_number, f"%{value.lower()}%"])
+        event_where_clauses.append("(asn_number = ? OR LOWER(COALESCE(asn_org, '')) LIKE ?)")
+        event_where_params.extend([asn_number, f"%{value.lower()}%"])
       else:
-        event_query += " WHERE LOWER(COALESCE(asn_org, '')) LIKE ?"
-        event_params.append(f"%{value.lower()}%")
+        event_where_clauses.append("LOWER(COALESCE(asn_org, '')) LIKE ?")
+        event_where_params.append(f"%{value.lower()}%")
     else:
-      event_query += " WHERE LOWER(COALESCE(player_name, '')) LIKE ?"
-      event_params.append(f"%{value.lower()}%")
+      event_where_clauses.append("LOWER(COALESCE(player_name, '')) LIKE ?")
+      event_where_params.append(f"%{value.lower()}%")
 
-    event_query += " ORDER BY timestamp DESC LIMIT ?"
-    event_params.append(limit)
+    if connection_type_filter:
+      event_where_clauses.append("LOWER(COALESCE(connection_type, '')) = ?")
+      event_where_params.append(connection_type_filter)
+    if event_type_filter:
+      event_where_clauses.append("LOWER(COALESCE(details, '')) LIKE ?")
+      event_where_params.append(f'%"event_type": "{event_type_filter}%')
+    if country_filter and len(country_filter) == 2 and country_filter.isalpha():
+      event_where_clauses.append("(UPPER(COALESCE(details, '')) LIKE ? OR UPPER(COALESCE(details, '')) LIKE ?)")
+      event_where_params.append(f'%"COUNTRY_CODE":"{country_filter}"%')
+      event_where_params.append(f'%"COUNTRY_CODE": "{country_filter}"%')
+
+    event_where_sql = " AND ".join(event_where_clauses) if event_where_clauses else "1=1"
+
+    event_count_query = f"""
+      SELECT COUNT(*)
+      FROM connection_events
+      WHERE {event_where_sql}
+    """
+
+    event_data_query = f"""
+      SELECT id, timestamp, source_ip, player_name, connection_type,
+             asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details
+      FROM connection_events
+      WHERE {event_where_sql}
+      ORDER BY timestamp DESC
+      LIMIT ? OFFSET ?
+    """
 
     records: list[dict[str, object]] = []
+    total_count = 0
+    event_rows_raw: list[dict[str, object]] = []
 
-    async with self._db._lock:
-      async with self._db._db.execute(event_query, event_params) as cursor:
-        rows = await cursor.fetchall()
-      for timestamp, source_ip, player_name, connection_type, asn_number, asn_org, risk_score, threat_level, details_value in rows:
+    if record_kind in {"event", "all"}:
+      async with self._db._lock:
+        async with self._db._db.execute(event_count_query, tuple(event_where_params)) as count_cursor:
+          count_row = await count_cursor.fetchone()
+          total_count = int((count_row[0] or 0) if count_row else 0)
+        async with self._db._db.execute(
+          event_data_query,
+          tuple([*event_where_params, page_size, offset]),
+        ) as cursor:
+          rows = await cursor.fetchall()
+          columns = [d[0] for d in cursor.description]
+          event_rows_raw = [dict(zip(columns, row)) for row in rows]
+
+      if refresh_missing_geo and event_rows_raw:
+        update_payload: list[tuple[object, object, object, object, int]] = []
+        for row in event_rows_raw:
+          row_id = int(row.get("id") or 0)
+          source_ip = str(row.get("source_ip") or "").strip()
+          if row_id <= 0:
+            continue
+
+          details_value = row.get("details")
+          details_obj: dict = {}
+          if isinstance(details_value, str) and details_value:
+            try:
+              parsed = json.loads(details_value)
+              if isinstance(parsed, dict):
+                details_obj = parsed
+            except Exception:
+              details_obj = {}
+          elif isinstance(details_value, dict):
+            details_obj = dict(details_value)
+
+          changed = False
+          asn_number = row.get("asn_number")
+          asn_org = row.get("asn_org")
+          is_suspicious = bool(row.get("is_suspicious_asn"))
+
+          if (asn_number is None and not str(asn_org or "").strip()) and self._is_valid_ip(source_ip) and self._asn_lookup:
+            asn_result = self._asn_lookup.lookup(source_ip)
+            if asn_result.asn_number is not None or str(asn_result.asn_org or "").strip():
+              asn_number = asn_result.asn_number
+              asn_org = asn_result.asn_org
+              is_suspicious = bool(asn_result.is_suspicious)
+              changed = True
+
+          country_code = self._resolve_country_code(details_obj, source_ip)
+          if country_code and str(details_obj.get("country_code") or "").strip().upper() != country_code:
+            details_obj["country_code"] = country_code
+            changed = True
+
+          if changed:
+            row["asn_number"] = asn_number
+            row["asn_org"] = asn_org
+            row["is_suspicious_asn"] = is_suspicious
+            row["details"] = details_obj
+            update_payload.append(
+              (
+                asn_number,
+                str(asn_org or ""),
+                1 if is_suspicious else 0,
+                json.dumps(details_obj, ensure_ascii=False),
+                row_id,
+              )
+            )
+
+        if update_payload:
+          async with self._db._lock:
+            await self._db._db.executemany(
+              """
+              UPDATE connection_events
+              SET asn_number = ?, asn_org = ?, is_suspicious_asn = ?, details = ?
+              WHERE id = ?
+              """,
+              update_payload,
+            )
+            await self._db._db.commit()
+
+      for row in event_rows_raw:
         details_obj = {}
+        details_value = row.get("details")
         if isinstance(details_value, str) and details_value:
           try:
             details_obj = json.loads(details_value)
@@ -2363,58 +2487,125 @@ class DashboardAPI:
         records.append(
           {
             "kind": "event",
-            "timestamp": timestamp,
-            "source_ip": source_ip,
-            "player_name": player_name,
-            "connection_type": connection_type,
+            "id": row.get("id"),
+            "timestamp": row.get("timestamp"),
+            "source_ip": row.get("source_ip"),
+            "player_name": row.get("player_name"),
+            "connection_type": row.get("connection_type"),
             "event_type": str(details_obj.get("event_type") or ""),
-            "event_port": self._extract_event_port({"player_name": player_name}, details_obj),
-            "country_code": self._resolve_country_code(details_obj, source_ip),
-            "asn_number": asn_number,
-            "asn_org": asn_org,
-            "risk_score": risk_score,
-            "threat_level": threat_level,
+            "event_port": self._extract_event_port({"player_name": row.get("player_name")}, details_obj),
+            "country_code": self._resolve_country_code(details_obj, row.get("source_ip")),
+            "asn_number": row.get("asn_number"),
+            "asn_org": row.get("asn_org"),
+            "is_suspicious_asn": bool(row.get("is_suspicious_asn")),
+            "risk_score": row.get("risk_score"),
+            "threat_level": row.get("threat_level"),
           }
         )
 
-      if resolved_field == "ip":
+    if resolved_field == "ip" and record_kind in {"ban", "all"}:
+      async with self._db._lock:
         async with self._db._db.execute(
           """
-          SELECT banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
+          SELECT COUNT(*)
           FROM ban_history
           WHERE source_ip = ?
-          ORDER BY banned_at DESC
-          LIMIT ?
+            AND risk_score >= ?
+            AND risk_score <= ?
           """,
-          (value, limit),
-        ) as cursor:
-          ban_rows = await cursor.fetchall()
-        for banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active in ban_rows:
-          records.append(
+          (value, min_risk, max_risk),
+        ) as bcount_cursor:
+          bcount_row = await bcount_cursor.fetchone()
+          ban_total_count = int((bcount_row[0] or 0) if bcount_row else 0)
+
+        # record_kind=ban uses pure SQL paging; record_kind=all merges after fetch for stable UX.
+        if record_kind == "ban":
+          async with self._db._db.execute(
+            """
+            SELECT id, banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
+            FROM ban_history
+            WHERE source_ip = ?
+              AND risk_score >= ?
+              AND risk_score <= ?
+            ORDER BY banned_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (value, min_risk, max_risk, page_size, offset),
+          ) as cursor:
+            ban_rows = await cursor.fetchall()
+          records = [
             {
               "kind": "ban",
-              "timestamp": banned_at,
-              "source_ip": source_ip,
-              "reason": reason,
-              "risk_score": risk_score,
-              "ban_duration": ban_duration,
-              "expires_at": expires_at,
-              "is_active": bool(is_active),
+              "id": row[0],
+              "timestamp": row[1],
+              "source_ip": row[2],
+              "reason": row[3],
+              "risk_score": row[4],
+              "ban_duration": row[5],
+              "expires_at": row[6],
+              "is_active": bool(row[7]),
             }
+            for row in ban_rows
+          ]
+          total_count = ban_total_count
+        else:
+          # Merge recent events and bans for the same IP, then paginate.
+          fetch_cap = min(max(page_size * page * 4, page_size * 4), 5000)
+          async with self._db._lock:
+            async with self._db._db.execute(
+              """
+              SELECT id, banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
+              FROM ban_history
+              WHERE source_ip = ?
+                AND risk_score >= ?
+                AND risk_score <= ?
+              ORDER BY banned_at DESC
+              LIMIT ?
+              """,
+              (value, min_risk, max_risk, fetch_cap),
+            ) as cursor:
+              ban_rows = await cursor.fetchall()
+          ban_records = [
+            {
+              "kind": "ban",
+              "id": row[0],
+              "timestamp": row[1],
+              "source_ip": row[2],
+              "reason": row[3],
+              "risk_score": row[4],
+              "ban_duration": row[5],
+              "expires_at": row[6],
+              "is_active": bool(row[7]),
+            }
+            for row in ban_rows
+          ]
+          merged = [*records, *ban_records]
+          merged.sort(
+            key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
+            reverse=True,
           )
+          total_count = int(total_count) + int(ban_total_count)
+          records = merged[offset : offset + page_size]
 
-    records.sort(
-      key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
-      reverse=True,
-    )
-    if len(records) > limit:
-      records = records[:limit]
+    if record_kind == "event":
+      records.sort(
+        key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
+        reverse=True,
+      )
 
     await self._log_audit(
       request,
       "admin.query_records",
       actor_username=actor,
-      details={"field": resolved_field, "value": value, "count": len(records), "limit": limit},
+      details={
+        "field": resolved_field,
+        "value": value,
+        "record_kind": record_kind,
+        "count": len(records),
+        "page": page,
+        "page_size": page_size,
+        "total": total_count,
+      },
     )
 
     return web.json_response(
@@ -2422,6 +2613,12 @@ class DashboardAPI:
         "ok": True,
         "field": resolved_field,
         "value": value,
+        "record_kind": record_kind,
+        "page": page,
+        "page_size": page_size,
+        "offset": offset,
+        "total": total_count,
+        "has_more": bool(offset + len(records) < int(total_count or 0)),
         "count": len(records),
         "records": records,
       }
@@ -5726,7 +5923,7 @@ th,td{border-bottom:1px solid #24314f;padding:8px;text-align:left;font-size:.92r
         <p class="sub">Search common AuthMe log locations.</p>
         <button class="primary" id="detectBtn">Scan Common Paths</button>
         <table>
-          <thead><tr><th>Path</th><th>Size</th><th>Updated</th><th>Select</th></tr></thead>
+          <thead><tr><th>Path</th><th>Size (bytes)</th><th>Last Modified</th><th>Action</th></tr></thead>
           <tbody id="logRows"><tr><td colspan="4" class="sub">No scan yet.</td></tr></tbody>
         </table>
       </section>
@@ -7286,12 +7483,44 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
                 <option value="asn">ASN</option>
                 <option value="user">Username</option>
               </select>
+              <select id="queryRecordKind" class="ctrl">
+                <option value="event" selected>Events</option>
+                <option value="ban">Bans</option>
+                <option value="all">All</option>
+              </select>
               <input id="queryValue" class="ctrl search" placeholder="Example: 203.0.113.4, AS15169, notch">
               <button id="queryRunBtn" class="btn ghost">Run Query</button>
             </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <select id="queryConnectionType" class="ctrl">
+                <option value="">All Sources</option>
+                <option value="ssh">ssh</option>
+                <option value="minecraft">minecraft</option>
+                <option value="authme">authme</option>
+                <option value="nginx">nginx</option>
+                <option value="portscan">portscan</option>
+              </select>
+              <input id="queryEventType" class="ctrl search" placeholder="event_type filter (login, ip_disconnect...)">
+              <input id="queryCountry" class="ctrl search" placeholder="country (TR, US)">
+              <select id="queryPageSize" class="ctrl">
+                <option value="25">25 rows</option>
+                <option value="50" selected>50 rows</option>
+                <option value="100">100 rows</option>
+                <option value="200">200 rows</option>
+              </select>
+            </div>
+            <div class="toolbar-grid query-grid" style="margin-top:8px">
+              <input id="queryMinRisk" class="ctrl search" placeholder="min risk (0-100)">
+              <input id="queryMaxRisk" class="ctrl search" placeholder="max risk (0-100)">
+              <div class="sub" id="queryPageInfo" style="align-self:center">Page 1 / 1</div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button id="queryPrevBtn" class="btn ghost">Previous</button>
+                <button id="queryNextBtn" class="btn ghost">Next</button>
+              </div>
+            </div>
             <div class="table-wrap" style="max-height:240px">
               <table>
-                <thead><tr><th>Type</th><th>Time</th><th>IP</th><th>Details</th><th>Risk</th></tr></thead>
+                <thead><tr><th>Type</th><th>Time</th><th>IP</th><th>Details</th><th>Country</th><th>ASN</th><th>Risk</th></tr></thead>
                 <tbody id="queryRows"></tbody>
               </table>
             </div>
@@ -8195,7 +8424,7 @@ function renderFirewall(){
 function renderQueryResults(rows){
   var target=$('#queryRows');
   if(!rows||!rows.length){
-    target.innerHTML='<tr><td colspan="5" class="empty">No records found for this query.</td></tr>';
+    target.innerHTML='<tr><td colspan="7" class="empty">No records found for this query.</td></tr>';
     return;
   }
   target.innerHTML=rows.map(function(r){
@@ -8203,16 +8432,38 @@ function renderQueryResults(rows){
     var ts=ago(r.timestamp);
     var ip=E(r.source_ip||'-');
     var details='-';
+    var country='-';
+    var asn='-';
     if(r.kind==='ban'){
       details=E((r.reason||'-')+' · '+(r.ban_duration&&r.ban_duration>0?(''+r.ban_duration+'s'):'Permanent')+' · '+(r.is_active?'Active':'Inactive'));
     }else{
       var port=detectPortFromEvent(r);
       var bits=[r.connection_type||'-', r.event_type||'', port?('port '+port):'', r.player_name||'', r.asn_org||''];
       details=E(bits.filter(function(v){ return !!v; }).join(' · ')||'-');
+      country=E(String(r.country_code||'-').toUpperCase()||'-');
+      var asnNum=String(r.asn_number||'').trim();
+      var asnOrg=String(r.asn_org||'').trim();
+      asn=E(asnNum?('AS'+asnNum): (asnOrg||'-'));
+      if(asnNum&&asnOrg){ asn = E('AS'+asnNum+' · '+asnOrg); }
     }
-    return '<tr><td>'+E(kind)+'</td><td>'+E(ts)+'</td><td class="mono">'+ip+'</td><td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+details+'">'+details+'</td><td>'+E(String(r.risk_score||0))+'</td></tr>';
+    return '<tr><td>'+E(kind)+'</td><td>'+E(ts)+'</td><td class="mono">'+ip+'</td><td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+details+'">'+details+'</td><td>'+country+'</td><td>'+asn+'</td><td>'+E(String(r.risk_score||0))+'</td></tr>';
   }).join('');
 }
+
+function updateQueryPageInfo(payload){
+  var page=Number(payload&&payload.page||1);
+  var pageSize=Number(payload&&payload.page_size||50);
+  var total=Number(payload&&payload.total||0);
+  var maxPage=Math.max(Math.ceil(total/Math.max(pageSize,1)),1);
+  $('#queryPageInfo').textContent='Page '+String(page)+' / '+String(maxPage)+' · '+N(total)+' total';
+  $('#queryPrevBtn').disabled = page <= 1;
+  $('#queryNextBtn').disabled = page >= maxPage;
+}
+
+function resetQueryPaging(){
+  window.adminQueryPage = 1;
+}
+
 async function runRecordQuery(){
   var value=$('#queryValue').value.trim();
   if(!value){
@@ -8220,10 +8471,38 @@ async function runRecordQuery(){
     return;
   }
   var field=$('#queryField').value||'auto';
-  var payload=await api('/api/admin/query-records', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({field:field, value:value, limit:300})});
+  var recordKind=$('#queryRecordKind').value||'event';
+  var connectionType=$('#queryConnectionType').value||'';
+  var eventType=$('#queryEventType').value.trim().toLowerCase();
+  var country=$('#queryCountry').value.trim().toUpperCase();
+  var pageSize=parseInt($('#queryPageSize').value||'50',10);
+  if(!Number.isFinite(pageSize)||pageSize<=0){ pageSize=50; }
+  var minRisk=parseInt($('#queryMinRisk').value||'0',10);
+  if(!Number.isFinite(minRisk)){ minRisk=0; }
+  var maxRisk=parseInt($('#queryMaxRisk').value||'100',10);
+  if(!Number.isFinite(maxRisk)){ maxRisk=100; }
+  window.adminQueryPage = Math.max(parseInt(window.adminQueryPage||1,10)||1,1);
+  var payload=await api('/api/admin/query-records', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      field:field,
+      value:value,
+      record_kind:recordKind,
+      connection_type:connectionType,
+      event_type:eventType,
+      country:country,
+      min_risk:minRisk,
+      max_risk:maxRisk,
+      page:window.adminQueryPage,
+      page_size:pageSize,
+      refresh_missing_geo:true
+    })
+  });
   if(!payload){ return; }
   renderQueryResults(payload.records||[]);
-  setStatus('ok','Query complete', 'Found '+N(payload.count||0)+' record(s) for '+(payload.field||field).toUpperCase()+'.');
+  updateQueryPageInfo(payload);
+  setStatus('ok','Query complete', 'Showing '+N(payload.count||0)+' record(s), total '+N(payload.total||0)+' for '+(payload.field||field).toUpperCase()+'.');
 }
 function parseBulkCategories(raw){
   var seen={};
@@ -8508,8 +8787,26 @@ function bind(){
   $('#topPortsToggleBtn').addEventListener('click', function(){ state.topPortsExpanded=!state.topPortsExpanded; renderTopPortscannedPorts(); });
     $('#adminAtTimeRange').addEventListener('change', function(){ handleUserActivity(); refresh(); });
   $('#adminIncludeHoneypot').addEventListener('change', function(){ handleUserActivity(); refresh(); });
-  $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); await runRecordQuery(); });
-  $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); await runRecordQuery(); } });
+  $('#queryRunBtn').addEventListener('click', async function(){ handleUserActivity(); resetQueryPaging(); await runRecordQuery(); });
+  $('#queryValue').addEventListener('keydown', async function(ev){ if(ev.key==='Enter'){ ev.preventDefault(); handleUserActivity(); resetQueryPaging(); await runRecordQuery(); } });
+  $('#queryPrevBtn').addEventListener('click', async function(){
+    if(parseInt(window.adminQueryPage||1,10)<=1){ return; }
+    handleUserActivity();
+    window.adminQueryPage = Math.max(parseInt(window.adminQueryPage||1,10)-1,1);
+    await runRecordQuery();
+  });
+  $('#queryNextBtn').addEventListener('click', async function(){
+    handleUserActivity();
+    window.adminQueryPage = Math.max(parseInt(window.adminQueryPage||1,10)+1,1);
+    await runRecordQuery();
+  });
+  ['queryField','queryRecordKind','queryConnectionType','queryEventType','queryCountry','queryPageSize','queryMinRisk','queryMaxRisk'].forEach(function(id){
+    $('#'+id).addEventListener('change', async function(){
+      handleUserActivity();
+      resetQueryPaging();
+      await runRecordQuery();
+    });
+  });
   $('#bulkActionBtn').addEventListener('click', async function(){ handleUserActivity(); await runBulkIpAction(); });
   $('#saveAdminTotpBtn').addEventListener('click', async function(){
     handleUserActivity();

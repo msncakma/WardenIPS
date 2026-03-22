@@ -1,3 +1,13 @@
+wardenips (0.4.0~beta23-1) stable; urgency=medium
+
+  * Rework admin record query with pagination and advanced filters
+  * Recalculate missing ASN/country during query and persist enrichment to DB
+  * Improve admin query UX with page navigation and filter-triggered refresh
+  * Fix setup wizard Step 1 table structure after query panel updates
+  * Bump version to 0.4.0-beta-23
+
+ -- msncakma <wardenips@msncakma.dev>  Sun, 22 Mar 2026 02:00:00 +03:00
+
 wardenips (0.4.0~beta22-1) stable; urgency=medium
 
   * Add lightweight ASN backfill loop for manually inserted events with missing ASN fields
