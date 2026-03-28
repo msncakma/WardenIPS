@@ -1314,6 +1314,79 @@ class DatabaseManager:
 
         return stats
 
+    async def get_active_bans(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get list of active bans from database.
+        
+        Args:
+            limit: Maximum number of bans to return
+            
+        Returns:
+            List of active ban records
+        """
+        try:
+            async with self._db.execute(
+                "SELECT id, source_ip, reason, banned_at, ban_duration_seconds, is_active "
+                "FROM ban_history WHERE is_active = 1 ORDER BY banned_at DESC LIMIT ?",
+                (min(limit, 1000),)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        "id": row[0],
+                        "source_ip": row[1],
+                        "reason": row[2],
+                        "banned_at": row[3],
+                        "duration_seconds": row[4],
+                        "is_active": row[5],
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error("Failed to get active bans: %s", e)
+            return []
+
+    async def record_unban(self, ip: str) -> bool:
+        """Record an IP unban operation.
+        
+        Args:
+            ip: IP address being unbanned
+            
+        Returns:
+            True if successful
+        """
+        try:
+            async with self._lock:
+                async with self._db.execute(
+                    "UPDATE ban_history SET is_active = 0 WHERE source_ip = ? AND is_active = 1",
+                    (ip,)
+                ) as cursor:
+                    await self._db.commit()
+                    return cursor.rowcount > 0 if cursor.rowcount else False
+        except Exception as e:
+            logger.error("Failed to record unban for IP %s: %s", ip, e)
+            return False
+
+    async def optimize(self) -> bool:
+        """Optimize database (VACUUM + ANALYZE).
+        
+        Returns:
+            True if successful
+        """
+        try:
+            async with self._lock:
+                # Run VACUUM to reclaim space
+                async with self._db.execute("VACUUM"):
+                    pass
+                # Run ANALYZE to update statistics
+                async with self._db.execute("ANALYZE"):
+                    pass
+                await self._db.commit()
+                logger.info("Database optimized successfully")
+                return True
+        except Exception as e:
+            logger.error("Failed to optimize database: %s", e)
+            return False
+
     # ── Admin Maintenance ──
 
     async def clear_events(self) -> int:

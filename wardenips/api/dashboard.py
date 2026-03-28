@@ -49,6 +49,13 @@ from urllib.parse import quote, urlencode
 
 from aiohttp import web
 import yaml
+from wardenips.api.legacy import admin_bulk_handlers
+from wardenips.api.legacy import admin_config_handlers
+from wardenips.api.legacy import admin_identity_handlers
+from wardenips.api.legacy import admin_security_handlers
+from wardenips.api.legacy import auth_handlers
+from wardenips.api.legacy import public_metrics_handlers
+from wardenips.api.legacy import setup_handlers
 
 try:
   import pymysql  # type: ignore
@@ -100,6 +107,16 @@ class DashboardAPI:
     self._notifier = notifier
     self._blocklist = blocklist
     self._abuse_reporter = abuse_reporter
+    
+    # Service layer instances (initialized in start())
+    self._ban_service = None
+    self._auth_service = None
+    self._whitelist_service = None
+    self._config_service = None
+    self._firewall_service = None
+    self._permission_service = None
+    self._audit_service = None
+    
     self._enabled: bool = False
     self._host: str = "127.0.0.1"
     self._port: int = 7680
@@ -561,11 +578,29 @@ class DashboardAPI:
     return hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
 
   def _render_ui_template(self, html: str) -> str:
+    html = self._inject_dashboard_assets(html)
     return (
       html
       .replace("__APP_VERSION__", __version__)
       .replace("__APP_AUTHOR__", __author__)
     )
+
+  @staticmethod
+  def _inject_dashboard_assets(html: str) -> str:
+    head_assets = (
+      '<link rel="stylesheet" href="/api/assets/modern-theme.css">\n'
+      '<link rel="stylesheet" href="/api/assets/responsive.css">'
+    )
+    body_assets = (
+      '<script src="/api/assets/realtime.js"></script>\n'
+      '<script src="/api/assets/components.js"></script>'
+    )
+
+    if '/api/assets/modern-theme.css' not in html and '</head>' in html:
+      html = html.replace('</head>', f'{head_assets}\n</head>', 1)
+    if '/api/assets/realtime.js' not in html and '</body>' in html:
+      html = html.replace('</body>', f'{body_assets}\n</body>', 1)
+    return html
 
   def _format_duration(self, total_seconds: Optional[int]) -> str:
     if total_seconds is None or total_seconds < 0:
@@ -708,11 +743,7 @@ class DashboardAPI:
     except Exception as exc:
       logger.debug("Audit logging failed for %s: %s", action, exc)
 
-  async def start(self) -> None:
-    if not self.enabled:
-      return
-
-    self._app = web.Application()
+  def _register_page_routes(self) -> None:
     self._app.router.add_get("/", self._handle_root)
     self._app.router.add_get("/portal", self._handle_portal)
     self._app.router.add_get("/dashboard", self._handle_dashboard)
@@ -721,6 +752,9 @@ class DashboardAPI:
     self._app.router.add_get("/v2", self._handle_dashboard_v2)
     self._app.router.add_get("/login", self._handle_login_page)
     self._app.router.add_get("/setup", self._handle_setup_page)
+    self._app.router.add_get("/logout", self._handle_logout)
+
+  def _register_auth_routes(self) -> None:
     self._app.router.add_post("/api/login", self._handle_login)
     self._app.router.add_post("/api/login/totp", self._handle_login_totp)
     self._app.router.add_post("/api/setup/begin", self._handle_setup_begin)
@@ -728,10 +762,13 @@ class DashboardAPI:
     self._app.router.add_post("/api/invite/register", self._handle_invite_register)
     self._app.router.add_post("/api/logout", self._handle_logout)
     self._app.router.add_post("/api/session/activity", self._handle_session_activity)
-    self._app.router.add_get("/logout", self._handle_logout)
+
+  def _register_public_api_routes(self) -> None:
     self._app.router.add_get("/api/health", self._handle_health)
     self._app.router.add_get("/api/stats", self._handle_stats)
     self._app.router.add_get("/api/bans", self._handle_bans)
+    self._app.router.add_get("/api/ws", self._handle_websocket)
+    self._app.router.add_get("/api/assets/{filename}", self._handle_asset_file)
     self._app.router.add_get("/api/firewall-bans", self._handle_firewall_bans)
     self._app.router.add_get("/api/events", self._handle_events)
     self._app.router.add_get("/api/firewall", self._handle_firewall)
@@ -742,6 +779,9 @@ class DashboardAPI:
     self._app.router.add_get("/api/geo-heatmap", self._handle_geo_heatmap)
     self._app.router.add_get("/api/threat-distribution", self._handle_threat_distribution)
     self._app.router.add_get("/api/plugin-stats", self._handle_plugin_stats)
+    self._app.router.add_get("/api/blocklist", self._handle_blocklist)
+
+  def _register_minecraft_routes(self) -> None:
     self._app.router.add_get("/api/minecraft/summary", self._handle_minecraft_summary)
     self._app.router.add_get("/api/minecraft/events", self._handle_minecraft_events)
     self._app.router.add_get("/api/minecraft/filter-options", self._handle_minecraft_filter_options)
@@ -758,7 +798,8 @@ class DashboardAPI:
     self._app.router.add_post("/api/admin/minecraft/ban-email", self._handle_admin_minecraft_ban_email)
     self._app.router.add_post("/api/admin/minecraft/ban-asn", self._handle_admin_minecraft_ban_asn)
     self._app.router.add_post("/api/admin/minecraft/whitelist-player", self._handle_admin_minecraft_whitelist_player)
-    self._app.router.add_get("/api/blocklist", self._handle_blocklist)
+
+  def _register_admin_routes(self) -> None:
     self._app.router.add_post("/api/admin/ban-ip", self._handle_admin_ban_ip)
     self._app.router.add_post("/api/admin/report-and-ban", self._handle_admin_report_and_ban)
     self._app.router.add_post("/api/admin/bulk-ip-action", self._handle_admin_bulk_ip_action)
@@ -792,6 +833,81 @@ class DashboardAPI:
     self._app.router.add_get("/api/admin/portal-links", self._handle_admin_get_portal_links)
     self._app.router.add_post("/api/admin/portal-links", self._handle_admin_set_portal_links)
 
+  def _publish_modular_dependencies(self) -> None:
+    """Publish shared dependencies into app state for modular route handlers."""
+    from wardenips.api.services import (
+      AuditService,
+      AuthService,
+      BanService,
+      ConfigService,
+      FirewallService,
+      PermissionService,
+      WhitelistService,
+    )
+
+    self._app["db"] = self._db
+    self._app["firewall"] = self._firewall
+    self._app["config"] = self._config
+
+    # Instantiate and store services both in app and on api instance
+    self._ban_service = BanService(self._db, self._firewall, self._whitelist)
+    self._auth_service = AuthService(self._db)
+    self._whitelist_service = WhitelistService(self._db, self._whitelist)
+    self._config_service = ConfigService(self._config, hot_reload_manager=None)
+    self._firewall_service = FirewallService(self._firewall)
+    self._permission_service = PermissionService(self._db)
+    self._audit_service = AuditService(self._db)
+
+    self._app["ban_service"] = self._ban_service
+    self._app["auth_service"] = self._auth_service
+    self._app["whitelist_service"] = self._whitelist_service
+    self._app["config_service"] = self._config_service
+    self._app["firewall_service"] = self._firewall_service
+    self._app["permission_service"] = self._permission_service
+    self._app["audit_service"] = self._audit_service
+
+    plugin_manager = getattr(self, "_plugin_manager", None)
+    if plugin_manager is not None:
+      self._app["plugins"] = plugin_manager
+
+  async def _register_modular_v2_routes(self) -> None:
+    """Register modular route handlers under /api/v2 for safe migration."""
+    from wardenips.api.routes import setup_all_routes
+
+    # Build dependencies dict for modular routes
+    dependencies = {
+        "db": self._db,
+        "firewall": self._firewall,
+        "config": self._config,
+        "whitelist": self._whitelist,
+        "notifier": self._notifier,
+        "blocklist": self._blocklist,
+        "abuse_reporter": self._abuse_reporter,
+        "ban_service": self._app.get("ban_service"),
+        "auth_service": self._app.get("auth_service"),
+        "whitelist_service": self._app.get("whitelist_service"),
+        "config_service": self._app.get("config_service"),
+        "firewall_service": self._app.get("firewall_service"),
+        "permission_service": self._app.get("permission_service"),
+        "audit_service": self._app.get("audit_service"),
+    }
+
+    # Register all modular routes via centralized setup function
+    await setup_all_routes(self._app, dependencies)
+
+  async def start(self) -> None:
+    if not self.enabled:
+      return
+
+    self._app = web.Application()
+    self._publish_modular_dependencies()
+    await self._register_modular_v2_routes()
+    self._register_page_routes()
+    self._register_auth_routes()
+    self._register_public_api_routes()
+    self._register_minecraft_routes()
+    self._register_admin_routes()
+
     self._runner = web.AppRunner(self._app, access_log=None)
     await self._runner.setup()
     site = web.TCPSite(self._runner, self._host, self._port)
@@ -819,6 +935,89 @@ class DashboardAPI:
         "system_uptime_seconds": system_uptime_seconds,
       }
     )
+
+  async def _handle_asset_file(self, request: web.Request) -> web.StreamResponse:
+    filename = str(request.match_info.get("filename", "")).strip()
+    if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+      raise web.HTTPNotFound()
+
+    asset_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets"))
+    asset_path = os.path.abspath(os.path.join(asset_dir, filename))
+    if not asset_path.startswith(asset_dir + os.sep):
+      raise web.HTTPNotFound()
+    if not os.path.isfile(asset_path):
+      raise web.HTTPNotFound()
+
+    response = web.FileResponse(asset_path)
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return response
+
+  async def _handle_websocket(self, request: web.Request) -> web.StreamResponse:
+    if not self._check_public_dashboard_access(request):
+      return self._json_auth_error()
+
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
+    async def send_snapshot() -> None:
+      uptime = int(time.monotonic() - self._start_time)
+      system_uptime_seconds = self._get_system_uptime_seconds()
+      await ws.send_json(
+        {
+          "type": "health:update",
+          "payload": {
+            "status": "ok",
+            "uptime": self._format_duration(uptime),
+            "uptime_seconds": uptime,
+            "system_uptime": self._format_duration(system_uptime_seconds),
+            "system_uptime_seconds": system_uptime_seconds,
+          },
+        }
+      )
+
+      stats = await self._db.get_stats()
+      stats["firewall_active_bans"] = await self._firewall.get_banned_count()
+      stats["simulation_mode"] = self._firewall.simulation_mode
+      await ws.send_json({"type": "stats:updated", "payload": stats})
+
+      await ws.send_json(
+        {
+          "type": "firewall:updated",
+          "payload": {
+            "active_bans": int(stats.get("firewall_active_bans", 0) or 0),
+            "simulation_mode": bool(stats.get("simulation_mode", False)),
+          },
+        }
+      )
+
+    await send_snapshot()
+
+    while not ws.closed:
+      try:
+        msg = await ws.receive(timeout=5)
+      except asyncio.TimeoutError:
+        await send_snapshot()
+        continue
+
+      if msg.type == web.WSMsgType.TEXT:
+        raw_data = str(msg.data or "").strip()
+        try:
+          payload = json.loads(raw_data) if raw_data else {}
+        except Exception:
+          await ws.send_json({"type": "error", "payload": {"message": "invalid_json"}})
+          continue
+
+        message_type = str(payload.get("type", "")).strip().lower()
+        if message_type in {"ping", "health:get", "stats:get", "firewall:get", "snapshot"}:
+          await send_snapshot()
+        else:
+          await ws.send_json({"type": "ack", "payload": {"accepted": True}})
+      elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+        break
+      elif msg.type == web.WSMsgType.ERROR:
+        break
+
+    return ws
 
   async def _handle_stats(self, request: web.Request) -> web.Response:
     if not self._check_public_dashboard_access(request):
@@ -1014,52 +1213,13 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_firewall(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    count = await self._firewall.get_banned_count()
-    return web.json_response(
-      {
-        "simulation_mode": self._firewall.simulation_mode,
-        "active_bans": count,
-        "firewall": repr(self._firewall),
-      }
-    )
+    return await public_metrics_handlers.handle_firewall(self, request)
 
   async def _handle_firewall_bans(self, request: web.Request) -> web.Response:
-    if not self._check_auth(request):
-      return self._json_auth_error()
-    limit = min(int(request.query.get("limit", "500")), 2000)
-    try:
-      items = await self._firewall.list_banned_ips(limit=limit)
-      return web.json_response({"items": items, "count": len(items)})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_firewall_bans(self, request)
 
   async def _handle_top_attackers(self, request: web.Request) -> web.Response:
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    limit = min(int(request.query.get("limit", "10")), 50)
-    try:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          """
-          SELECT source_ip,
-               COUNT(*) as ban_count,
-               MAX(risk_score) as max_risk,
-               MAX(banned_at) as last_ban
-          FROM ban_history
-          GROUP BY source_ip
-          ORDER BY ban_count DESC
-          LIMIT ?
-          """,
-          (limit,),
-        ) as cursor:
-          rows = await cursor.fetchall()
-          columns = [d[0] for d in cursor.description]
-          attackers = [dict(zip(columns, row)) for row in rows]
-      return web.json_response({"attackers": attackers})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_top_attackers(self, request)
 
   async def _handle_top_portscanned_ports(self, request: web.Request) -> web.Response:
     if not self._check_public_dashboard_access(request):
@@ -1119,181 +1279,20 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_events_timeline(self, request: web.Request) -> web.Response:
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    hours = min(int(request.query.get("hours", "24")), 168)
-    try:
-      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
-      async with self._db._lock:
-        async with self._db._db.execute(
-          f"""
-          SELECT strftime('%Y-%m-%d %H:00', timestamp) as hour,
-               COUNT(*) as count
-          FROM connection_events
-          WHERE {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')
-          GROUP BY hour
-          ORDER BY hour ASC
-          """,
-          (f"-{hours}",),
-        ) as cursor:
-          rows = await cursor.fetchall()
-          timeline = [{"hour": r[0], "count": r[1]} for r in rows]
-      return web.json_response({"timeline": timeline})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_events_timeline(self, request)
 
   async def _handle_asn_stats(self, request: web.Request) -> web.Response:
     """Top countries (if present in event details) and ASN organizations."""
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    hours = max(int(request.query.get("hours", "0")), 0)
-    try:
-      timestamp_expr = "COALESCE(strftime('%s', timestamp), CASE WHEN timestamp GLOB '[0-9]*' THEN CAST(timestamp AS INTEGER) ELSE 0 END)"
-      time_clause = f"AND {timestamp_expr} >= strftime('%s', 'now', ? || ' hours')" if hours > 0 else ""
-      time_params: list = [f"-{hours}"] if hours > 0 else []
-      async with self._db._lock:
-        async with self._db._db.execute(
-          f"""
-          SELECT COALESCE(asn_org, 'Unknown') as org,
-               COUNT(*) as count,
-               SUM(CASE WHEN is_suspicious_asn=1 THEN 1 ELSE 0 END) as suspicious_count
-          FROM connection_events
-          WHERE asn_org IS NOT NULL
-          {time_clause}
-          GROUP BY asn_org
-          ORDER BY count DESC
-          LIMIT 20
-          """,
-          tuple(time_params),
-        ) as cursor:
-          rows = await cursor.fetchall()
-          orgs = [{"org": r[0], "count": r[1], "suspicious": r[2]} for r in rows]
-
-      # Country values are optional and inferred from event details JSON.
-      async with self._db._lock:
-        async with self._db._db.execute(
-          f"""
-          SELECT source_ip, details
-          FROM connection_events
-          WHERE 1=1
-          {time_clause}
-          ORDER BY id DESC
-          LIMIT 5000
-          """,
-          tuple(time_params),
-        ) as cursor:
-          rows = await cursor.fetchall()
-
-          counts: dict[str, int] = {}
-          for source_ip, details_value in rows:
-            details_obj = {}
-            if isinstance(details_value, str) and details_value:
-              try:
-                details_obj = json.loads(details_value)
-              except Exception:
-                details_obj = {}
-            elif isinstance(details_value, dict):
-              details_obj = details_value
-
-            code = self._resolve_country_code(details_obj, source_ip) or "ZZ"
-            counts[code] = counts.get(code, 0) + 1
-
-          countries = [
-            {"country": country, "count": count}
-            for country, count in sorted(
-              counts.items(),
-              key=lambda item: item[1],
-              reverse=True,
-            )[:30]
-          ]
-
-      return web.json_response({"asn_orgs": orgs, "countries": countries})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_asn_stats(self, request)
 
   async def _handle_geo_heatmap(self, request: web.Request) -> web.Response:
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    hours = min(int(request.query.get("hours", "24")), 168)
-    try:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          """
-          SELECT source_ip, details
-          FROM connection_events
-          WHERE COALESCE(strftime('%s', timestamp), 0) >= strftime('%s', 'now', ? || ' hours')
-          ORDER BY id DESC
-          LIMIT 5000
-          """,
-          (f"-{hours}",),
-        ) as cursor:
-          rows = await cursor.fetchall()
-
-          counts: dict[str, int] = {}
-          for source_ip, details_value in rows:
-            details_obj = {}
-            if isinstance(details_value, str) and details_value:
-              try:
-                details_obj = json.loads(details_value)
-              except Exception:
-                details_obj = {}
-            elif isinstance(details_value, dict):
-              details_obj = details_value
-
-            code = self._resolve_country_code(details_obj, source_ip)
-            if not code or code == "ZZ":
-              continue
-            counts[code] = counts.get(code, 0) + 1
-
-          points = [
-            {"country": country, "count": count}
-            for country, count in sorted(
-              counts.items(),
-              key=lambda item: item[1],
-              reverse=True,
-            )[:150]
-          ]
-      return web.json_response({"points": points, "hours": hours})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_geo_heatmap(self, request)
 
   async def _handle_threat_distribution(self, request: web.Request) -> web.Response:
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    try:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          """
-          SELECT threat_level, COUNT(*) as count
-          FROM connection_events
-          GROUP BY threat_level
-          ORDER BY count DESC
-          """
-        ) as cursor:
-          rows = await cursor.fetchall()
-          distribution = [{"level": r[0], "count": r[1]} for r in rows]
-      return web.json_response({"distribution": distribution})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_threat_distribution(self, request)
 
   async def _handle_plugin_stats(self, request: web.Request) -> web.Response:
-    if not self._check_public_dashboard_access(request):
-      return self._json_auth_error()
-    try:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          """
-          SELECT connection_type, COUNT(*) as count
-          FROM connection_events
-          GROUP BY connection_type
-          ORDER BY count DESC
-          """
-        ) as cursor:
-          rows = await cursor.fetchall()
-          plugins = [{"plugin": r[0], "count": r[1]} for r in rows]
-      return web.json_response({"plugins": plugins})
-    except Exception as exc:
-      return web.json_response({"error": str(exc)}, status=500)
+    return await public_metrics_handlers.handle_plugin_stats(self, request)
 
   async def _handle_blocklist(self, request: web.Request) -> web.Response:
     if not self._check_public_dashboard_access(request):
@@ -1312,142 +1311,16 @@ class DashboardAPI:
       return web.json_response({"error": str(exc)}, status=500)
 
   async def _handle_login_page(self, request: web.Request) -> web.Response:
-    if self._bootstrap_token_is_valid():
-      raise web.HTTPFound("/setup")
-    next_path = self._normalize_next_path(
-      request.query.get("next", "/dashboard"),
-      "/dashboard",
-    )
-    if self._is_session_authenticated(request):
-      raise web.HTTPFound(next_path)
-    auth_ready = await self._admin_auth_available()
-    html = LOGIN_HTML.replace("__NEXT_PATH__", json.dumps(next_path))
-    html = html.replace("__AUTH_READY__", "true" if auth_ready else "false")
-    html = html.replace(
-      "__PUBLIC_DASHBOARD_ENABLED__",
-      "true" if self._public_dashboard_enabled else "false",
-    )
-    html = html.replace(
-      "__SETUP_MESSAGE__",
-      json.dumps(
-        "No admin user exists yet. Complete the first-boot setup flow and create an admin account."
-      ),
-    )
-    html = self._render_ui_template(html)
-    return web.Response(text=html, content_type="text/html")
+    return await auth_handlers.handle_login_page(self, request)
 
   async def _handle_setup_page(self, request: web.Request) -> web.Response:
-    if not self._bootstrap_token_is_valid():
-      raise web.HTTPFound("/login")
-    html = SETUP_HTML.replace("__SETUP_EXPIRY__", json.dumps(self._bootstrap_token_expires_at or "24 hours"))
-    html = self._render_ui_template(html)
-    return web.Response(text=html, content_type="text/html")
+    return await auth_handlers.handle_setup_page(self, request)
 
   async def _handle_login(self, request: web.Request) -> web.Response:
-    if self._bootstrap_token_is_valid():
-      return web.json_response(
-        {"error": "setup_required", "message": "Initial setup must be completed before login.", "redirect_to": "/setup"},
-        status=403,
-      )
-    client_ip = self._client_ip(request)
-    if self._consume_rate_limit(
-      self._login_attempts,
-      client_ip,
-      self._login_rate_limit_per_minute,
-      60,
-    ):
-      return web.json_response(
-        {"error": "too_many_attempts", "message": "Too many login attempts."},
-        status=429,
-      )
-    try:
-      payload = await request.json()
-    except Exception:
-      form_data = await request.post()
-      payload = dict(form_data)
-
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    next_path = self._normalize_next_path(
-      str(payload.get("next", "/dashboard")).strip() or "/dashboard",
-      "/dashboard",
-    )
-    if not await self._admin_auth_available():
-      return self._json_auth_error()
-    user = await self._db.get_admin_user_by_username(username)
-    if user:
-      locked_until_raw = str(user.get("locked_until", "") or "").strip()
-      if locked_until_raw:
-        try:
-          locked_until = datetime.fromisoformat(locked_until_raw.replace("Z", "+00:00"))
-          if locked_until.tzinfo is None:
-            locked_until = locked_until.replace(tzinfo=timezone.utc)
-          if locked_until > datetime.now(timezone.utc):
-            await self._log_audit(
-              request,
-              "auth.login_failed",
-              actor_username=username or None,
-              details={"reason": "account_locked", "locked_until": locked_until.isoformat()},
-            )
-            return web.json_response(
-              {"error": "account_locked", "message": "Account is temporarily locked due to repeated failures."},
-              status=423,
-            )
-        except Exception:
-          pass
-
-    if not user or not verify_password(str(user.get("password_hash", "")), password):
-      if user:
-        try:
-          failed_count = int(user.get("failed_login_count", 0) or 0) + 1
-        except Exception:
-          failed_count = 1
-        lock_seconds = 300 if failed_count >= 5 else 0
-        await self._db.record_admin_failed_login(username, lock_seconds=lock_seconds)
-      await self._log_audit(request, "auth.login_failed", actor_username=username or None, details={"reason": "invalid_credentials"})
-      return web.json_response(
-        {"error": "invalid_credentials", "message": "Invalid username or password."},
-        status=401,
-      )
-
-    if int(user.get("totp_enabled", 0)):
-      pending_token = secrets.token_urlsafe(24)
-      self._pending_logins[pending_token] = {
-        "username": user["username"],
-        "next_path": next_path,
-        "expires_at": time.time() + 300,
-      }
-      return web.json_response({"ok": True, "requires_totp": True, "pending_token": pending_token})
-
-    response = web.json_response({"ok": True, "redirect_to": next_path})
-    self._issue_session(response, request, username=user["username"])
-    await self._db.record_admin_login(user["username"], client_ip)
-    await self._log_audit(request, "auth.login_success", actor_username=user["username"], details={"method": "password_only"})
-    return response
+    return await auth_handlers.handle_login(self, request)
 
   async def _handle_login_totp(self, request: web.Request) -> web.Response:
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    pending_token = str(payload.get("pending_token", "")).strip()
-    code = str(payload.get("totp_code", "")).strip()
-    pending = self._pending_logins.get(pending_token)
-    if not pending or float(pending.get("expires_at", 0)) <= time.time():
-      self._pending_logins.pop(pending_token, None)
-      return web.json_response({"error": "pending_auth_expired", "message": "The login challenge expired. Start again."}, status=401)
-    username = str(pending.get("username", ""))
-    user = await self._db.get_admin_user_by_username(username)
-    if not user or not verify_totp_code(str(user.get("totp_secret", "")), code):
-      await self._log_audit(request, "auth.totp_failed", actor_username=username, details={"reason": "invalid_totp"})
-      return web.json_response({"error": "invalid_totp", "message": "Invalid TOTP code."}, status=401)
-
-    self._pending_logins.pop(pending_token, None)
-    response = web.json_response({"ok": True, "redirect_to": pending.get("next_path") or "/admin"})
-    self._issue_session(response, request, username=username)
-    await self._db.record_admin_login(username, self._client_ip(request))
-    await self._log_audit(request, "auth.login_success", actor_username=username, details={"method": "password_totp"})
-    return response
+    return await auth_handlers.handle_login_totp(self, request)
 
   async def _handle_admin_get_auth_settings(self, request: web.Request) -> web.Response:
     if not self._check_auth(request):
@@ -1548,361 +1421,31 @@ class DashboardAPI:
     )
 
   async def _handle_setup_begin(self, request: web.Request) -> web.Response:
-    if not self._bootstrap_token_is_valid():
-      return web.json_response({"error": "setup_unavailable", "message": "First-boot setup is not available anymore."}, status=403)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    bootstrap_token = str(payload.get("bootstrap_token", "")).strip()
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    password_confirm = str(payload.get("password_confirm", ""))
-    if not verify_bootstrap_token(self._bootstrap_token_hash, bootstrap_token):
-      await self._log_audit(request, "setup.begin_failed", actor_username=username or None, details={"reason": "invalid_bootstrap"})
-      return web.json_response({"error": "invalid_bootstrap", "message": "Invalid bootstrap token."}, status=401)
-    if not username or username.lower() == "admin":
-      return web.json_response({"error": "invalid_username", "message": "Choose a non-default admin username."}, status=400)
-    if password != password_confirm:
-      return web.json_response({"error": "password_mismatch", "message": "Passwords do not match."}, status=400)
-    is_valid, policy_message = check_password_policy(password)
-    if not is_valid:
-      return web.json_response({"error": "weak_password", "message": policy_message}, status=400)
-    if await self._db.has_admin_users():
-      return web.json_response({"error": "setup_completed", "message": "An admin user already exists."}, status=409)
-
-    pending_token = secrets.token_urlsafe(24)
-    totp_secret = generate_totp_secret()
-    totp_uri = build_totp_uri(username, totp_secret)
-    self._pending_setups[pending_token] = {
-      "username": username,
-      "password_hash": hash_password(password),
-      "totp_secret": totp_secret,
-      "expires_at": time.time() + 900,
-    }
-    await self._log_audit(request, "setup.begin_success", actor_username=username, details={"totp": True})
-    return web.json_response({
-      "ok": True,
-      "pending_setup_token": pending_token,
-      "totp_secret": totp_secret,
-      "totp_uri": totp_uri,
-      "totp_qr_data_url": build_totp_qr_data_url(totp_uri),
-    })
+    return await setup_handlers.handle_setup_begin(self, request)
 
   async def _handle_admin_list_users(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.users.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    try:
-      limit = int(request.query.get("limit", "200") or 200)
-    except Exception:
-      limit = 200
-    rows = await self._db.list_admin_users(limit=limit)
-    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+    return await admin_identity_handlers.handle_admin_list_users(self, request)
 
   async def _handle_admin_create_user(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.users.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request) or ""
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    display_name = str(payload.get("display_name", "")).strip()
-    roles = payload.get("roles", []) if isinstance(payload.get("roles", []), list) else []
-    permissions = payload.get("permissions", []) if isinstance(payload.get("permissions", []), list) else []
-    totp_enabled = bool(payload.get("totp_enabled", True))
-    is_owner = bool(payload.get("is_owner", False))
-
-    if not username:
-      return web.json_response({"error": "invalid_username", "message": "username is required."}, status=400)
-    if not password:
-      return web.json_response({"error": "invalid_password", "message": "password is required."}, status=400)
-    valid, message = check_password_policy(password)
-    if not valid:
-      return web.json_response({"error": "weak_password", "message": message}, status=400)
-    if is_owner and not await self._actor_has_permission(request, "*"):
-      return web.json_response({"error": "forbidden", "message": "Only owner can create another owner account."}, status=403)
-    if await self._db.get_admin_user_by_username(username):
-      return web.json_response({"error": "username_exists", "message": "Username already exists."}, status=409)
-
-    user_id = await self._db.create_admin_user(
-      username=username,
-      password_hash=hash_password(password),
-      totp_secret=generate_totp_secret(),
-      totp_enabled=totp_enabled,
-      is_owner=is_owner,
-      display_name=display_name or username,
-      created_by=actor,
-    )
-    for role in roles:
-      await self._db.assign_role_to_user(username, str(role or "").strip().lower())
-    for node in permissions:
-      await self._db.upsert_user_permission(username, str(node or "").strip(), effect=1)
-
-    await self._log_audit(
-      request,
-      "admin.users.create",
-      actor_username=actor,
-      target=username,
-      details={"user_id": user_id, "roles": roles, "permissions": permissions, "is_owner": is_owner},
-    )
-    return web.json_response({"ok": True, "user_id": user_id, "username": username}, status=201)
+    return await admin_identity_handlers.handle_admin_create_user(self, request)
 
   async def _handle_admin_assign_role(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.users.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request) or ""
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    username = str(payload.get("username", "")).strip()
-    role_code = str(payload.get("role", "")).strip().lower()
-    if not username or not role_code:
-      return web.json_response({"error": "invalid_request", "message": "username and role are required."}, status=400)
-    ok = await self._db.assign_role_to_user(username, role_code)
-    if not ok:
-      return web.json_response({"error": "assignment_failed", "message": "Could not assign role."}, status=404)
-    await self._log_audit(request, "admin.users.assign_role", actor_username=actor, target=username, details={"role": role_code})
-    return web.json_response({"ok": True, "username": username, "role": role_code})
+    return await admin_identity_handlers.handle_admin_assign_role(self, request)
 
   async def _handle_admin_grant_permission(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.users.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request) or ""
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    username = str(payload.get("username", "")).strip()
-    node = str(payload.get("permission", "")).strip()
-    effect = int(payload.get("effect", 1) or 1)
-    if not username or not node:
-      return web.json_response({"error": "invalid_request", "message": "username and permission are required."}, status=400)
-    ok = await self._db.upsert_user_permission(username, node, effect=effect)
-    if not ok:
-      return web.json_response({"error": "grant_failed", "message": "Could not update user permission."}, status=404)
-    await self._log_audit(request, "admin.users.permission", actor_username=actor, target=username, details={"permission": node, "effect": 1 if effect >= 0 else -1})
-    return web.json_response({"ok": True, "username": username, "permission": node, "effect": 1 if effect >= 0 else -1})
+    return await admin_identity_handlers.handle_admin_grant_permission(self, request)
 
   async def _handle_admin_list_invites(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.invites.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    try:
-      limit = int(request.query.get("limit", "100") or 100)
-    except Exception:
-      limit = 100
-    rows = await self._db.list_invite_tokens(limit=limit)
-    items = []
-    for row in rows:
-      token_hash = str(row.get("token_hash") or "")
-      try:
-        role_codes = json.loads(str(row.get("role_codes_json") or "[]"))
-      except Exception:
-        role_codes = []
-      try:
-        permission_nodes = json.loads(str(row.get("permission_nodes_json") or "[]"))
-      except Exception:
-        permission_nodes = []
-      items.append(
-        {
-          "id": row.get("id"),
-          "fingerprint": token_hash[:8] + "..." if token_hash else "",
-          "created_by": row.get("created_by"),
-          "note": row.get("note"),
-          "max_uses": row.get("max_uses"),
-          "used_count": row.get("used_count"),
-          "expires_at": row.get("expires_at"),
-          "is_active": bool(row.get("is_active")),
-          "role_codes": role_codes,
-          "permission_nodes": permission_nodes,
-          "created_at": row.get("created_at"),
-        }
-      )
-    return web.json_response({"ok": True, "count": len(items), "items": items})
+    return await admin_identity_handlers.handle_admin_list_invites(self, request)
 
   async def _handle_admin_create_invite(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.invites.manage")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request) or ""
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    note = str(payload.get("note", "")).strip()
-    max_uses = max(1, min(int(payload.get("max_uses", 1) or 1), 50))
-    expires_in_hours = max(1, min(int(payload.get("expires_in_hours", 24) or 24), 24 * 30))
-    roles = [str(item or "").strip().lower() for item in list(payload.get("roles", []) or []) if str(item or "").strip()]
-    permissions = [str(item or "").strip() for item in list(payload.get("permissions", []) or []) if str(item or "").strip()]
-    raw_token = secrets.token_urlsafe(24)
-    token_hash = self._hash_invite_token(raw_token)
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()
-    invite_id = await self._db.create_invite_token(
-      token_hash=token_hash,
-      created_by=actor,
-      expires_at=expires_at,
-      max_uses=max_uses,
-      role_codes=roles,
-      permission_nodes=permissions,
-      note=note,
-    )
-    await self._log_audit(request, "admin.invites.create", actor_username=actor, target=str(invite_id), details={"max_uses": max_uses, "expires_at": expires_at, "roles": roles, "permissions": permissions})
-    return web.json_response({"ok": True, "invite_id": invite_id, "invite_token": raw_token, "expires_at": expires_at, "max_uses": max_uses}, status=201)
+    return await admin_identity_handlers.handle_admin_create_invite(self, request)
 
   async def _handle_invite_register(self, request: web.Request) -> web.Response:
-    if self._bootstrap_token_is_valid():
-      return web.json_response({"error": "setup_required", "message": "Complete bootstrap setup first."}, status=403)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    invite_token = str(payload.get("invite_token", "")).strip()
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    password_confirm = str(payload.get("password_confirm", ""))
-    display_name = str(payload.get("display_name", "")).strip()
-    totp_enabled = bool(payload.get("totp_enabled", True))
-
-    if not invite_token or not username:
-      return web.json_response({"error": "invalid_request", "message": "invite_token and username are required."}, status=400)
-    if password != password_confirm:
-      return web.json_response({"error": "password_mismatch", "message": "Passwords do not match."}, status=400)
-    valid, message = check_password_policy(password)
-    if not valid:
-      return web.json_response({"error": "weak_password", "message": message}, status=400)
-    if await self._db.get_admin_user_by_username(username):
-      return web.json_response({"error": "username_exists", "message": "Username already exists."}, status=409)
-
-    invite = await self._db.get_active_invite_by_hash(self._hash_invite_token(invite_token))
-    if not invite:
-      return web.json_response({"error": "invalid_invite", "message": "Invite token is invalid or expired."}, status=401)
-
-    created_by = str(invite.get("created_by") or "")
-    user_id = await self._db.create_admin_user(
-      username=username,
-      password_hash=hash_password(password),
-      totp_secret=generate_totp_secret(),
-      totp_enabled=totp_enabled,
-      is_owner=False,
-      display_name=display_name or username,
-      created_by=created_by,
-    )
-    try:
-      role_codes = json.loads(str(invite.get("role_codes_json") or "[]"))
-    except Exception:
-      role_codes = []
-    try:
-      permission_nodes = json.loads(str(invite.get("permission_nodes_json") or "[]"))
-    except Exception:
-      permission_nodes = []
-    for role in role_codes if isinstance(role_codes, list) else []:
-      await self._db.assign_role_to_user(username, str(role or "").strip().lower())
-    for node in permission_nodes if isinstance(permission_nodes, list) else []:
-      await self._db.upsert_user_permission(username, str(node or "").strip(), effect=1)
-
-    await self._db.consume_invite_token(int(invite.get("id") or 0))
-    response = web.json_response({"ok": True, "redirect_to": "/portal", "message": "Registration completed."})
-    self._issue_session(response, request, username=username)
-    await self._db.record_admin_login(username, self._client_ip(request))
-    await self._log_audit(request, "auth.invite_register", actor_username=username, details={"invite_id": invite.get("id"), "created_by": created_by, "user_id": user_id})
-    return response
+    return await setup_handlers.handle_invite_register(self, request)
 
   async def _handle_setup_complete(self, request: web.Request) -> web.Response:
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    pending_token = str(payload.get("pending_setup_token", "")).strip()
-    totp_code = str(payload.get("totp_code", "")).strip()
-    pending = self._pending_setups.get(pending_token)
-    if not pending or float(pending.get("expires_at", 0)) <= time.time():
-      self._pending_setups.pop(pending_token, None)
-      return web.json_response({"error": "setup_expired", "message": "Setup session expired. Start again."}, status=401)
-    if not verify_totp_code(str(pending.get("totp_secret", "")), totp_code):
-      await self._log_audit(request, "setup.complete_failed", actor_username=str(pending.get("username", "")), details={"reason": "invalid_totp"})
-      return web.json_response({"error": "invalid_totp", "message": "Invalid TOTP code."}, status=401)
-    if await self._db.has_admin_users():
-      self._pending_setups.pop(pending_token, None)
-      return web.json_response({"error": "setup_completed", "message": "An admin user already exists."}, status=409)
-
-    username = str(pending.get("username", ""))
-    try:
-      await self._db.create_admin_user(
-        username=username,
-        password_hash=str(pending.get("password_hash", "")),
-        totp_secret=str(pending.get("totp_secret", "")),
-        totp_enabled=True,
-        is_owner=True,
-        display_name=username,
-        created_by="bootstrap_setup",
-      )
-    except Exception as exc:
-      message = str(exc)
-      if "readonly" in message.lower():
-        return web.json_response(
-          {
-            "error": "database_readonly",
-            "message": "Database is not writable by the service account. Repair ownership/permissions for /var/lib/wardenips and retry.",
-          },
-          status=500,
-        )
-      return web.json_response(
-        {"error": "setup_failed", "message": message or "Admin setup failed."},
-        status=500,
-      )
-    self._pending_setups.pop(pending_token, None)
-    # Apply first-install defaults
-    try:
-      private_nets = payload.get("whitelist_private_networks") or []
-      if private_nets and isinstance(private_nets, list):
-        existing_ips = list(self._config.get("whitelist.ips", []) or [])
-        existing_cidrs = list(self._config.get("whitelist.cidr_ranges", []) or [])
-        for raw in private_nets:
-          raw = str(raw).strip()
-          if not raw:
-            continue
-          try:
-            if "/" in raw:
-              n = str(ipaddress.ip_network(raw, strict=False))
-              if n not in existing_cidrs:
-                existing_cidrs.append(n)
-            else:
-              ip_val = str(ipaddress.ip_address(raw))
-              if ip_val not in existing_ips:
-                existing_ips.append(ip_val)
-          except ValueError:
-            pass
-        await self._config.patch_values({"whitelist.ips": existing_ips, "whitelist.cidr_ranges": existing_cidrs})
-        if self._whitelist:
-          await self._whitelist.reload(self._config)
-      # Ensure monitor mode is active for fresh installs
-      await self._config.patch_values({"firewall.simulation_mode": True})
-      self._firewall.apply_simulation_config(True)
-    except Exception:
-      pass
-    await self._clear_bootstrap_config()
-    response = web.json_response({"ok": True, "redirect_to": "/admin", "message": "Initial admin setup completed."})
-    self._issue_session(response, request, username=username)
-    await self._db.record_admin_login(username, self._client_ip(request))
-    await self._log_audit(request, "setup.complete_success", actor_username=username, details={"totp": True})
-    return response
+    return await setup_handlers.handle_setup_complete(self, request)
 
   async def _handle_root(self, request: web.Request) -> web.Response:
     if self._bootstrap_token_is_valid():
@@ -1972,33 +1515,10 @@ class DashboardAPI:
     return web.Response(text=self._render_ui_template(html), content_type="text/html")
 
   async def _handle_logout(self, request: web.Request) -> web.Response:
-    actor = self._get_session_actor(request)
-    if request.method == "GET":
-      response = web.HTTPFound("/login")
-    else:
-      response = web.json_response({"ok": True, "redirect_to": "/login"})
-    self._clear_session(request, response)
-    if actor:
-      await self._log_audit(request, "auth.logout", actor_username=actor)
-    return response
+    return await auth_handlers.handle_logout(self, request)
 
   async def _handle_session_activity(self, request: web.Request) -> web.Response:
-    if not self._is_session_authenticated(request):
-      return self._json_auth_error()
-    token = self._get_session_token(request)
-    if self._consume_rate_limit(
-      self._activity_touches,
-      token,
-      limit=1,
-      window_seconds=self._activity_touch_interval_seconds,
-    ):
-      return web.json_response(
-        {"ok": True, "ttl_seconds": max(int(self._sessions.get(token, 0) - time.time()), 0)}
-      )
-    self._touch_session(request)
-    return web.json_response(
-      {"ok": True, "ttl_seconds": max(int(self._sessions.get(token, 0) - time.time()), 0)}
-    )
+    return await auth_handlers.handle_session_activity(self, request)
 
   def _normalize_whitelist_entry(self, value: str) -> tuple[str, str]:
     candidate = str(value or "").strip()
@@ -2010,1219 +1530,61 @@ class DashboardAPI:
     return str(ipaddress.ip_address(candidate)), "ip"
 
   async def _handle_admin_get_whitelist(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    return web.json_response(
-      {
-        "ok": True,
-        "ips": list(self._config.get("whitelist.ips", []) or []),
-        "cidr_ranges": list(self._config.get("whitelist.cidr_ranges", []) or []),
-      }
-    )
+    return await admin_security_handlers.handle_admin_get_whitelist(self, request)
 
   async def _handle_admin_add_whitelist(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    raw_value = str(payload.get("value", "")).strip()
-    try:
-      normalized, entry_type = self._normalize_whitelist_entry(raw_value)
-    except Exception:
-      return web.json_response({"error": "invalid_entry", "message": "Provide a valid IPv4/IPv6 address or CIDR range."}, status=400)
-
-    ip_values = list(self._config.get("whitelist.ips", []) or [])
-    cidr_values = list(self._config.get("whitelist.cidr_ranges", []) or [])
-
-    if entry_type == "ip":
-      if normalized in ip_values:
-        return web.json_response({"ok": True, "message": f"{normalized} is already in whitelist.", "entry": normalized, "entry_type": entry_type})
-      ip_values.append(normalized)
-    else:
-      if normalized in cidr_values:
-        return web.json_response({"ok": True, "message": f"{normalized} is already in whitelist.", "entry": normalized, "entry_type": entry_type})
-      cidr_values.append(normalized)
-
-    await self._config.patch_values(
-      {
-        "whitelist.ips": ip_values,
-        "whitelist.cidr_ranges": cidr_values,
-      }
-    )
-    if self._whitelist:
-      await self._whitelist.reload(self._config)
-
-    await self._log_audit(request, "admin.whitelist_add", actor_username=actor, details={"entry": normalized, "entry_type": entry_type})
-    return web.json_response({"ok": True, "message": f"Added {normalized} to whitelist.", "entry": normalized, "entry_type": entry_type})
+    return await admin_security_handlers.handle_admin_add_whitelist(self, request)
 
   async def _handle_admin_remove_whitelist(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    raw_value = str(payload.get("value", "")).strip()
-    try:
-      normalized, entry_type = self._normalize_whitelist_entry(raw_value)
-    except Exception:
-      return web.json_response({"error": "invalid_entry", "message": "Provide a valid IPv4/IPv6 address or CIDR range."}, status=400)
-
-    ip_values = list(self._config.get("whitelist.ips", []) or [])
-    cidr_values = list(self._config.get("whitelist.cidr_ranges", []) or [])
-    changed = False
-
-    if entry_type == "ip" and normalized in ip_values:
-      ip_values = [item for item in ip_values if str(item).strip() != normalized]
-      changed = True
-    if entry_type == "cidr" and normalized in cidr_values:
-      cidr_values = [item for item in cidr_values if str(item).strip() != normalized]
-      changed = True
-
-    if not changed:
-      return web.json_response({"ok": True, "message": f"{normalized} was not present in whitelist.", "entry": normalized, "entry_type": entry_type})
-
-    await self._config.patch_values(
-      {
-        "whitelist.ips": ip_values,
-        "whitelist.cidr_ranges": cidr_values,
-      }
-    )
-    if self._whitelist:
-      await self._whitelist.reload(self._config)
-
-    await self._log_audit(request, "admin.whitelist_remove", actor_username=actor, details={"entry": normalized, "entry_type": entry_type})
-    return web.json_response({"ok": True, "message": f"Removed {normalized} from whitelist.", "entry": normalized, "entry_type": entry_type})
+    return await admin_security_handlers.handle_admin_remove_whitelist(self, request)
 
   async def _handle_admin_unban_ip(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    payload = await request.json()
-    ip_value = str(payload.get("ip", "")).strip()
-    if not ip_value:
-      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
-    firewall_result = await self._firewall.unban_ip(ip_value)
-    deactivated = await self._db.deactivate_ban_by_ip(ip_value)
-    await self._log_audit(request, "admin.unban_ip", actor_username=actor, details={"ip": ip_value, "firewall_result": firewall_result, "deactivated_records": deactivated})
-    return web.json_response(
-      {
-        "ok": firewall_result,
-        "message": f"Removed {ip_value} from firewall bans.",
-        "deactivated_records": deactivated,
-      }
-    )
+    return await admin_security_handlers.handle_admin_unban_ip(self, request)
 
   async def _handle_admin_ban_ip(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    ip_value = str(payload.get("ip", "")).strip()
-    if not ip_value:
-      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
-    try:
-      ipaddress.ip_address(ip_value)
-    except Exception:
-      return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
-
-    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
-    try:
-      duration = max(int(duration_value), 0)
-    except Exception:
-      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
-
-    reason = str(payload.get("reason", "")).strip() or "[ADMIN] Manual ban from dashboard"
-    risk_score_value = payload.get("risk_score", 100)
-    try:
-      risk_score = min(max(int(risk_score_value), 0), 100)
-    except Exception:
-      risk_score = 100
-
-    banned = await self._firewall.ban_ip(ip_value, duration=duration, reason=reason)
-    if not banned:
-      return web.json_response(
-        {
-          "ok": False,
-          "message": f"Ban request for {ip_value} was skipped (already banned, whitelisted, or blocked by safety checks).",
-        },
-        status=409,
-      )
-
-    await self._db.log_ban(ip_value, reason, risk_score, duration)
-    await self._notifier.notify_ban(
-      ip=ip_value,
-      reason=reason,
-      risk=risk_score,
-      duration=duration,
-      plugin="admin",
-    )
-    await self._log_audit(
-      request,
-      "admin.ban_ip",
-      actor_username=actor,
-      details={"ip": ip_value, "duration": duration, "reason": reason, "risk_score": risk_score},
-    )
-    return web.json_response(
-      {
-        "ok": True,
-        "message": f"{ip_value} was added to firewall ban list.",
-        "duration": duration,
-        "risk_score": risk_score,
-      }
-    )
+    return await admin_security_handlers.handle_admin_ban_ip(self, request)
 
   async def _handle_admin_report_and_ban(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    ip_value = str(payload.get("ip", "")).strip()
-    if not ip_value:
-      return web.json_response({"error": "invalid_ip", "message": "IP address is required."}, status=400)
-    try:
-      ipaddress.ip_address(ip_value)
-    except Exception:
-      return web.json_response({"error": "invalid_ip", "message": "Provide a valid IPv4 or IPv6 address."}, status=400)
-
-    duration_value = payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))
-    try:
-      duration = max(int(duration_value), 0)
-    except Exception:
-      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
-
-    reason = str(payload.get("reason", "")).strip() or "[ADMIN] Report+Ban from dashboard"
-    risk_score_value = payload.get("risk_score", 100)
-    try:
-      risk_score = min(max(int(risk_score_value), 0), 100)
-    except Exception:
-      risk_score = 100
-
-    raw_categories = payload.get("categories", [14])
-    categories: list[int] = []
-    if isinstance(raw_categories, list):
-      for item in raw_categories:
-        try:
-          value = int(item)
-        except Exception:
-          continue
-        if 1 <= value <= 24 and value not in categories:
-          categories.append(value)
-    if not categories:
-      categories = [14]
-
-    ban_applied = await self._firewall.ban_ip(ip_value, duration=duration, reason=reason)
-    if ban_applied:
-      await self._db.log_ban(ip_value, reason, risk_score, duration)
-      await self._notifier.notify_ban(
-        ip=ip_value,
-        reason=reason,
-        risk=risk_score,
-        duration=duration,
-        plugin="admin",
-      )
-
-    reported = False
-    if self._abuse_reporter:
-      try:
-        reported = await self._abuse_reporter.report_ip(
-          ip=ip_value,
-          categories=categories,
-          comment=f"{reason} | Trigger: admin report+ban",
-        )
-      except Exception:
-        reported = False
-
-    await self._log_audit(
-      request,
-      "admin.report_and_ban",
-      actor_username=actor,
-      details={
-        "ip": ip_value,
-        "duration": duration,
-        "risk_score": risk_score,
-        "categories": categories,
-        "ban_applied": ban_applied,
-        "reported": reported,
-      },
-    )
-
-    if not ban_applied and not reported:
-      return web.json_response(
-        {
-          "ok": False,
-          "message": f"No action taken for {ip_value} (already banned, whitelisted, or reporter unavailable).",
-          "ban_applied": False,
-          "reported": False,
-        },
-        status=409,
-      )
-
-    result_parts: list[str] = []
-    result_parts.append("ban applied" if ban_applied else "ban skipped")
-    result_parts.append("reported" if reported else "report skipped")
-    return web.json_response(
-      {
-        "ok": True,
-        "message": f"{ip_value}: " + ", ".join(result_parts) + ".",
-        "ban_applied": ban_applied,
-        "reported": reported,
-      }
-    )
+    return await admin_bulk_handlers.handle_admin_report_and_ban(self, request)
 
   async def _handle_admin_bulk_ip_action(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    action = str(payload.get("action", "ban") or "ban").strip().lower()
-    if action not in {"ban", "report", "report_and_ban"}:
-      return web.json_response(
-        {
-          "error": "invalid_action",
-          "message": "action must be one of: ban, report, report_and_ban.",
-        },
-        status=400,
-      )
-
-    lines_text = str(payload.get("lines", "") or "")
-    if not lines_text.strip():
-      return web.json_response(
-        {"error": "invalid_lines", "message": "Provide at least one IP in lines."},
-        status=400,
-      )
-
-    try:
-      duration = max(int(payload.get("duration", self._config.get("firewall.ipset.default_ban_duration", 0))), 0)
-    except Exception:
-      duration = max(int(self._config.get("firewall.ipset.default_ban_duration", 0)), 0)
-
-    reason_base = str(payload.get("reason", "") or "").strip()
-    if not reason_base:
-      reason_base = "[ADMIN] Bulk action from dashboard"
-
-    risk_score_value = payload.get("risk_score", 100)
-    try:
-      risk_score = min(max(int(risk_score_value), 0), 100)
-    except Exception:
-      risk_score = 100
-
-    raw_categories = payload.get("categories", [14])
-    categories: list[int] = []
-    if isinstance(raw_categories, list):
-      for item in raw_categories:
-        try:
-          value = int(item)
-        except Exception:
-          continue
-        if 1 <= value <= 24 and value not in categories:
-          categories.append(value)
-    if not categories:
-      categories = [14]
-
-    raw_respect = payload.get("respect_report_rate_limit", True)
-    if isinstance(raw_respect, bool):
-      respect_report_rate_limit = raw_respect
-    elif isinstance(raw_respect, (int, float)):
-      respect_report_rate_limit = bool(int(raw_respect))
-    elif isinstance(raw_respect, str):
-      respect_report_rate_limit = raw_respect.strip().lower() in {"1", "true", "yes", "on"}
-    else:
-      respect_report_rate_limit = True
-
-    try:
-      report_interval_ms = int(payload.get("report_interval_ms", 2200))
-    except Exception:
-      report_interval_ms = 2200
-    report_interval_ms = min(max(report_interval_ms, 500), 15000)
-    report_interval_seconds = report_interval_ms / 1000.0
-    last_report_at = 0.0
-
-    entries: list[tuple[str, str]] = []
-    for raw_line in lines_text.splitlines():
-      line = str(raw_line or "").strip()
-      if not line or line.startswith("#"):
-        continue
-      if "|" in line:
-        ip_part, note_part = line.split("|", 1)
-        ip_value = ip_part.strip()
-        per_line_note = note_part.strip()
-      else:
-        ip_value = line
-        per_line_note = ""
-      if not ip_value:
-        continue
-      entries.append((ip_value, per_line_note))
-
-    if not entries:
-      return web.json_response(
-        {"error": "invalid_lines", "message": "No valid IP lines were found."},
-        status=400,
-      )
-
-    results: list[dict[str, object]] = []
-    for ip_value, per_line_note in entries:
-      item = {
-        "ip": ip_value,
-        "ban_applied": False,
-        "reported": False,
-        "ok": False,
-        "message": "",
-      }
-      try:
-        ipaddress.ip_address(ip_value)
-      except Exception:
-        item["message"] = "Invalid IP format."
-        results.append(item)
-        continue
-
-      final_reason = reason_base
-      if per_line_note:
-        final_reason = f"{reason_base} | {per_line_note}"
-
-      ban_applied = False
-      if action in {"ban", "report_and_ban"}:
-        ban_applied = await self._firewall.ban_ip(ip_value, duration=duration, reason=final_reason)
-        if ban_applied:
-          await self._db.log_ban(ip_value, final_reason, risk_score, duration)
-          await self._notifier.notify_ban(
-            ip=ip_value,
-            reason=final_reason,
-            risk=risk_score,
-            duration=duration,
-            plugin="admin",
-          )
-
-      reported = False
-      if action in {"report", "report_and_ban"} and self._abuse_reporter:
-        if respect_report_rate_limit and last_report_at > 0:
-          elapsed = time.monotonic() - last_report_at
-          wait_seconds = report_interval_seconds - elapsed
-          if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
-        try:
-          reported = await self._abuse_reporter.report_ip(
-            ip=ip_value,
-            categories=categories,
-            comment=f"{final_reason} | Trigger: admin bulk {action}",
-          )
-          last_report_at = time.monotonic()
-        except Exception:
-          reported = False
-          last_report_at = time.monotonic()
-
-        # One paced retry helps when bursts hit provider-side throttling.
-        if not reported and respect_report_rate_limit:
-          await asyncio.sleep(report_interval_seconds)
-          try:
-            reported = await self._abuse_reporter.report_ip(
-              ip=ip_value,
-              categories=categories,
-              comment=f"{final_reason} | Trigger: admin bulk {action} (retry)",
-            )
-            last_report_at = time.monotonic()
-          except Exception:
-            reported = False
-            last_report_at = time.monotonic()
-
-      item["ban_applied"] = ban_applied
-      item["reported"] = reported
-      if action == "ban":
-        item["ok"] = bool(ban_applied)
-        item["message"] = "ban applied" if ban_applied else "ban skipped"
-      elif action == "report":
-        item["ok"] = bool(reported)
-        item["message"] = "reported" if reported else "report skipped (rate-limit/provider/no-reporter)"
-      else:
-        item["ok"] = bool(ban_applied or reported)
-        parts = ["ban applied" if ban_applied else "ban skipped", "reported" if reported else "report skipped (rate-limit/provider/no-reporter)"]
-        item["message"] = ", ".join(parts)
-      results.append(item)
-
-    success_count = sum(1 for item in results if item.get("ok"))
-    fail_count = len(results) - success_count
-    reported_count = sum(1 for item in results if item.get("reported"))
-    ban_count = sum(1 for item in results if item.get("ban_applied"))
-
-    await self._log_audit(
-      request,
-      "admin.bulk_ip_action",
-      actor_username=actor,
-      details={
-        "action": action,
-        "total": len(results),
-        "success": success_count,
-        "failed": fail_count,
-        "reported": reported_count,
-        "ban_applied": ban_count,
-        "categories": categories,
-      },
-    )
-
-    return web.json_response(
-      {
-        "ok": True,
-        "action": action,
-        "total": len(results),
-        "success": success_count,
-        "failed": fail_count,
-        "reported": reported_count,
-        "ban_applied": ban_count,
-        "categories": categories,
-        "respect_report_rate_limit": respect_report_rate_limit,
-        "report_interval_ms": report_interval_ms,
-        "message": f"Bulk action completed: {success_count}/{len(results)} successful.",
-        "results": results,
-      }
-    )
+    return await admin_bulk_handlers.handle_admin_bulk_ip_action(self, request)
 
   async def _handle_admin_deactivate_ban(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    payload = await request.json()
-    source_ip = str(payload.get("source_ip", "")).strip()
-    if not source_ip:
-      return web.json_response(
-        {"error": "invalid_ip", "message": "Source IP is required."},
-        status=400,
-      )
-    updated = await self._db.deactivate_ban_by_ip(source_ip)
-    await self._log_audit(request, "admin.deactivate_ban", actor_username=actor, details={"source_ip": source_ip, "updated": updated})
-    return web.json_response({"ok": True, "updated": updated})
+    return await admin_config_handlers.handle_admin_deactivate_ban(self, request)
 
   async def _handle_admin_deactivate_all_bans(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    updated = await self._db.deactivate_all_bans()
-    await self._log_audit(request, "admin.deactivate_all_bans", actor_username=actor, details={"updated": updated})
-    return web.json_response({"ok": True, "updated": updated})
+    return await admin_config_handlers.handle_admin_deactivate_all_bans(self, request)
 
   async def _handle_admin_enforce_simulated_bans(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-
-    if not self._firewall.simulation_mode:
-      return web.json_response(
-        {
-          "error": "simulation_not_enabled",
-          "message": "Simulation mode is not enabled. This action is only available while simulation mode is active.",
-        },
-        status=400,
-      )
-
-    now_unix = int(time.time())
-    candidates: list[dict[str, object]] = []
-    expired_ips: set[str] = set()
-
-    async with self._db._lock:
-      async with self._db._db.execute(
-        """
-        SELECT source_ip, reason, ban_duration, expires_at
-        FROM ban_history
-        WHERE is_active = 1
-        ORDER BY banned_at DESC
-        LIMIT 5000
-        """
-      ) as cursor:
-        rows = await cursor.fetchall()
-
-    seen_ips: set[str] = set()
-    for source_ip, reason, ban_duration, expires_at in rows:
-      ip_value = str(source_ip or "").strip()
-      if not ip_value or ip_value in seen_ips:
-        continue
-      seen_ips.add(ip_value)
-
-      duration = int(ban_duration or 0)
-      expires_unix = self._parse_timestamp_unix(expires_at)
-      if expires_unix is not None:
-        remaining = expires_unix - now_unix
-        if remaining <= 0:
-          expired_ips.add(ip_value)
-          continue
-        duration = remaining
-
-      candidates.append(
-        {
-          "ip": ip_value,
-          "duration": duration,
-          "reason": str(reason or "simulation replay"),
-        }
-      )
-
-    deactivated_expired = 0
-    for ip_value in expired_ips:
-      deactivated_expired += await self._db.deactivate_ban_by_ip(ip_value)
-
-    result = await self._firewall.enforce_db_bans(candidates)
-    await self._log_audit(
-      request,
-      "admin.enforce_simulated_bans",
-      actor_username=actor,
-      details={
-        "requested": result.get("requested", 0),
-        "applied": result.get("applied", 0),
-        "failed": result.get("failed", 0),
-        "skipped": result.get("skipped", 0),
-        "expired_deactivated": deactivated_expired,
-      },
-    )
-    return web.json_response(
-      {
-        "ok": True,
-        "requested": result.get("requested", 0),
-        "applied": result.get("applied", 0),
-        "failed": result.get("failed", 0),
-        "skipped": result.get("skipped", 0),
-        "expired_deactivated": deactivated_expired,
-      }
-    )
+    return await admin_bulk_handlers.handle_admin_enforce_simulated_bans(self, request)
 
   async def _handle_admin_reconcile_bans(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-
-    now_unix = int(time.time())
-    desired: dict[str, dict[str, object]] = {}
-    expired_ips: set[str] = set()
-    skipped_invalid = 0
-    db_total_bans = 0
-
-    async with self._db._lock:
-      async with self._db._db.execute("SELECT COUNT(*) FROM ban_history") as total_cursor:
-        total_row = await total_cursor.fetchone()
-        db_total_bans = int(total_row[0]) if total_row else 0
-      async with self._db._db.execute(
-        """
-        SELECT source_ip, reason, ban_duration, expires_at
-        FROM ban_history
-        WHERE is_active = 1
-        ORDER BY banned_at DESC
-        LIMIT 20000
-        """
-      ) as cursor:
-        rows = await cursor.fetchall()
-
-    for source_ip, reason, ban_duration, expires_at in rows:
-      ip_value = str(source_ip or "").strip()
-      if not ip_value or ip_value in desired:
-        continue
-      try:
-        ipaddress.ip_address(ip_value)
-      except Exception:
-        skipped_invalid += 1
-        continue
-
-      try:
-        duration = max(int(ban_duration or 0), 0)
-      except Exception:
-        duration = 0
-
-      expires_unix = self._parse_timestamp_unix(expires_at)
-      if expires_unix is not None:
-        remaining = expires_unix - now_unix
-        if remaining <= 0:
-          expired_ips.add(ip_value)
-          continue
-        duration = max(int(remaining), 1)
-
-      desired[ip_value] = {
-        "duration": duration,
-        "reason": str(reason or "db reconcile"),
-      }
-
-    deactivated_expired = 0
-    for ip_value in expired_ips:
-      deactivated_expired += await self._db.deactivate_ban_by_ip(ip_value)
-
-    candidates = [
-      {
-        "ip": ip_value,
-        "duration": int(meta.get("duration", 0)),
-        "reason": str(meta.get("reason", "db reconcile")),
-      }
-      for ip_value, meta in desired.items()
-    ]
-
-    firewall_items = await self._firewall.list_banned_ips(limit=20000)
-    firewall_ips = {
-      str(item.get("ip") or "").strip()
-      for item in firewall_items
-      if str(item.get("ip") or "").strip()
-    }
-    desired_ips = set(desired.keys())
-
-    enforce_result = await self._firewall.enforce_db_bans(candidates)
-    re_applied = int(enforce_result.get("applied", 0))
-    apply_failed = int(enforce_result.get("failed", 0))
-    apply_skipped = int(enforce_result.get("skipped", 0))
-    requested = int(enforce_result.get("requested", 0))
-
-    # Reconcile is intentionally one-way (DB -> Firewall).
-    # Keep firewall-only entries untouched so manual operator bans are preserved.
-    removed_extra = 0
-    remove_failed = 0
-    firewall_extra_untouched = len(firewall_ips - desired_ips)
-
-    await self._log_audit(
-      request,
-      "admin.reconcile_bans",
-      actor_username=actor,
-      details={
-        "db_total_bans": db_total_bans,
-        "db_active_considered": len(desired_ips),
-        "expired_deactivated": deactivated_expired,
-        "invalid_rows_skipped": skipped_invalid,
-        "firewall_before": len(firewall_ips),
-        "requested": requested,
-        "reapplied": re_applied,
-        "apply_failed": apply_failed,
-        "apply_skipped": apply_skipped,
-        "removed_extra": removed_extra,
-        "remove_failed": remove_failed,
-        "firewall_extra_untouched": firewall_extra_untouched,
-      },
-    )
-
-    return web.json_response(
-      {
-        "ok": True,
-        "db_total_bans": db_total_bans,
-        "db_active_considered": len(desired_ips),
-        "expired_deactivated": deactivated_expired,
-        "invalid_rows_skipped": skipped_invalid,
-        "firewall_before": len(firewall_ips),
-        "requested": requested,
-        "reapplied": re_applied,
-        "apply_failed": apply_failed,
-        "apply_skipped": apply_skipped,
-        "removed_extra": removed_extra,
-        "remove_failed": remove_failed,
-        "firewall_extra_untouched": firewall_extra_untouched,
-      }
-    )
+    return await admin_bulk_handlers.handle_admin_reconcile_bans(self, request)
 
   async def _handle_admin_query_records(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.query.run")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    started_at = time.perf_counter()
-
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    field = str(payload.get("field", "auto") or "auto").strip().lower()
-    value = str(payload.get("value", "") or "").strip()
-    page = max(int(payload.get("page", 1) or 1), 1)
-    page_size = min(max(int(payload.get("page_size", payload.get("limit", 100)) or 100), 1), 500)
-    offset = (page - 1) * page_size
-    record_kind = str(payload.get("record_kind", "event") or "event").strip().lower()
-    connection_type_filter = str(payload.get("connection_type", "") or "").strip().lower()
-    event_type_filter = str(payload.get("event_type", "") or "").strip().lower()
-    country_filter = str(payload.get("country", "") or "").strip().upper()
-    try:
-      min_risk = int(payload.get("min_risk", 0) or 0)
-    except Exception:
-      min_risk = 0
-    try:
-      max_risk = int(payload.get("max_risk", 100) or 100)
-    except Exception:
-      max_risk = 100
-    min_risk = min(max(min_risk, 0), 100)
-    max_risk = min(max(max_risk, 0), 100)
-    if min_risk > max_risk:
-      min_risk, max_risk = max_risk, min_risk
-    refresh_missing_geo = bool(payload.get("refresh_missing_geo", True))
-
-    if not value:
-      return web.json_response({"error": "invalid_query", "message": "Query value is required."}, status=400)
-
-    if field not in {"auto", "ip", "asn", "user"}:
-      return web.json_response({"error": "invalid_field", "message": "Field must be one of: auto, ip, asn, user."}, status=400)
-    if record_kind not in {"event", "ban", "all"}:
-      return web.json_response({"error": "invalid_record_kind", "message": "record_kind must be one of: event, ban, all."}, status=400)
-
-    if field == "auto":
-      try:
-        ipaddress.ip_address(value)
-        resolved_field = "ip"
-      except Exception:
-        normalized = value.upper().strip()
-        if normalized.startswith("AS") and normalized[2:].isdigit():
-          resolved_field = "asn"
-        elif normalized.isdigit():
-          resolved_field = "asn"
-        else:
-          resolved_field = "user"
-    else:
-      resolved_field = field
-
-    event_where_clauses: list[str] = ["risk_score >= ?", "risk_score <= ?"]
-    event_where_params: list[object] = [min_risk, max_risk]
-
-    if resolved_field == "ip":
-      event_where_clauses.append("source_ip = ?")
-      event_where_params.append(value)
-    elif resolved_field == "asn":
-      normalized = value.upper().strip()
-      asn_number: Optional[int] = None
-      if normalized.startswith("AS"):
-        normalized = normalized[2:]
-      if normalized.isdigit():
-        asn_number = int(normalized)
-      if asn_number is not None:
-        event_where_clauses.append("(asn_number = ? OR LOWER(COALESCE(asn_org, '')) LIKE ?)")
-        event_where_params.extend([asn_number, f"%{value.lower()}%"])
-      else:
-        event_where_clauses.append("LOWER(COALESCE(asn_org, '')) LIKE ?")
-        event_where_params.append(f"%{value.lower()}%")
-    else:
-      event_where_clauses.append("LOWER(COALESCE(player_name, '')) LIKE ?")
-      event_where_params.append(f"%{value.lower()}%")
-
-    if connection_type_filter:
-      event_where_clauses.append("LOWER(COALESCE(connection_type, '')) = ?")
-      event_where_params.append(connection_type_filter)
-    if event_type_filter:
-      event_where_clauses.append("LOWER(COALESCE(details, '')) LIKE ?")
-      event_where_params.append(f'%"event_type": "{event_type_filter}%')
-    if country_filter and len(country_filter) == 2 and country_filter.isalpha():
-      event_where_clauses.append("(UPPER(COALESCE(details, '')) LIKE ? OR UPPER(COALESCE(details, '')) LIKE ?)")
-      event_where_params.append(f'%"COUNTRY_CODE":"{country_filter}"%')
-      event_where_params.append(f'%"COUNTRY_CODE": "{country_filter}"%')
-
-    event_where_sql = " AND ".join(event_where_clauses) if event_where_clauses else "1=1"
-
-    event_count_query = f"""
-      SELECT COUNT(*)
-      FROM connection_events
-      WHERE {event_where_sql}
-    """
-
-    event_data_query = f"""
-      SELECT id, timestamp, source_ip, player_name, connection_type,
-             asn_number, asn_org, is_suspicious_asn, risk_score, threat_level, details
-      FROM connection_events
-      WHERE {event_where_sql}
-      ORDER BY timestamp DESC
-      LIMIT ? OFFSET ?
-    """
-
-    records: list[dict[str, object]] = []
-    total_count = 0
-    event_rows_raw: list[dict[str, object]] = []
-
-    if record_kind in {"event", "all"}:
-      async with self._db._lock:
-        async with self._db._db.execute(event_count_query, tuple(event_where_params)) as count_cursor:
-          count_row = await count_cursor.fetchone()
-          total_count = int((count_row[0] or 0) if count_row else 0)
-        async with self._db._db.execute(
-          event_data_query,
-          tuple([*event_where_params, page_size, offset]),
-        ) as cursor:
-          rows = await cursor.fetchall()
-          columns = [d[0] for d in cursor.description]
-          event_rows_raw = [dict(zip(columns, row)) for row in rows]
-
-      if refresh_missing_geo and event_rows_raw:
-        update_payload: list[tuple[object, object, object, object, int]] = []
-        for row in event_rows_raw:
-          row_id = int(row.get("id") or 0)
-          source_ip = str(row.get("source_ip") or "").strip()
-          if row_id <= 0:
-            continue
-
-          details_value = row.get("details")
-          details_obj: dict = {}
-          if isinstance(details_value, str) and details_value:
-            try:
-              parsed = json.loads(details_value)
-              if isinstance(parsed, dict):
-                details_obj = parsed
-            except Exception:
-              details_obj = {}
-          elif isinstance(details_value, dict):
-            details_obj = dict(details_value)
-
-          changed = False
-          asn_number = row.get("asn_number")
-          asn_org = row.get("asn_org")
-          is_suspicious = bool(row.get("is_suspicious_asn"))
-
-          if (asn_number is None and not str(asn_org or "").strip()) and self._is_valid_ip(source_ip) and self._asn_lookup:
-            asn_result = self._asn_lookup.lookup(source_ip)
-            if asn_result.asn_number is not None or str(asn_result.asn_org or "").strip():
-              asn_number = asn_result.asn_number
-              asn_org = asn_result.asn_org
-              is_suspicious = bool(asn_result.is_suspicious)
-              changed = True
-
-          country_code = self._resolve_country_code(details_obj, source_ip)
-          if country_code and str(details_obj.get("country_code") or "").strip().upper() != country_code:
-            details_obj["country_code"] = country_code
-            changed = True
-
-          if changed:
-            row["asn_number"] = asn_number
-            row["asn_org"] = asn_org
-            row["is_suspicious_asn"] = is_suspicious
-            row["details"] = details_obj
-            update_payload.append(
-              (
-                asn_number,
-                str(asn_org or ""),
-                1 if is_suspicious else 0,
-                json.dumps(details_obj, ensure_ascii=False),
-                row_id,
-              )
-            )
-
-        if update_payload:
-          async with self._db._lock:
-            await self._db._db.executemany(
-              """
-              UPDATE connection_events
-              SET asn_number = ?, asn_org = ?, is_suspicious_asn = ?, details = ?
-              WHERE id = ?
-              """,
-              update_payload,
-            )
-            await self._db._db.commit()
-
-      for row in event_rows_raw:
-        details_obj = {}
-        details_value = row.get("details")
-        if isinstance(details_value, str) and details_value:
-          try:
-            details_obj = json.loads(details_value)
-          except Exception:
-            details_obj = {}
-        elif isinstance(details_value, dict):
-          details_obj = details_value
-        records.append(
-          {
-            "kind": "event",
-            "id": row.get("id"),
-            "timestamp": row.get("timestamp"),
-            "source_ip": row.get("source_ip"),
-            "player_name": row.get("player_name"),
-            "connection_type": row.get("connection_type"),
-            "event_type": str(details_obj.get("event_type") or ""),
-            "event_port": self._extract_event_port({"player_name": row.get("player_name")}, details_obj),
-            "country_code": self._resolve_country_code(details_obj, row.get("source_ip")),
-            "asn_number": row.get("asn_number"),
-            "asn_org": row.get("asn_org"),
-            "is_suspicious_asn": bool(row.get("is_suspicious_asn")),
-            "risk_score": row.get("risk_score"),
-            "threat_level": row.get("threat_level"),
-          }
-        )
-
-    if resolved_field == "ip" and record_kind in {"ban", "all"}:
-      async with self._db._lock:
-        async with self._db._db.execute(
-          """
-          SELECT COUNT(*)
-          FROM ban_history
-          WHERE source_ip = ?
-            AND risk_score >= ?
-            AND risk_score <= ?
-          """,
-          (value, min_risk, max_risk),
-        ) as bcount_cursor:
-          bcount_row = await bcount_cursor.fetchone()
-          ban_total_count = int((bcount_row[0] or 0) if bcount_row else 0)
-
-        # record_kind=ban uses pure SQL paging; record_kind=all merges after fetch for stable UX.
-        if record_kind == "ban":
-          async with self._db._db.execute(
-            """
-            SELECT id, banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
-            FROM ban_history
-            WHERE source_ip = ?
-              AND risk_score >= ?
-              AND risk_score <= ?
-            ORDER BY banned_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            (value, min_risk, max_risk, page_size, offset),
-          ) as cursor:
-            ban_rows = await cursor.fetchall()
-          records = [
-            {
-              "kind": "ban",
-              "id": row[0],
-              "timestamp": row[1],
-              "source_ip": row[2],
-              "reason": row[3],
-              "risk_score": row[4],
-              "ban_duration": row[5],
-              "expires_at": row[6],
-              "is_active": bool(row[7]),
-            }
-            for row in ban_rows
-          ]
-          total_count = ban_total_count
-        else:
-          # Merge recent events and bans for the same IP, then paginate.
-          fetch_cap = min(max(page_size * page * 4, page_size * 4), 5000)
-          async with self._db._lock:
-            async with self._db._db.execute(
-              """
-              SELECT id, banned_at, source_ip, reason, risk_score, ban_duration, expires_at, is_active
-              FROM ban_history
-              WHERE source_ip = ?
-                AND risk_score >= ?
-                AND risk_score <= ?
-              ORDER BY banned_at DESC
-              LIMIT ?
-              """,
-              (value, min_risk, max_risk, fetch_cap),
-            ) as cursor:
-              ban_rows = await cursor.fetchall()
-          ban_records = [
-            {
-              "kind": "ban",
-              "id": row[0],
-              "timestamp": row[1],
-              "source_ip": row[2],
-              "reason": row[3],
-              "risk_score": row[4],
-              "ban_duration": row[5],
-              "expires_at": row[6],
-              "is_active": bool(row[7]),
-            }
-            for row in ban_rows
-          ]
-          merged = [*records, *ban_records]
-          merged.sort(
-            key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
-            reverse=True,
-          )
-          total_count = int(total_count) + int(ban_total_count)
-          records = merged[offset : offset + page_size]
-
-    if record_kind == "event":
-      records.sort(
-        key=lambda item: self._parse_timestamp_unix(item.get("timestamp")) or 0,
-        reverse=True,
-      )
-
-    await self._log_audit(
-      request,
-      "admin.query_records",
-      actor_username=actor,
-      details={
-        "field": resolved_field,
-        "value": value,
-        "record_kind": record_kind,
-        "count": len(records),
-        "page": page,
-        "page_size": page_size,
-        "total": total_count,
-      },
-    )
-
-    try:
-      await self._db.log_query_event(
-        actor_username=actor,
-        endpoint="/api/admin/query-records",
-        query_payload={
-          "field": resolved_field,
-          "value": value,
-          "record_kind": record_kind,
-          "connection_type": connection_type_filter,
-          "event_type": event_type_filter,
-          "country": country_filter,
-          "min_risk": min_risk,
-          "max_risk": max_risk,
-          "page": page,
-          "page_size": page_size,
-        },
-        result_count=len(records),
-        duration_ms=int((time.perf_counter() - started_at) * 1000),
-        ip_address=self._client_ip(request),
-        user_agent=request.headers.get("User-Agent", ""),
-      )
-    except Exception:
-      pass
-
-    return web.json_response(
-      {
-        "ok": True,
-        "field": resolved_field,
-        "value": value,
-        "record_kind": record_kind,
-        "page": page,
-        "page_size": page_size,
-        "offset": offset,
-        "total": total_count,
-        "has_more": bool(offset + len(records) < int(total_count or 0)),
-        "count": len(records),
-        "records": records,
-      }
-    )
+    return await admin_identity_handlers.handle_admin_query_records(self, request)
 
   async def _handle_admin_audit_events(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.audit.view")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-
-    try:
-      limit = int(request.query.get("limit", "200") or 200)
-    except Exception:
-      limit = 200
-    actor = str(request.query.get("actor", "") or "").strip()
-    action = str(request.query.get("action", "") or "").strip()
-
-    rows = await self._db.get_audit_events(limit=limit, actor=actor, action=action)
-    for row in rows:
-      details_value = row.get("details_json")
-      if isinstance(details_value, str) and details_value:
-        try:
-          row["details"] = json.loads(details_value)
-        except Exception:
-          row["details"] = details_value
-      else:
-        row["details"] = details_value
-    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+    return await admin_identity_handlers.handle_admin_audit_events(self, request)
 
   async def _handle_admin_audit_queries(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.audit.view")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-
-    try:
-      limit = int(request.query.get("limit", "200") or 200)
-    except Exception:
-      limit = 200
-    actor = str(request.query.get("actor", "") or "").strip()
-    endpoint = str(request.query.get("endpoint", "") or "").strip()
-
-    rows = await self._db.get_query_logs(limit=limit, actor=actor, endpoint=endpoint)
-    for row in rows:
-      query_value = row.get("query_json")
-      if isinstance(query_value, str) and query_value:
-        try:
-          row["query"] = json.loads(query_value)
-        except Exception:
-          row["query"] = query_value
-      else:
-        row["query"] = query_value
-    return web.json_response({"ok": True, "count": len(rows), "items": rows})
+    return await admin_identity_handlers.handle_admin_audit_queries(self, request)
 
   async def _handle_admin_flush_firewall(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    flushed = await self._firewall.flush()
-    updated = await self._db.deactivate_all_bans()
-    await self._log_audit(request, "admin.flush_firewall", actor_username=actor, details={"flushed": flushed, "deactivated_records": updated})
-    return web.json_response({"ok": flushed, "deactivated_records": updated})
+    return await admin_config_handlers.handle_admin_flush_firewall(self, request)
 
   async def _handle_admin_clear_events(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    deleted = await self._db.clear_events()
-    await self._log_audit(request, "admin.clear_events", actor_username=actor, details={"deleted": deleted})
-    return web.json_response({"ok": True, "deleted": deleted})
+    return await admin_config_handlers.handle_admin_clear_events(self, request)
 
   async def _handle_admin_clear_ban_history(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    deleted = await self._db.clear_ban_history()
-    await self._log_audit(request, "admin.clear_ban_history", actor_username=actor, details={"deleted": deleted})
-    return web.json_response({"ok": True, "deleted": deleted})
+    return await admin_config_handlers.handle_admin_clear_ban_history(self, request)
 
   async def _handle_admin_test_notification(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    if not self._notifier:
-      return web.json_response(
-        {"error": "notifications_unavailable", "message": "Notification manager is not available."},
-        status=503,
-      )
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    channel = str(payload.get("channel", "all")).strip().lower() or "all"
-    try:
-      result = await self._notifier.send_test_notification(channel)
-    except ValueError as exc:
-      return web.json_response({"error": "invalid_channel", "message": str(exc)}, status=400)
-    except RuntimeError as exc:
-      return web.json_response({"error": "notification_unavailable", "message": str(exc)}, status=503)
-    summary = ", ".join(f"{name}: {status}" for name, status in result["results"].items())
-    await self._log_audit(request, "admin.test_notification", actor_username=actor, details={"channel": channel, "results": result.get("results", {})})
-    return web.json_response({"ok": True, "message": f"Test notification dispatched ({summary}).", **result})
+    return await admin_config_handlers.handle_admin_test_notification(self, request)
 
   async def _handle_admin_update_status(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "panel.view")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    checker = UpdateChecker(current_version=__version__)
-    return web.json_response(await checker.get_status())
+    return await admin_config_handlers.handle_admin_update_status(self, request)
 
   def _set_nested_config_value(self, payload: dict, dotted_path: str, value) -> None:
     current = payload
@@ -3235,163 +1597,19 @@ class DashboardAPI:
       current[segments[-1]] = value
 
   async def _handle_admin_get_config(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    config_data = self._config.raw
-    yaml_text = await self._config.get_yaml_text()
-    return web.json_response(
-      {
-        "ok": True,
-        "config": config_data,
-        "yaml": yaml_text,
-        "message": "Some runtime changes apply immediately in the dashboard, while service-level changes may require a restart.",
-      }
-    )
+    return await admin_config_handlers.handle_admin_get_config(self, request)
 
   async def _handle_admin_save_config(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    yaml_text = str(payload.get("yaml", "")).strip()
-    if not yaml_text:
-      return web.json_response({"error": "invalid_config", "message": "YAML content is required."}, status=400)
-    try:
-      await self._config.save_yaml_text(yaml_text)
-    except Exception as exc:
-      return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
-    self._initialize_config()
-    desired_simulation, effective_simulation = self._sync_firewall_simulation_mode()
-    await self._log_audit(request, "admin.save_config", actor_username=actor, details={"mode": "yaml", "bytes": len(yaml_text)})
-    current_yaml = await self._config.get_yaml_text()
-    message = "Configuration saved. Restart WardenIPS if you changed firewall, plugin, or notification wiring."
-    if (not desired_simulation) and effective_simulation:
-      message = (
-        "Configuration saved. Simulation mode remains active because firewall tools/permissions are not currently available at runtime."
-      )
-    return web.json_response(
-      {
-        "ok": True,
-        "message": message,
-        "config": self._config.raw,
-        "yaml": current_yaml,
-      }
-    )
+    return await admin_config_handlers.handle_admin_save_config(self, request)
 
   async def _handle_admin_patch_config(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-    changes = payload.get("changes") or {}
-    if not isinstance(changes, dict) or not changes:
-      return web.json_response({"error": "invalid_changes", "message": "At least one config change is required."}, status=400)
-    try:
-      normalized_changes = {str(key): value for key, value in changes.items()}
-      await self._config.patch_values(normalized_changes)
-    except Exception as exc:
-      return web.json_response({"error": "config_write_failed", "message": str(exc)}, status=500)
-    self._initialize_config()
-    desired_simulation, effective_simulation = self._sync_firewall_simulation_mode()
-    await self._log_audit(request, "admin.patch_config", actor_username=actor, details={"changes": sorted(str(key) for key in changes.keys())})
-    current_yaml = await self._config.get_yaml_text()
-    message = "Configuration updated."
-    if (not desired_simulation) and effective_simulation:
-      message = (
-        "Configuration updated. Simulation mode remains active because firewall tools/permissions are not currently available at runtime."
-      )
-    return web.json_response(
-      {
-        "ok": True,
-        "message": message,
-        "config": self._config.raw,
-        "yaml": current_yaml,
-      }
-    )
+    return await admin_config_handlers.handle_admin_patch_config(self, request)
 
   async def _handle_admin_get_portal_links(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    return web.json_response(
-      {
-        "ok": True,
-        "enabled": bool(self._portal_enabled),
-        "count": len(self._portal_links),
-        "links": list(self._portal_links),
-      }
-    )
+    return await admin_config_handlers.handle_admin_get_portal_links(self, request)
 
   async def _handle_admin_set_portal_links(self, request: web.Request) -> web.Response:
-    permission_error = await self._require_permission(request, "admin.config.edit")
-    if permission_error is not None:
-      return permission_error
-    self._touch_session(request)
-    actor = self._get_session_actor(request)
-    try:
-      payload = await request.json()
-    except Exception:
-      payload = {}
-
-    raw_links = payload.get("links", [])
-    if not isinstance(raw_links, list):
-      return web.json_response({"error": "invalid_links", "message": "links must be a JSON array."}, status=400)
-
-    normalized_links: list[dict[str, str]] = []
-    for item in raw_links[:40]:
-      if not isinstance(item, dict):
-        continue
-      title = str(item.get("title", "")).strip()
-      url = str(item.get("url", "")).strip()
-      description = str(item.get("description", "")).strip()
-      permission = str(item.get("permission", "")).strip()
-      if not title or not url:
-        continue
-      normalized_links.append(
-        {
-          "title": title[:120],
-          "url": url[:500],
-          "description": description[:260],
-          "permission": permission[:120],
-        }
-      )
-
-    enabled = bool(payload.get("enabled", True))
-    await self._config.patch_values(
-      {
-        "dashboard.portal.enabled": enabled,
-        "dashboard.portal.links": normalized_links,
-      }
-    )
-    self._initialize_config()
-    await self._log_audit(
-      request,
-      "admin.portal.links.update",
-      actor_username=actor,
-      details={"enabled": enabled, "count": len(normalized_links)},
-    )
-    return web.json_response(
-      {
-        "ok": True,
-        "enabled": bool(self._portal_enabled),
-        "count": len(self._portal_links),
-        "links": list(self._portal_links),
-        "message": "Portal links updated.",
-      }
-    )
+    return await admin_config_handlers.handle_admin_set_portal_links(self, request)
 
   async def _handle_dashboard(self, request: web.Request) -> web.Response:
     if not self._public_dashboard_enabled:
@@ -9403,3 +7621,5 @@ bindAllSettingsGroupToggles();
 </script>
 </body>
 </html>"""
+
+

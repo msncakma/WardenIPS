@@ -6,7 +6,7 @@ It is designed for teams that want stronger protection than static log-based ban
 
 Maintainer: msncakma
 
-[![Version](https://img.shields.io/badge/version-0.4.0-beta--8-green.svg)](https://github.com/msncakma/WardenIPS)
+[![Version](https://img.shields.io/badge/version-1.0.0-brightgreen.svg)](https://github.com/msncakma/WardenIPS)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Donate-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/msncakma)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -27,16 +27,16 @@ If you run internet-facing services and want practical prevention with transpare
 
 ## Transparent Status
 
-Current version: v0.4.0-beta-8
+Current version: v1.0.0
 
-This project is in beta, and that matters.
+This project is now in a stable major line, and that matters.
 
 - Feature state: Core capabilities are in place and actively used.
-- Stability state: Good for labs, staging, and controlled production pilots.
+- Stability state: Production-ready baseline with continued iterative improvements.
 - Remaining risk: Threshold tuning, whitelist quality, and environment-specific traffic patterns still determine final safety.
 - Honest recommendation: Deploy in simulation first, validate behavior, then enable enforcement.
 
-WardenIPS is intentionally transparent about maturity. If you require a formally declared production-stable line, wait for a RELEASE tag.
+WardenIPS remains intentionally transparent about maturity and operational risk. Stable does not mean zero false positives without environment tuning.
 
 ## What It Does
 
@@ -184,6 +184,99 @@ Full cleanup:
 ```sh
 sudo sh uninstall.sh --purge
 ```
+
+## Operational Control (v1.0.0+)
+
+## Release Notes
+
+For full details of the major update, see [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+WardenIPS provides two professional operational modes for managing your security posture:
+
+### Command-Line Interface (CLI)
+
+The `wardenips-cli` tool allows operators to control WardenIPS from the command line:
+
+```bash
+# Ban an IP address (direct local access - requires root)
+wardenips-cli ban add 192.168.1.100 --reason "SSH brute-force" --duration 3600
+
+# List active bans
+wardenips-cli ban list --output json
+
+# Manage whitelist (add/remove trusted IPs)
+wardenips-cli whitelist add 203.0.113.50 --tag "office"
+wardenips-cli whitelist list
+
+# Firewall operations
+wardenips-cli firewall status
+wardenips-cli firewall sync --dry-run  # Preview what would change
+
+# Configuration management
+wardenips-cli config reload --components whitelist,firewall  # Zero-downtime reload
+
+# Check system status
+wardenips-cli status  # Overall system health
+
+# Plugin management
+wardenips-cli plugins list
+wardenips-cli plugins reload ssh
+```
+
+**Features:**
+- Direct access mode (fast, local, root-required)
+- Output formats: Text (default), JSON, CSV
+- Dry-run mode for non-destructive testing
+
+### REST API
+
+For multi-team or multi-machine setups, use the REST API with authentication:
+
+```bash
+# Authenticate and get session token
+TOKEN=$(curl -X POST http://localhost:8080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"xxx"}' | jq -r .session_token)
+
+# Ban an IP (audited operation)
+curl -X POST http://localhost:8080/api/admin/ban-ip \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"192.168.1.100","reason":"Brute-force","duration":3600}'
+
+# Get dashboard overview (public endpoint, optional auth)
+curl http://localhost:8080/api/stats
+
+# Hot-reload configuration (API-based)
+curl -X POST http://localhost:8080/api/admin/config/reload \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"components":["whitelist","firewall"]}'
+```
+
+**API Features:**
+- Bearer token authentication with session management
+- Role-based access control (Admin, Operator, Viewer, Analyst)
+- Comprehensive audit logging of all operations
+- 40+ endpoints covering all operational needs
+- Structured JSON responses
+
+Migration note:
+- A modular migration namespace is available at `/api/v2/*`.
+- Existing `/api/*` endpoints remain active for backward compatibility.
+- New development and CLI/API parity checks should prefer `/api/v2/*` during Phase 3 refactoring.
+
+**Available Endpoints:**
+
+| Category | Endpoints |
+|----------|-----------|
+| Public | `GET /api/health`, `/api/stats`, `/api/events`, `/api/bans`, `/api/firewall`, etc. |
+| Admin Users | `GET/POST /api/admin/users`, manage invites, assign roles |
+| Whitelist | `GET/POST/DELETE /api/admin/whitelist` |
+| Banning | `POST /api/admin/ban-ip`, `DELETE /api/admin/ban/{ip}`, bulk operations |
+| Config | `GET/PATCH /api/admin/config`, hot-reload, validation |
+| Operations | Firewall sync, plugin reload, database optimization |
+
+See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for complete API reference.
 
 ## Release Model
 

@@ -50,7 +50,7 @@ setup(
     install_requires=requirements,
     python_requires=">=3.10",
     classifiers=[
-        "Development Status :: 4 - Beta",
+        "Development Status :: 5 - Production/Stable",
         "Intended Audience :: System Administrators",
         "Intended Audience :: Developers", 
         "Topic :: System :: Networking :: Firewalls",
@@ -69,6 +69,7 @@ setup(
     entry_points={
         "console_scripts": [
             "wardenips-python=main:main",  # Alternative Python entry point
+            "wardenips-cli=wardenips.cli.main:cli_entry_point",  # CLI management tool
         ],
     },
     zip_safe=False,  # Due to bundled assets and configs

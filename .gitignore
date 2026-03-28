@@ -22,13 +22,8 @@ data/
 .DS_Store
 Thumbs.db
 
-
-# Customs
-WARDEN_ARCHITECTURE.md
-walkthrough.md
-VM_TEST_GUIDE.md
-IMPLEMENTATION_REPORT.md
-todo.md
+# Windows generated files
+Desktop.ini
 
 # Python packaging
 *.egg-info/
@@ -41,8 +36,11 @@ debian/.debhelper/
 debian/debhelper-build-stamp
 debian/files
 debian/*.debhelper
+debian/*.debhelper.log
 debian/*.substvars
 debian/wardenips/
+debian/*.buildinfo
+debian/*.changes
 *.deb
 
 # Python tooling caches
@@ -77,6 +75,8 @@ htmlcov/
 pip-wheel-metadata/
 site/
 
-# Windows generated files
-Desktop.ini
+# Temporary phase/session reports
+PHASE*_*.md
+PHASE*.md
+SESSION_COMPLETION_SUMMARY.md
 

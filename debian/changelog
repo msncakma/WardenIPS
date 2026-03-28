@@ -1,3 +1,14 @@
+wardenips (1.0.0-1) stable; urgency=medium
+
+  * Major stable release line: 1.0.0
+  * Complete dashboard modernization integration (assets + websocket plumbing)
+  * Introduce modular API route and service layer foundations
+  * Add professional CLI architecture with direct and API client modes
+  * Add hot-reload management foundation for operational workflows
+  * Align documentation and packaging metadata with stable major release
+
+ -- msncakma <wardenips@msncakma.dev>  Sat, 28 Mar 2026 12:00:00 +0300
+
 wardenips (0.4.0~beta23-1) stable; urgency=medium
 
   * Rework admin record query with pagination and advanced filters

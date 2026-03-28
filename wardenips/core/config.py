@@ -402,6 +402,15 @@ class ConfigManager:
         if segments:
             current[segments[-1]] = value
 
+    async def set(self, key: str, value: Any) -> None:
+        """Set a configuration value using dot notation and save to disk.
+        
+        Args:
+            key: Dotted-path key (e.g., "firewall.simulation_mode")
+            value: Value to set
+        """
+        await self.patch_values({key: value})
+
     # ── Internal Methods ──
 
     async def _read_config(self, path: Path) -> None:

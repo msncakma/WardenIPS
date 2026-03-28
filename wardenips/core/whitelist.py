@@ -211,6 +211,26 @@ class WhitelistManager:
             logger.info("Runtime whitelist applied: %d IP(s).", added)
         return added
 
+    async def remove_runtime_ips(self, ips: List[str]) -> int:
+        """Removes runtime IPs from the in-memory whitelist."""
+        removed = 0
+        async with self._lock:
+            for raw_ip in ips:
+                value = str(raw_ip or "").strip()
+                if not value:
+                    continue
+                try:
+                    parsed = ipaddress.ip_address(value)
+                except ValueError:
+                    logger.debug("Runtime whitelist remove skipped invalid IP: %s", value)
+                    continue
+                if parsed in self._whitelisted_ips:
+                    self._whitelisted_ips.discard(parsed)
+                    removed += 1
+        if removed:
+            logger.info("Runtime whitelist entries removed: %d IP(s).", removed)
+        return removed
+
     def _detect_own_ips(self) -> None:
         """Detect own server IPs and add them to _protected_ips.
 
