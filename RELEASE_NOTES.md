@@ -1,5 +1,20 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-3 - CLI Permission Fallback and Alias Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- Resolved `Permission denied` errors when running wrapper CLI commands (`ban`, `whitelist`, `database`, `auth`, etc.) as non-root users.
+- Wrapper now auto-falls back to `sudo -u wardenips` for CLI/main operations when direct runtime access is blocked by filesystem permissions.
+- Added `plugin` alias support so `wardenips plugin ...` now maps to `wardenips plugins ...`.
+
+### Notes
+
+- Security model remains intact: installation directory can stay locked down while wrapper keeps commands usable.
+- Installer template was updated, so fresh installs/updates generate the corrected wrapper behavior.
+
 ## v1.0.1-beta-2 - CLI Wrapper Exposure Fix
 
 Release date: 2026-03-28

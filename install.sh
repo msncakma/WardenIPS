@@ -669,6 +669,49 @@ run_privileged() {
     exit 1
 }
 
+run_cli() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        return
+    fi
+
+    # Non-root users may not have execute/read access because /opt/wardenips is locked down.
+    if [ -x "$PYTHON_BIN" ] && [ -r "$CONFIG_FILE" ]; then
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        return
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -u "$SERVICE_USER" "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        return
+    fi
+
+    printf "${RED}✗ Cannot access runtime as current user and sudo is unavailable.${NC}\n" >&2
+    printf "Try running as root or install sudo.\n" >&2
+    exit 1
+}
+
+run_main() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$PYTHON_BIN" "$MAIN_FILE" "$@"
+        return
+    fi
+
+    if [ -x "$PYTHON_BIN" ]; then
+        "$PYTHON_BIN" "$MAIN_FILE" "$@"
+        return
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -u "$SERVICE_USER" "$PYTHON_BIN" "$MAIN_FILE" "$@"
+        return
+    fi
+
+    printf "${RED}✗ Cannot execute runtime as current user and sudo is unavailable.${NC}\n" >&2
+    printf "Try running as root or install sudo.\n" >&2
+    exit 1
+}
+
 repair_permissions() {
     chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$DATA_DIR" "$LOG_DIR"
     find "$DATA_DIR" "$LOG_DIR" -type d -exec chmod 750 {} +
@@ -705,6 +748,7 @@ usage() {
     printf "  ${CYAN}firewall${NC}        Run firewall subcommands\n"
     printf "  ${CYAN}database${NC}        Run database subcommands\n"
     printf "  ${CYAN}plugins${NC}         Run plugin subcommands\n"
+    printf "  ${CYAN}plugin${NC}          Alias for plugins\n"
     printf "  ${CYAN}auth${NC}            Run auth subcommands\n"
     printf "  ${CYAN}status-cli${NC}      Run CLI status report (not systemctl status)\n"
     printf "  ${CYAN}config-cli${NC}      Run CLI config subcommands\n"
@@ -721,27 +765,30 @@ case "${1:-help}" in
         usage
         ;;
     version)
-        "$PYTHON_BIN" "$MAIN_FILE" --version
+        run_main --version
         ;;
     summary|status-summary)
-        "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+        run_main --config "$CONFIG_FILE" --status
         ;;
     cli)
         shift
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        run_cli "$@"
         ;;
-    ban|whitelist|firewall|database|plugins|auth)
+    ban|whitelist|firewall|database|plugins|plugin|auth)
         cmd="$1"
         shift
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$cmd" "$@"
+        if [ "$cmd" = "plugin" ]; then
+            cmd="plugins"
+        fi
+        run_cli "$cmd" "$@"
         ;;
     config-cli)
         shift
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" config "$@"
+        run_cli config "$@"
         ;;
     status-cli)
         shift
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" status "$@"
+        run_cli status "$@"
         ;;
     start)
         run_privileged systemctl start "$SERVICE_NAME"
