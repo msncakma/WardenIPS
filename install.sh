@@ -671,18 +671,18 @@ run_privileged() {
 
 run_cli() {
     if [ "$(id -u)" -eq 0 ]; then
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        env "PYTHONPATH=$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
         return
     fi
 
     # Non-root users may not have execute/read access because /opt/wardenips is locked down.
     if [ -x "$PYTHON_BIN" ] && [ -r "$CONFIG_FILE" ]; then
-        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        env "PYTHONPATH=$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
         return
     fi
 
     if command -v sudo >/dev/null 2>&1; then
-        sudo -u "$SERVICE_USER" "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        sudo -u "$SERVICE_USER" env "PYTHONPATH=$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
         return
     fi
 

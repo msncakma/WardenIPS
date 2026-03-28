@@ -1,5 +1,15 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-4 - CLI Module Import Path Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- Resolved `ModuleNotFoundError: No module named 'wardenips'` for wrapper CLI commands such as `wardenips cli`, `wardenips whitelist`, and `wardenips status-cli`.
+- Wrapper now sets `PYTHONPATH=/opt/wardenips` when invoking `-m wardenips.cli.main`, ensuring module discovery even when the package is not installed into site-packages.
+- Applied the same fix to the installer-generated wrapper template for consistency on fresh installs and updates.
+
 ## v1.0.1-beta-3 - CLI Permission Fallback and Alias Fix
 
 Release date: 2026-03-28
