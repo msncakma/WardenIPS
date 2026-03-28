@@ -107,6 +107,9 @@ class DashboardAPI:
     self._notifier = notifier
     self._blocklist = blocklist
     self._abuse_reporter = abuse_reporter
+    # Legacy handlers still access template constants via instance attributes.
+    self.LOGIN_HTML = LOGIN_HTML
+    self.SETUP_HTML = SETUP_HTML
     
     # Service layer instances (initialized in start())
     self._ban_service = None
