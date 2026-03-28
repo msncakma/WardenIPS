@@ -699,6 +699,16 @@ usage() {
     printf "  ${CYAN}config${NC}          Print configuration file path\n"
     printf "  ${CYAN}path${NC}            Print installation directory\n"
     printf "  ${CYAN}edit${NC}            Edit configuration (requires sudo)\n\n"
+    printf "${BOLD}Operational CLI (new):${NC}\n"
+    printf "  ${CYAN}ban${NC}             Run ban subcommands (wardenips ban --help)\n"
+    printf "  ${CYAN}whitelist${NC}       Run whitelist subcommands\n"
+    printf "  ${CYAN}firewall${NC}        Run firewall subcommands\n"
+    printf "  ${CYAN}database${NC}        Run database subcommands\n"
+    printf "  ${CYAN}plugins${NC}         Run plugin subcommands\n"
+    printf "  ${CYAN}auth${NC}            Run auth subcommands\n"
+    printf "  ${CYAN}status-cli${NC}      Run CLI status report (not systemctl status)\n"
+    printf "  ${CYAN}config-cli${NC}      Run CLI config subcommands\n"
+    printf "  ${CYAN}cli${NC}             Pass-through to CLI entry (wardenips cli --help)\n\n"
     printf "${BOLD}Maintenance:${NC}\n"
     printf "  ${CYAN}repair-perms${NC}    Fix ownership/permissions for DB, logs, and config\n\n"
     printf "${BOLD}Utilities:${NC}\n"
@@ -715,6 +725,23 @@ case "${1:-help}" in
         ;;
     summary|status-summary)
         "$PYTHON_BIN" "$MAIN_FILE" --config "$CONFIG_FILE" --status
+        ;;
+    cli)
+        shift
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$@"
+        ;;
+    ban|whitelist|firewall|database|plugins|auth)
+        cmd="$1"
+        shift
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" "$cmd" "$@"
+        ;;
+    config-cli)
+        shift
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" config "$@"
+        ;;
+    status-cli)
+        shift
+        "$PYTHON_BIN" -m wardenips.cli.main --config "$CONFIG_FILE" status "$@"
         ;;
     start)
         run_privileged systemctl start "$SERVICE_NAME"

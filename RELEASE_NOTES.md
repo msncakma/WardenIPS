@@ -1,5 +1,23 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-2 - CLI Wrapper Exposure Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- `wardenips` wrapper now exposes new operational CLI command groups directly in help output.
+- You can now run these from the wrapper directly: `ban`, `whitelist`, `firewall`, `database`, `plugins`, `auth`.
+- Added pass-through modes:
+	- `wardenips cli ...`
+	- `wardenips config-cli ...`
+	- `wardenips status-cli ...`
+
+### Notes
+
+- Existing service commands (`start`, `stop`, `restart`, `status`, `logs`) remain unchanged.
+- `config` remains reserved for printing config path in wrapper; use `config-cli` for CLI config subcommands.
+
 ## v1.0.0 - Major Platform Update
 
 Release date: 2026-03-28
