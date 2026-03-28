@@ -1,5 +1,20 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-7 - CLI Circular Import and Command Parser Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- Removed invalid eager imports from `wardenips.cli.commands` package initializer that referenced non-existent modules (`auth`, `plugins`, `status`).
+- Resolved startup crash: `ImportError: cannot import name 'auth' from partially initialized module wardenips.cli.commands`.
+- Added parser registrations for `plugins`, `auth`, and `status` command groups so wrapper-forwarded commands are recognized consistently.
+
+### Impact
+
+- `wardenips cli` and `wardenips auth` no longer fail during module import.
+- Placeholder command groups return controlled not-implemented messages instead of import-time crashes.
+
 ## v1.0.1-beta-6 - Missing CLI Dependency Fix
 
 Release date: 2026-03-28

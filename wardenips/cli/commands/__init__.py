@@ -1,5 +1,7 @@
-"""CLI command modules for WardenIPS."""
+"""CLI command modules for WardenIPS.
 
-from . import auth, ban, config, database, firewall, plugins, status, whitelist
+Avoid eager imports here because some command groups are optional/placeholder.
+Import concrete command modules directly where they are used.
+"""
 
-__all__ = ["auth", "ban", "config", "database", "firewall", "plugins", "status", "whitelist"]
+__all__ = ["ban", "config", "database", "firewall", "whitelist"]

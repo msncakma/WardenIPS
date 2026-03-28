@@ -148,6 +148,15 @@ For more help on a specific command:
     database_subparsers = database_parser.add_subparsers(dest="database_cmd", required=True)
     register_database_commands(database_subparsers)
     database_parser.set_defaults(handler='database')
+
+    plugins_parser = subparsers.add_parser("plugins", help="Manage plugins")
+    plugins_parser.set_defaults(handler='plugins')
+
+    auth_parser = subparsers.add_parser("auth", help="Manage authentication")
+    auth_parser.set_defaults(handler='auth')
+
+    status_parser = subparsers.add_parser("status", help="Show operational status")
+    status_parser.set_defaults(handler='status')
     
     return parser
 
