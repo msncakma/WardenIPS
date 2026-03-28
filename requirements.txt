@@ -25,5 +25,8 @@ qrcode[pil]>=7.4.2
 # Terminal Renklendirme
 colorama>=0.4.6
 
+# CLI tablo ciktilari
+tabulate>=0.9.0
+
 # Optional MySQL lookup for minecraft player_db fallback queries
 PyMySQL>=1.1.1

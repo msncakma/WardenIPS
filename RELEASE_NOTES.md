@@ -1,5 +1,18 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-6 - Missing CLI Dependency Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- Added missing `tabulate` dependency to `requirements.txt`.
+- Fixes runtime crash for CLI commands that render table output (`ban`, `whitelist`, `config`, `database`, `firewall`).
+
+### Impact
+
+- `wardenips` CLI subcommands no longer fail with `ModuleNotFoundError: No module named 'tabulate'` after install/update.
+
 ## v1.0.1-beta-5 - Installer Update Source Fix
 
 Release date: 2026-03-28
