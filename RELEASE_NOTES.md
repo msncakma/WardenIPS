@@ -1,5 +1,19 @@
 # WardenIPS Release Notes
 
+## v1.0.1-beta-5 - Installer Update Source Fix
+
+Release date: 2026-03-28
+
+### Fixed
+
+- Resolved update flow where running `install.sh` from `/opt/wardenips` could skip file deployment entirely.
+- Installer now detects non-git `/opt/wardenips` installs and automatically fetches the latest repository snapshot before deploying files.
+- This ensures wrapper and CLI updates are actually applied on hosts installed from packaged snapshots.
+
+### Impact
+
+- Fixes cases where users kept seeing old wrapper behavior (`ModuleNotFoundError` / missing new commands) even after rerunning installer.
+
 ## v1.0.1-beta-4 - CLI Module Import Path Fix
 
 Release date: 2026-03-28

@@ -276,8 +276,19 @@ deploy_files() {
     fi
 
     if [ "$SOURCE_DIR" = "$INSTALL_DIR" ]; then
-        log "Already running from $INSTALL_DIR, skipping file copy."
-        return
+        if [ -d "$INSTALL_DIR/.git" ]; then
+            log "Already running from git checkout at $INSTALL_DIR, skipping file copy."
+            return
+        fi
+
+        warn "Running from existing install directory without git metadata. Fetching latest source snapshot for update."
+        if [ -z "$TMP_DIR" ]; then
+            TMP_DIR="$(mktemp -d)"
+        fi
+        SOURCE_DIR="$TMP_DIR/repo-update"
+        if ! git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$SOURCE_DIR"; then
+            error "Failed to fetch latest repository snapshot from ${REPO_URL}"
+        fi
     fi
 
     log "Deploying files to $INSTALL_DIR..."
